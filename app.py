@@ -19993,6 +19993,239 @@ def tak_esri_uninstall():
     return jsonify({'success': True, 'steps': steps})
 
 
+# ── TAK-Esri: Conda / ArcGIS SDK setup ───────────────────────────────────────
+_tak_esri_conda_log = []
+_tak_esri_conda_status = {'running': False, 'complete': False, 'error': False}
+_CONDA_BIN = '/root/miniconda/bin/conda'
+
+
+def _run_tak_esri_conda_install():
+    """Background thread: install Miniconda + arcgis_env + ArcGIS SDK."""
+    log = _tak_esri_conda_log
+    status = _tak_esri_conda_status
+
+    def plog(msg):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        log.append(entry)
+        print(entry, flush=True)
+
+    try:
+        # ── Step 1: Miniconda ─────────────────────────────────────────────────
+        plog("━━━ Step 1/3: Miniconda ━━━")
+        if not os.path.exists(_CONDA_BIN):
+            plog("  Downloading Miniconda installer…")
+            r = subprocess.run(
+                ['wget', '-q', 'https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh',
+                 '-O', '/tmp/miniconda.sh'],
+                capture_output=True, text=True, timeout=180)
+            if r.returncode != 0:
+                plog(f"  ✗ Download failed: {(r.stderr or r.stdout or '')[:200]}")
+                status.update({'running': False, 'error': True})
+                return
+            plog("  ✓ Downloaded — running installer (batch mode)…")
+            r = subprocess.run(
+                ['bash', '/tmp/miniconda.sh', '-b', '-p', '/root/miniconda'],
+                capture_output=True, text=True, timeout=180)
+            if r.returncode != 0:
+                plog(f"  ✗ Install failed: {(r.stderr or r.stdout or '')[:200]}")
+                status.update({'running': False, 'error': True})
+                return
+            plog("  ✓ Miniconda installed to /root/miniconda/")
+        else:
+            plog("  ✓ Already installed")
+
+        # ── Step 2: arcgis_env ────────────────────────────────────────────────
+        plog("")
+        plog("━━━ Step 2/3: arcgis_env (Python 3.9) ━━━")
+        r = subprocess.run([_CONDA_BIN, 'env', 'list'], capture_output=True, text=True, timeout=30)
+        if 'arcgis_env' in (r.stdout or ''):
+            plog("  ✓ arcgis_env already exists")
+        else:
+            plog("  Creating environment…")
+            r = subprocess.run(
+                [_CONDA_BIN, 'create', '-n', 'arcgis_env', 'python=3.9', '-y'],
+                capture_output=True, text=True, timeout=300)
+            if r.returncode != 0:
+                plog(f"  ✗ Failed: {(r.stderr or r.stdout or '')[:300]}")
+                status.update({'running': False, 'error': True})
+                return
+            plog("  ✓ arcgis_env created")
+
+        # ── Step 3: ArcGIS SDK ────────────────────────────────────────────────
+        plog("")
+        plog("━━━ Step 3/3: ArcGIS SDK install (this can take 10–20 min) ━━━")
+        # Check if already present
+        chk = subprocess.run(
+            [_CONDA_BIN, 'run', '-n', 'arcgis_env', 'python', '-c',
+             'import arcgis; print(arcgis.__version__)'],
+            capture_output=True, text=True, timeout=60)
+        if chk.returncode == 0 and chk.stdout.strip():
+            plog(f"  ✓ ArcGIS SDK already installed (v{chk.stdout.strip()})")
+        else:
+            plog("  Running: conda install -c esri arcgis -y")
+            proc = subprocess.Popen(
+                [_CONDA_BIN, 'install', '-n', 'arcgis_env', '-c', 'esri', 'arcgis', '-y'],
+                stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            for line in proc.stdout:
+                line = line.rstrip()
+                if line:
+                    plog(f"  {line}")
+            proc.wait()
+            if proc.returncode != 0:
+                plog(f"  ✗ conda install failed — trying pip fallback…")
+                r = subprocess.run(
+                    [_CONDA_BIN, 'run', '-n', 'arcgis_env', 'pip', 'install', 'arcgis', '-q'],
+                    capture_output=True, text=True, timeout=600)
+                if r.returncode != 0:
+                    plog(f"  ✗ pip install also failed: {(r.stderr or '')[:200]}")
+                    status.update({'running': False, 'error': True})
+                    return
+                plog("  ✓ ArcGIS SDK installed via pip")
+            else:
+                plog("  ✓ ArcGIS SDK installed via conda")
+
+        plog("")
+        plog("✅ Conda environment ready.")
+        plog("   → Test your credentials in Step 2, then create the feature layer in Step 3.")
+        status.update({'running': False, 'complete': True, 'error': False})
+
+    except Exception as e:
+        plog(f"✗ Fatal error: {e}")
+        status.update({'running': False, 'error': True})
+
+
+@app.route('/api/tak-esri/conda/install', methods=['POST'])
+@login_required
+def tak_esri_conda_install():
+    if _tak_esri_conda_status.get('running'):
+        return jsonify({'error': 'Already running'}), 409
+    _tak_esri_conda_log.clear()
+    _tak_esri_conda_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=_run_tak_esri_conda_install, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/tak-esri/conda/log')
+@login_required
+def tak_esri_conda_log_api():
+    idx = request.args.get('index', 0, type=int)
+    return jsonify({
+        'entries': _tak_esri_conda_log[idx:],
+        'total': len(_tak_esri_conda_log),
+        'running': _tak_esri_conda_status['running'],
+        'complete': _tak_esri_conda_status['complete'],
+        'error': _tak_esri_conda_status['error'],
+    })
+
+
+@app.route('/api/tak-esri/conda/status')
+@login_required
+def tak_esri_conda_status_api():
+    conda_installed = os.path.exists(_CONDA_BIN)
+    arcgis_ready = False
+    arcgis_version = ''
+    if conda_installed:
+        r = subprocess.run(
+            [_CONDA_BIN, 'run', '-n', 'arcgis_env', 'python', '-c',
+             'import arcgis; print(arcgis.__version__)'],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode == 0 and r.stdout.strip():
+            arcgis_ready = True
+            arcgis_version = r.stdout.strip()
+    r2 = subprocess.run(['systemctl', 'is-active', 'arcgis-append.service'],
+                        capture_output=True, text=True)
+    return jsonify({
+        'conda_installed': conda_installed,
+        'arcgis_ready': arcgis_ready,
+        'arcgis_version': arcgis_version,
+        'append_state': (r2.stdout.strip() or 'unknown'),
+    })
+
+
+@app.route('/api/tak-esri/arcgis/test-signin', methods=['POST'])
+@login_required
+def tak_esri_arcgis_test_signin():
+    sign_in_script = os.path.join(TAK_ESRI_DIR, 'ArcGIS', 'sign-in.py')
+    if not os.path.exists(sign_in_script):
+        return jsonify({'success': False,
+                        'error': 'sign-in.py not found — save ArcGIS credentials and re-deploy first'}), 400
+    if not os.path.exists(_CONDA_BIN):
+        return jsonify({'success': False,
+                        'error': 'Miniconda not installed — complete Step 1 first'}), 400
+    try:
+        r = subprocess.run(
+            [_CONDA_BIN, 'run', '-n', 'arcgis_env', 'python', sign_in_script],
+            capture_output=True, text=True, timeout=60)
+        output = (r.stdout or '').strip()
+        err = (r.stderr or '').strip()
+        if r.returncode == 0 and output:
+            return jsonify({'success': True, 'username': output, 'output': output})
+        return jsonify({'success': False, 'error': err or output or 'Unknown error'})
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False,
+                        'error': 'Timed out (60 s) — check enterprise URL and credentials'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/tak-esri/arcgis/push', methods=['POST'])
+@login_required
+def tak_esri_arcgis_push():
+    push_script = os.path.join(TAK_ESRI_DIR, 'ArcGIS', 'push.py')
+    if not os.path.exists(push_script):
+        return jsonify({'success': False,
+                        'error': 'push.py not found — save ArcGIS credentials and re-deploy first'}), 400
+    if not os.path.exists(_CONDA_BIN):
+        return jsonify({'success': False, 'error': 'Miniconda not installed'}), 400
+    try:
+        r = subprocess.run(
+            [_CONDA_BIN, 'run', '-n', 'arcgis_env', 'python', push_script],
+            capture_output=True, text=True, timeout=120)
+        output = (r.stdout or '').strip()
+        err = (r.stderr or '').strip()
+        # Extract layer ID: "Feature layer created: <id>"
+        layer_id = ''
+        for line in output.splitlines():
+            if 'Feature layer created:' in line:
+                layer_id = line.split('Feature layer created:')[-1].strip()
+                break
+        if r.returncode == 0:
+            if layer_id:
+                cfg = _tak_esri_load_config()
+                cfg['feature_layer_id'] = layer_id
+                _tak_esri_save_config(cfg)
+            return jsonify({'success': True, 'output': output, 'layer_id': layer_id})
+        return jsonify({'success': False, 'error': err or output or 'Unknown error', 'output': output})
+    except subprocess.TimeoutExpired:
+        return jsonify({'success': False, 'error': 'Timed out (120 s)'})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
+
+@app.route('/api/tak-esri/arcgis/append/control', methods=['POST'])
+@login_required
+def tak_esri_arcgis_append_control():
+    data = request.get_json(silent=True) or {}
+    action = (data.get('action') or '').strip()
+    if action not in ('start', 'stop', 'restart', 'enable', 'disable'):
+        return jsonify({'error': 'Invalid action'}), 400
+    svc_path = '/etc/systemd/system/arcgis-append.service'
+    if action in ('start', 'enable') and not os.path.exists(svc_path):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        src = os.path.join(base_dir, 'modules', 'tak_esri', 'service-files', 'arcgis-append.service')
+        if not os.path.exists(src):
+            return jsonify({'error': 'arcgis-append.service source not found in module files'}), 500
+        import shutil
+        shutil.copy2(src, svc_path)
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+    r = subprocess.run(['systemctl', action, 'arcgis-append.service'],
+                       capture_output=True, text=True, timeout=15)
+    time.sleep(1)
+    r2 = subprocess.run(['systemctl', 'is-active', 'arcgis-append.service'],
+                        capture_output=True, text=True)
+    return jsonify({'success': r.returncode == 0, 'state': (r2.stdout.strip() or 'unknown')})
+
+
 TAK_ESRI_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
 <title>TAK-Esri — infra-TAK</title>
 <link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
@@ -20110,6 +20343,7 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
     {% if esri.installed %}<button class="tab" onclick="showTab('services')">🔧 Services</button>{% endif %}
     <button class="tab" onclick="showTab('deploy')">🚀 {% if esri.installed %}Re-Deploy{% else %}Deploy{% endif %}</button>
     {% if esri.installed %}<button class="tab" onclick="showTab('info')">ℹ️ Paths &amp; Files</button>{% endif %}
+    <button class="tab" onclick="showTab('arcgis');checkCondaStatus()">🗺️ ArcGIS Setup</button>
   </div>
 
   <!-- CONFIG TAB -->
@@ -20275,6 +20509,96 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
   </div>
   {% endif %}
 
+  <!-- ARCGIS SETUP TAB -->
+  <div id="tab-arcgis" class="tab-panel">
+
+    <!-- Environment status overview -->
+    <div class="card">
+      <div class="card-title">Environment Status</div>
+      <div class="grid-2">
+        <div class="info-item">
+          <div class="info-label">Miniconda</div>
+          <div class="info-value" id="st-conda" style="color:var(--text-dim)">—</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">ArcGIS SDK (arcgis_env)</div>
+          <div class="info-value" id="st-arcgis" style="color:var(--text-dim)">—</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Append Loop Service</div>
+          <div class="info-value" id="st-append" style="color:var(--text-dim)">—</div>
+        </div>
+        <div class="info-item">
+          <div class="info-label">Feature Layer ID</div>
+          <div class="info-value" id="st-layerid" style="font-size:11px;word-break:break-all">{% if cfg.feature_layer_id %}{{ cfg.feature_layer_id }}{% else %}<span style="color:var(--text-dim)">not set</span>{% endif %}</div>
+        </div>
+      </div>
+      <button class="btn btn-ghost" style="margin-top:14px;font-size:12px" onclick="checkCondaStatus()">↻ Refresh Status</button>
+    </div>
+
+    <!-- Step 1: Miniconda + SDK -->
+    <div class="card">
+      <div class="card-title">Step 1 — Install Miniconda + ArcGIS SDK</div>
+      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
+        Installs Miniconda to <code>/root/miniconda/</code>, creates an <code>arcgis_env</code> Python 3.9
+        environment, and installs the Esri ArcGIS SDK via <code>conda install -c esri arcgis</code>.
+        <br><strong style="color:var(--yellow)">⚠ This can take 10–20 minutes.</strong>
+        The log streams live below.
+      </p>
+      <div id="conda-log-box" class="log-box" style="display:none;margin-bottom:16px"></div>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <button id="conda-install-btn" class="btn btn-primary" onclick="startCondaInstall()">⬇ Install Miniconda + ArcGIS SDK</button>
+        <span id="conda-msg" style="font-size:12px"></span>
+      </div>
+    </div>
+
+    <!-- Step 2: Test credentials -->
+    <div class="card">
+      <div class="card-title">Step 2 — Test ArcGIS Credentials</div>
+      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
+        Runs <code>sign-in.py</code> inside <code>arcgis_env</code> and prints your ArcGIS username on success.
+        Make sure credentials are filled in the <strong>Configuration</strong> tab and the pipeline has been
+        deployed (so <code>sign-in.py</code> exists on disk).
+      </p>
+      <button class="btn btn-ghost" onclick="testSignin()">🔑 Test Sign-In</button>
+      <div id="signin-output" style="display:none;margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;padding:12px 14px;background:#070a12;border-radius:8px;border:1px solid var(--border);white-space:pre-wrap"></div>
+    </div>
+
+    <!-- Step 3: Create feature layer -->
+    <div class="card">
+      <div class="card-title">Step 3 — Create ArcGIS Feature Layer</div>
+      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
+        Runs <code>push.py</code> to publish <code>/var/www/html/cot-logged.csv</code> as a new feature layer
+        in your ArcGIS organisation. The printed layer ID is captured automatically, saved to your config,
+        and pre-filled in the Configuration tab — no copy-paste needed.
+      </p>
+      <button class="btn btn-ghost" onclick="runPush()">📤 Create Feature Layer</button>
+      <div id="push-output" style="display:none;margin-top:12px;font-family:'JetBrains Mono',monospace;font-size:12px;padding:12px 14px;background:#070a12;border-radius:8px;border:1px solid var(--border);white-space:pre-wrap"></div>
+    </div>
+
+    <!-- Step 4: Append loop service -->
+    <div class="card">
+      <div class="card-title">Step 4 — ArcGIS Append Loop</div>
+      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
+        Manages <code>arcgis-append.service</code> — a systemd unit that runs <code>append.py</code> inside the
+        conda environment and overwrites the ArcGIS feature layer with fresh CoT data every 60 seconds.
+        The service file is auto-installed on first Start.
+      </p>
+      <div style="display:flex;align-items:center;gap:12px;margin-bottom:16px">
+        <span style="font-size:13px;color:var(--text-dim)">Status:</span>
+        <span id="append-badge" class="svc-badge badge-unknown">unknown</span>
+      </div>
+      <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center">
+        <button class="btn btn-success" onclick="appendControl('start')">▶ Start</button>
+        <button class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="appendControl('stop')">■ Stop</button>
+        <button class="btn btn-ghost" onclick="appendControl('restart')">↺ Restart</button>
+        <button class="btn btn-ghost" style="font-size:12px" onclick="appendControl('enable')" title="Enable so it auto-starts on boot">Enable on Boot</button>
+        <span id="append-msg" style="font-size:12px;color:var(--text-dim)"></span>
+      </div>
+    </div>
+
+  </div>
+
 </div>
 
 <!-- Uninstall modal -->
@@ -20410,6 +20734,131 @@ function doUninstall(){
       msg.textContent='Uninstalled. Reloading…';
       setTimeout(function(){location.reload();},1200);
     }).catch(function(e){msg.textContent=e.message||'Request failed';});
+}
+
+// ── ArcGIS Setup tab ──────────────────────────────────────────────────────────
+var _condaLogIdx=0,_condaLogPoll=null;
+
+function checkCondaStatus(){
+  fetch('/api/tak-esri/conda/status',{credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      var elConda=document.getElementById('st-conda');
+      var elArcgis=document.getElementById('st-arcgis');
+      var elAppend=document.getElementById('st-append');
+      var elBadge=document.getElementById('append-badge');
+      if(elConda){elConda.textContent=d.conda_installed?'✓ Installed':'✗ Not installed';elConda.style.color=d.conda_installed?'var(--green)':'var(--red)';}
+      if(elArcgis){elArcgis.textContent=d.arcgis_ready?('✓ v'+d.arcgis_version):'✗ Not installed';elArcgis.style.color=d.arcgis_ready?'var(--green)':'var(--red)';}
+      var st=d.append_state||'unknown';
+      var stColor=st==='active'?'var(--green)':st==='failed'?'var(--red)':'var(--yellow)';
+      if(elAppend){elAppend.textContent=st;elAppend.style.color=stColor;}
+      if(elBadge){elBadge.textContent=st;elBadge.className='svc-badge badge-'+(st==='active'?'active':st==='failed'?'failed':'inactive');}
+    }).catch(function(){});
+}
+
+function startCondaInstall(){
+  var btn=document.getElementById('conda-install-btn');
+  var box=document.getElementById('conda-log-box');
+  var msg=document.getElementById('conda-msg');
+  if(btn){btn.disabled=true;btn.textContent='⏳ Installing…';}
+  if(box){box.style.display='block';box.textContent='';}
+  if(msg){msg.textContent='';msg.style.color='';}
+  _condaLogIdx=0;
+  fetch('/api/tak-esri/conda/install',{method:'POST',credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.error){
+        if(btn){btn.disabled=false;btn.textContent='✗ Error — Retry';}
+        if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}
+        return;
+      }
+      _condaLogPoll=setInterval(pollCondaLog,1500);
+    }).catch(function(){if(btn){btn.disabled=false;btn.textContent='✗ Failed — Retry';}});
+}
+
+function pollCondaLog(){
+  fetch('/api/tak-esri/conda/log?index='+_condaLogIdx,{credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      var box=document.getElementById('conda-log-box');
+      if(d.entries&&d.entries.length){
+        if(box)box.textContent+=(box.textContent?'\n':'')+d.entries.join('\n');
+        if(box)box.scrollTop=box.scrollHeight;
+        _condaLogIdx=d.total;
+      }
+      if(!d.running){
+        clearInterval(_condaLogPoll);_condaLogPoll=null;
+        var btn=document.getElementById('conda-install-btn');
+        var msg=document.getElementById('conda-msg');
+        if(d.error){
+          if(btn){btn.disabled=false;btn.textContent='✗ Failed — Retry';btn.className='btn btn-danger';}
+          if(msg){msg.textContent='Installation failed';msg.style.color='var(--red)';}
+        } else if(d.complete){
+          if(btn){btn.disabled=false;btn.textContent='✓ Installed — Re-run';btn.className='btn btn-success';}
+          if(msg){msg.textContent='✓ Ready';msg.style.color='var(--green)';}
+          checkCondaStatus();
+        }
+      }
+    }).catch(function(){});
+}
+
+function testSignin(){
+  var box=document.getElementById('signin-output');
+  if(box){box.style.display='block';box.textContent='Testing…';box.style.color='var(--text-dim)';}
+  fetch('/api/tak-esri/arcgis/test-signin',{method:'POST',credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(!box)return;
+      if(d.success){box.textContent='✓ Signed in as: '+d.username;box.style.color='var(--green)';}
+      else{box.textContent='✗ '+(d.error||'Login failed');box.style.color='var(--red)';}
+    }).catch(function(e){if(box){box.textContent='Request failed';box.style.color='var(--red)';}});
+}
+
+function runPush(){
+  var box=document.getElementById('push-output');
+  if(box){box.style.display='block';box.textContent='Running push.py… (may take up to 2 minutes)';box.style.color='var(--text-dim)';}
+  fetch('/api/tak-esri/arcgis/push',{method:'POST',credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(!box)return;
+      if(d.success){
+        var out=d.output||'Done';
+        if(d.layer_id){
+          out+='\n\n✓ Layer ID captured and saved: '+d.layer_id;
+          var inp=document.getElementById('feature_layer_id');
+          if(inp)inp.value=d.layer_id;
+          var stId=document.getElementById('st-layerid');
+          if(stId)stId.textContent=d.layer_id;
+          out+='\n  Re-Deploy the pipeline to regenerate append.py with this ID.';
+        }
+        box.textContent=out;box.style.color='var(--green)';
+      } else {
+        box.textContent='✗ '+(d.error||'Failed')+'\n\n'+(d.output||'');
+        box.style.color='var(--red)';
+      }
+    }).catch(function(e){if(box){box.textContent='Request failed';box.style.color='var(--red)';}});
+}
+
+function appendControl(action){
+  var badge=document.getElementById('append-badge');
+  var msg=document.getElementById('append-msg');
+  if(badge)badge.textContent='…';
+  if(msg){msg.textContent='';msg.style.color='';}
+  fetch('/api/tak-esri/arcgis/append/control',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({action:action}),credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.error){
+        if(badge)badge.textContent='error';
+        if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}
+        return;
+      }
+      var st=d.state||'unknown';
+      if(badge){badge.textContent=st;badge.className='svc-badge badge-'+(st==='active'?'active':st==='failed'?'failed':'inactive');}
+      var elAppend=document.getElementById('st-append');
+      if(elAppend){elAppend.textContent=st;elAppend.style.color=st==='active'?'var(--green)':st==='failed'?'var(--red)':'var(--yellow)';}
+      if(msg){msg.textContent=d.success?'Done':'Failed';msg.style.color=d.success?'var(--green)':'var(--red)';setTimeout(function(){msg.textContent='';},2500);}
+    }).catch(function(e){if(msg){msg.textContent='Request failed';msg.style.color='var(--red)';}});
 }
 
 {% if deploying %}

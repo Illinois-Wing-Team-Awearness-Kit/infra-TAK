@@ -19676,6 +19676,749 @@ def _ensure_docker_log_limits(log_fn=None):
         return False, err
 
 
+# ── TAK-Esri Integration ──────────────────────────────────────────────────────
+TAK_ESRI_SERVICES = ['csv-download', 'csv-cot', 'csv-kml', 'cot-csv']
+TAK_ESRI_DIR = '/opt/TAK-Esri'
+TAK_ESRI_WEBROOT = '/var/www/html'
+_tak_esri_install_log = []
+_tak_esri_install_status = {'running': False, 'complete': False, 'error': False}
+
+def _tak_esri_service_statuses():
+    """Return dict of service_name → 'active'|'inactive'|'failed'|'unknown'."""
+    result = {}
+    for svc in TAK_ESRI_SERVICES:
+        r = subprocess.run(['systemctl', 'is-active', f'{svc}.service'], capture_output=True, text=True)
+        result[svc] = r.stdout.strip() or 'unknown'
+    return result
+
+def _tak_esri_load_config():
+    s = load_settings()
+    return s.get('tak_esri', {})
+
+def _tak_esri_save_config(cfg):
+    s = load_settings()
+    s['tak_esri'] = cfg
+    save_settings(s)
+
+def _run_tak_esri_install():
+    """Background thread: install the TAK-Esri pipeline."""
+    log = _tak_esri_install_log
+    status = _tak_esri_install_status
+
+    def plog(msg):
+        entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        log.append(entry)
+        print(entry, flush=True)
+
+    try:
+        cfg = _tak_esri_load_config()
+        survey_url = (cfg.get('survey123_url') or '').strip()
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        src_python = os.path.join(base_dir, 'modules', 'tak_esri', 'python')
+        src_services = os.path.join(base_dir, 'modules', 'tak_esri', 'service-files')
+
+        # ── Phase 1: System packages ──────────────────────────────────────────
+        plog("━━━ Phase 1/5: Installing system packages ━━━")
+        pkgs = ['python3-geopandas', 'apache2', 'python3-pandas']
+        r = subprocess.run(['apt-get', 'install', '-y'] + pkgs,
+                           capture_output=True, text=True, timeout=300)
+        if r.returncode != 0:
+            plog(f"  ⚠ apt-get returned {r.returncode} — continuing anyway")
+            plog(f"  {(r.stderr or r.stdout or '')[:300]}")
+        else:
+            plog(f"  ✓ Packages installed: {', '.join(pkgs)}")
+
+        # Ensure apache2 is running
+        subprocess.run(['systemctl', 'enable', '--now', 'apache2'], capture_output=True, timeout=30)
+        plog("  ✓ Apache2 enabled")
+
+        # ── Phase 2: Working directory + Python scripts ───────────────────────
+        plog("")
+        plog("━━━ Phase 2/5: Deploying Python scripts to /opt/TAK-Esri ━━━")
+        os.makedirs(TAK_ESRI_DIR, exist_ok=True)
+        os.makedirs(os.path.join(TAK_ESRI_WEBROOT, 'cot-messages-logged'), exist_ok=True)
+
+        scripts = ['csv-cot.py', 'csv-kml.py', 'cot-csv.py', 'copy-cot-intake.py']
+        for script in scripts:
+            src = os.path.join(src_python, script)
+            dst = os.path.join(TAK_ESRI_DIR, script)
+            if os.path.exists(src):
+                import shutil
+                shutil.copy2(src, dst)
+                plog(f"  ✓ Deployed {script}")
+            else:
+                plog(f"  ✗ Source not found: {src}")
+                status.update({'running': False, 'error': True})
+                return
+
+        # Touch output files so services don't crash on missing files
+        for touch_file in ['survey-cot.txt', 'survey123.kml', 'cot-logged.txt', 'cot-logged.csv']:
+            path = os.path.join(TAK_ESRI_WEBROOT, touch_file)
+            if not os.path.exists(path):
+                open(path, 'a').close()
+                plog(f"  ✓ Created placeholder {touch_file}")
+
+        # ── Phase 3: Generate csv-download.py ────────────────────────────────
+        plog("")
+        plog("━━━ Phase 3/5: Generating csv-download.py ━━━")
+        if not survey_url:
+            plog("  ⚠ No Survey123 URL configured — writing placeholder csv-download.py")
+            plog("    Update the URL in the TAK-Esri settings and re-deploy.")
+            survey_url = 'https://REPLACE_WITH_YOUR_SURVEY123_FEATURE_LAYER_URL/0/query'
+        # Ensure URL ends with /0/query
+        if not survey_url.rstrip('/').endswith('/0/query'):
+            survey_url = survey_url.rstrip('/') + '/0/query'
+
+        csv_download_src = (
+            "import geopandas as gpd\n"
+            "import time\n\n"
+            f"url = {repr(survey_url)}\n\n"
+            "while True:\n"
+            "    try:\n"
+            "        gdf = gpd.read_file(url + '?where=1%3D1&outFields=*&f=geojson')\n"
+            "        gdf.to_csv('/opt/TAK-Esri/survey.csv', index=False)\n"
+            "        print('Feature layer downloaded')\n"
+            "    except Exception as e:\n"
+            "        print(f'Error downloading feature layer: {e}')\n"
+            "    time.sleep(30)\n"
+        )
+        with open(os.path.join(TAK_ESRI_DIR, 'csv-download.py'), 'w') as f:
+            f.write(csv_download_src)
+        plog(f"  ✓ csv-download.py written (URL: {survey_url})")
+
+        # ── Phase 4: ArcGIS scripts (optional) ───────────────────────────────
+        plog("")
+        plog("━━━ Phase 4/5: ArcGIS scripts ━━━")
+        arcgis_dir = os.path.join(TAK_ESRI_DIR, 'ArcGIS')
+        os.makedirs(arcgis_dir, exist_ok=True)
+        ag_url = (cfg.get('arcgis_enterprise_url') or '').strip()
+        ag_user = (cfg.get('arcgis_username') or '').strip()
+        ag_pass = (cfg.get('arcgis_password') or '').strip()
+        ag_layer = (cfg.get('feature_layer_id') or '').strip()
+
+        if ag_url and ag_user and ag_pass:
+            sign_in_src = (
+                "from arcgis.gis import GIS\n"
+                f"gis = GIS({repr(ag_url)}, {repr(ag_user)}, {repr(ag_pass)})\n"
+                "print(gis.properties.user.username)\n"
+            )
+            with open(os.path.join(arcgis_dir, 'sign-in.py'), 'w') as f:
+                f.write(sign_in_src)
+            plog("  ✓ sign-in.py written")
+
+            push_src = (
+                "from arcgis.gis import GIS\n"
+                "import pandas as pd\n\n"
+                f"gis = GIS({repr(ag_url)}, {repr(ag_user)}, {repr(ag_pass)})\n"
+                "df = pd.read_csv('/var/www/html/cot-logged.csv')\n\n"
+                "layer_props = {\n"
+                "    'title': 'TAK-Esri CoT Layer',\n"
+                "    'description': 'TAK CoT messages pushed from infra-TAK',\n"
+                "    'type': 'CSV'\n"
+                "}\n"
+                "item = gis.content.add(layer_props, '/var/www/html/cot-logged.csv')\n"
+                "item.publish()\n"
+                "item.share(everyone=True)\n"
+                "print('Feature layer created:', item.id)\n"
+            )
+            with open(os.path.join(arcgis_dir, 'push.py'), 'w') as f:
+                f.write(push_src)
+            plog("  ✓ push.py written")
+
+            if ag_layer:
+                append_src = (
+                    "from arcgis.gis import GIS\n"
+                    "from arcgis.features import FeatureLayerCollection\n"
+                    "import time\n\n"
+                    f"gis = GIS({repr(ag_url)}, {repr(ag_user)}, {repr(ag_pass)})\n"
+                    f"FEATURE_LAYER_ID = {repr(ag_layer)}\n\n"
+                    "while True:\n"
+                    "    try:\n"
+                    "        item = gis.content.get(FEATURE_LAYER_ID)\n"
+                    "        flc = FeatureLayerCollection.fromitem(item)\n"
+                    "        flc.manager.overwrite('/var/www/html/cot-logged.csv')\n"
+                    "        print('Layer updated')\n"
+                    "    except Exception as e:\n"
+                    "        print(f'Error updating layer: {e}')\n"
+                    "    time.sleep(60)\n"
+                )
+                with open(os.path.join(arcgis_dir, 'append.py'), 'w') as f:
+                    f.write(append_src)
+                plog("  ✓ append.py written (60 s overwrite loop)")
+            else:
+                plog("  ℹ  No Feature Layer ID — append.py skipped (run push.py first, then re-save config with the ID)")
+        else:
+            plog("  ℹ  ArcGIS credentials not set — skipping sign-in/push/append scripts")
+            plog("    Fill in ArcGIS settings on this page and click Save Config, then Deploy again.")
+
+        # ── Phase 5: systemd services ─────────────────────────────────────────
+        plog("")
+        plog("━━━ Phase 5/5: Installing systemd services ━━━")
+        for svc_file in [f'{s}.service' for s in TAK_ESRI_SERVICES]:
+            src = os.path.join(src_services, svc_file)
+            dst = os.path.join('/etc/systemd/system', svc_file)
+            if os.path.exists(src):
+                import shutil
+                shutil.copy2(src, dst)
+                plog(f"  ✓ Installed {svc_file}")
+            else:
+                plog(f"  ✗ Service file missing: {src}")
+
+        subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+        plog("  ✓ systemd daemon reloaded")
+
+        for svc in TAK_ESRI_SERVICES:
+            r = subprocess.run(['systemctl', 'enable', '--now', f'{svc}.service'],
+                               capture_output=True, text=True, timeout=30)
+            state = 'active' if r.returncode == 0 else f'error ({r.returncode})'
+            plog(f"  {'✓' if r.returncode == 0 else '✗'} {svc}.service → {state}")
+
+        plog("")
+        plog("✅ TAK-Esri installed. All four pipeline services are now running.")
+        plog("   → Survey123 data will be downloaded every 30 seconds")
+        plog("   → CoT XML served at:   http://<server>/survey-cot.txt")
+        plog("   → KML served at:       http://<server>/survey123.kml")
+        plog("   → CoT CSV written to:  /var/www/html/cot-logged.csv")
+        if ag_layer:
+            plog("   → ArcGIS feature layer will overwrite every 60 s (run append.py in conda env)")
+        status.update({'running': False, 'complete': True, 'error': False})
+
+    except Exception as e:
+        plog(f"✗ Fatal error: {e}")
+        status.update({'running': False, 'error': True})
+
+
+@app.route('/tak-esri')
+@login_required
+def tak_esri_page():
+    settings = load_settings()
+    modules = detect_modules()
+    esri = modules.get('tak_esri', {})
+    cfg = _tak_esri_load_config()
+    svc_statuses = _tak_esri_service_statuses() if esri.get('installed') else {}
+    return make_response(render_template_string(TAK_ESRI_TEMPLATE,
+        settings=settings, esri=esri, cfg=cfg,
+        svc_statuses=svc_statuses, version=VERSION,
+        tak_esri_dir=TAK_ESRI_DIR,
+        deploying=_tak_esri_install_status.get('running', False),
+        deploy_done=_tak_esri_install_status.get('complete', False),
+        deploy_error=_tak_esri_install_status.get('error', False)))
+
+
+@app.route('/api/tak-esri/save-config', methods=['POST'])
+@login_required
+def tak_esri_save_config():
+    data = request.get_json(silent=True) or {}
+    cfg = {
+        'survey123_url': (data.get('survey123_url') or '').strip(),
+        'arcgis_enterprise_url': (data.get('arcgis_enterprise_url') or '').strip(),
+        'arcgis_username': (data.get('arcgis_username') or '').strip(),
+        'arcgis_password': (data.get('arcgis_password') or '').strip(),
+        'feature_layer_id': (data.get('feature_layer_id') or '').strip(),
+    }
+    _tak_esri_save_config(cfg)
+    return jsonify({'success': True})
+
+
+@app.route('/api/tak-esri/install', methods=['POST'])
+@login_required
+def tak_esri_install():
+    if _tak_esri_install_status.get('running'):
+        return jsonify({'error': 'Installation already in progress'}), 409
+    data = request.get_json(silent=True) or {}
+    if data.get('config'):
+        _tak_esri_save_config(data['config'])
+    _tak_esri_install_log.clear()
+    _tak_esri_install_status.update({'running': True, 'complete': False, 'error': False})
+    threading.Thread(target=_run_tak_esri_install, daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/tak-esri/install/log')
+@login_required
+def tak_esri_install_log():
+    idx = request.args.get('index', 0, type=int)
+    return jsonify({
+        'entries': _tak_esri_install_log[idx:],
+        'total': len(_tak_esri_install_log),
+        'running': _tak_esri_install_status['running'],
+        'complete': _tak_esri_install_status['complete'],
+        'error': _tak_esri_install_status['error'],
+    })
+
+
+@app.route('/api/tak-esri/service-status')
+@login_required
+def tak_esri_service_status():
+    return jsonify(_tak_esri_service_statuses())
+
+
+@app.route('/api/tak-esri/service-control', methods=['POST'])
+@login_required
+def tak_esri_service_control():
+    data = request.get_json(silent=True) or {}
+    action = (data.get('action') or '').strip()
+    service = (data.get('service') or '').strip()
+    allowed_services = {f'{s}.service' for s in TAK_ESRI_SERVICES}
+    if service not in allowed_services or action not in ('start', 'stop', 'restart'):
+        return jsonify({'error': 'Invalid service or action'}), 400
+    r = subprocess.run(['systemctl', action, service], capture_output=True, text=True, timeout=15)
+    time.sleep(1)
+    r2 = subprocess.run(['systemctl', 'is-active', service], capture_output=True, text=True)
+    return jsonify({'success': r.returncode == 0, 'state': r2.stdout.strip()})
+
+
+@app.route('/api/tak-esri/uninstall', methods=['POST'])
+@login_required
+def tak_esri_uninstall():
+    data = request.get_json(silent=True) or {}
+    password = data.get('password', '')
+    auth = load_auth()
+    if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
+        return jsonify({'error': 'Invalid admin password'}), 403
+    steps = []
+    for svc in TAK_ESRI_SERVICES:
+        subprocess.run(['systemctl', 'disable', '--now', f'{svc}.service'],
+                       capture_output=True, timeout=15)
+        svc_path = f'/etc/systemd/system/{svc}.service'
+        if os.path.exists(svc_path):
+            os.remove(svc_path)
+        steps.append(f'Stopped and removed {svc}.service')
+    subprocess.run(['systemctl', 'daemon-reload'], capture_output=True, timeout=15)
+    import shutil
+    if os.path.exists(TAK_ESRI_DIR):
+        shutil.rmtree(TAK_ESRI_DIR)
+        steps.append('Removed /opt/TAK-Esri')
+    _tak_esri_install_status.update({'running': False, 'complete': False, 'error': False})
+    return jsonify({'success': True, 'steps': steps})
+
+
+TAK_ESRI_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>TAK-Esri — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.material-symbols-outlined{font-family:'Material Symbols Outlined';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:'JetBrains Mono',monospace;margin-top:2px}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.nav-icon{font-size:15px;width:18px;text-align:center}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{margin-bottom:28px}.page-header h1{font-size:22px;font-weight:700}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:16px}
+.status-banner{display:flex;align-items:center;gap:12px;padding:14px 18px;border-radius:10px;margin-bottom:20px;font-size:13px}
+.status-banner.running{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);color:var(--green)}
+.status-banner.stopped{background:rgba(234,179,8,.08);border:1px solid rgba(234,179,8,.2);color:var(--yellow)}
+.status-banner.not-installed{background:rgba(59,130,246,.08);border:1px solid rgba(59,130,246,.2);color:var(--accent)}
+.dot{width:8px;height:8px;border-radius:50%;background:currentColor;flex-shrink:0}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
+.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}
+.info-value{font-size:13px;font-family:'JetBrains Mono',monospace;word-break:break-all}
+.btn{display:inline-flex;align-items:center;gap:8px;padding:10px 20px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:opacity .15s}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn-primary{background:var(--accent);color:#fff}.btn-success{background:var(--green);color:#fff}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+.btn-danger{background:var(--red);color:#fff}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:10px 14px;color:var(--text-primary);font-size:13px;font-family:inherit}
+.form-input:focus{outline:none;border-color:var(--accent)}
+.form-group{margin-bottom:14px}
+.log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:380px;overflow-y:auto;white-space:pre-wrap;line-height:1.6}
+.svc-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
+.svc-row:last-child{border-bottom:none}
+.svc-name{font-family:'JetBrains Mono',monospace;font-size:13px}
+.svc-badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;font-family:'JetBrains Mono',monospace}
+.badge-active{background:rgba(16,185,129,.15);color:var(--green)}
+.badge-inactive{background:rgba(234,179,8,.15);color:var(--yellow)}
+.badge-failed{background:rgba(239,68,68,.15);color:var(--red)}
+.badge-unknown{background:rgba(148,163,184,.1);color:var(--text-dim)}
+.svc-btns{display:flex;gap:6px}
+.svc-btn{font-size:11px;padding:4px 12px;border-radius:6px;cursor:pointer;border:1px solid var(--border);background:rgba(255,255,255,.04);color:var(--text-secondary);font-family:inherit;transition:all .15s}
+.svc-btn:hover{color:var(--text-primary);border-color:var(--cyan)}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw}
+.modal h3{font-size:16px;margin-bottom:8px;color:var(--red)}.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
+.modal-actions{display:flex;gap:10px;justify-content:flex-end}
+.flow-diagram{display:flex;align-items:center;gap:0;flex-wrap:wrap;gap:4px;margin-top:4px}
+.flow-node{background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:8px 14px;font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--text-secondary)}
+.flow-arrow{color:var(--text-dim);font-size:18px;padding:0 2px}
+.tab-bar{display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:20px}
+.tab{padding:9px 18px;font-size:13px;font-weight:500;cursor:pointer;color:var(--text-dim);border-bottom:2px solid transparent;background:none;border-top:none;border-left:none;border-right:none;transition:all .15s}
+.tab.active{color:var(--cyan);border-bottom-color:var(--cyan)}
+.tab-panel{display:none}.tab-panel.active{display:block}
+.hint{font-size:12px;color:var(--text-dim);margin-top:6px}
+</style></head>
+<body>
+{{ sidebar_html }}
+<div class="main">
+  <div class="page-header">
+    <h1>🌐 TAK-Esri Integration</h1>
+    <p>Bidirectional bridge — Survey123 → TAK Server → ArcGIS Online/Enterprise</p>
+  </div>
+
+  <!-- Data flow diagram -->
+  <div class="card" style="margin-bottom:20px">
+    <div class="card-title">Data Flow</div>
+    <div class="flow-diagram">
+      <span class="flow-node">Survey123<br><small style="color:var(--text-dim)">Feature Layer</small></span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-node">csv-download.py<br><small style="color:var(--text-dim)">GeoJSON → CSV</small></span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-node">csv-cot.py<br><small style="color:var(--text-dim)">CSV → CoT XML</small></span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-node">survey-cot.txt<br><small style="color:var(--text-dim)">(Apache)</small></span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-node">TAK Server<br><small style="color:var(--text-dim)">CoT consumer</small></span>
+    </div>
+    <div class="flow-diagram" style="margin-top:10px">
+      <span class="flow-node">TAK Server<br><small style="color:var(--text-dim)">cot-logged.txt</small></span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-node">cot-csv.py<br><small style="color:var(--text-dim)">CoT → CSV</small></span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-node">append.py<br><small style="color:var(--text-dim)">(conda env)</small></span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-node">ArcGIS Feature Layer<br><small style="color:var(--text-dim)">every 60 s</small></span>
+    </div>
+    <div class="flow-diagram" style="margin-top:10px">
+      <span class="flow-node" style="opacity:.6">Parallel:</span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-node">csv-kml.py<br><small style="color:var(--text-dim)">CSV → KML</small></span>
+      <span class="flow-arrow">→</span>
+      <span class="flow-node">survey123.kml<br><small style="color:var(--text-dim)">(Apache)</small></span>
+    </div>
+  </div>
+
+  {% if esri.running %}
+  <div class="status-banner running"><div class="dot"></div>Pipeline is running — services are active</div>
+  {% elif esri.installed %}
+  <div class="status-banner stopped"><div class="dot"></div>Installed but one or more services are stopped</div>
+  {% else %}
+  <div class="status-banner not-installed"><div class="dot"></div>TAK-Esri is not yet installed — configure and deploy below</div>
+  {% endif %}
+
+  <div class="tab-bar">
+    <button class="tab active" onclick="showTab('config')">⚙️ Configuration</button>
+    {% if esri.installed %}<button class="tab" onclick="showTab('services')">🔧 Services</button>{% endif %}
+    <button class="tab" onclick="showTab('deploy')">🚀 {% if esri.installed %}Re-Deploy{% else %}Deploy{% endif %}</button>
+    {% if esri.installed %}<button class="tab" onclick="showTab('info')">ℹ️ Paths &amp; Files</button>{% endif %}
+  </div>
+
+  <!-- CONFIG TAB -->
+  <div id="tab-config" class="tab-panel active">
+    <div class="card">
+      <div class="card-title">Survey123 Connection</div>
+      <div class="form-group">
+        <label class="form-label">Survey123 Feature Layer URL</label>
+        <input id="survey123_url" class="form-input" type="text"
+               placeholder="https://services.arcgis.com/.../FeatureServer"
+               value="{{ cfg.survey123_url or '' }}">
+        <p class="hint">The full ArcGIS FeatureServer URL for your Survey123 form. The installer will append <code>/0/query</code> automatically if missing.</p>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">ArcGIS Online / Enterprise Credentials <span style="color:var(--text-dim);font-weight:400;font-size:11px">(optional — required for CoT → ArcGIS push)</span></div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">Enterprise / Portal URL</label>
+          <input id="arcgis_enterprise_url" class="form-input" type="text"
+                 placeholder="https://org.maps.arcgis.com"
+                 value="{{ cfg.arcgis_enterprise_url or '' }}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Username</label>
+          <input id="arcgis_username" class="form-input" type="text"
+                 placeholder="your_username"
+                 value="{{ cfg.arcgis_username or '' }}">
+        </div>
+      </div>
+      <div class="grid-2">
+        <div class="form-group">
+          <label class="form-label">Password</label>
+          <input id="arcgis_password" class="form-input" type="password"
+                 placeholder="••••••••"
+                 value="{{ cfg.arcgis_password or '' }}">
+        </div>
+        <div class="form-group">
+          <label class="form-label">Feature Layer ID <span style="color:var(--text-dim);font-weight:400">(from push.py output)</span></label>
+          <input id="feature_layer_id" class="form-input" type="text"
+                 placeholder="abc123def456..."
+                 value="{{ cfg.feature_layer_id or '' }}">
+        </div>
+      </div>
+      <p class="hint">⚠ ArcGIS credentials are stored in the infra-TAK settings file. The conda/arcgis-sdk environment must be set up separately — see the INSTALL_INSTRUCTIONS.md for Phase 6.</p>
+    </div>
+
+    <button class="btn btn-success" onclick="saveConfig()">💾 Save Configuration</button>
+    <span id="save-msg" style="font-size:12px;margin-left:12px"></span>
+  </div>
+
+  <!-- SERVICES TAB -->
+  {% if esri.installed %}
+  <div id="tab-services" class="tab-panel">
+    <div class="card">
+      <div class="card-title">systemd Services</div>
+      <div id="svc-list">
+        {% for svc, state in svc_statuses.items() %}
+        <div class="svc-row" id="svc-row-{{ svc }}">
+          <div>
+            <div class="svc-name">{{ svc }}.service</div>
+            <div style="font-size:11px;color:var(--text-dim);margin-top:2px">
+              {% if svc == 'csv-download' %}Polls Survey123 Feature Layer every 30 s → survey.csv
+              {% elif svc == 'csv-cot' %}Converts survey.csv → CoT XML → survey-cot.txt every 5 s
+              {% elif svc == 'csv-kml' %}Converts survey.csv → KML → survey123.kml every 5 s
+              {% elif svc == 'cot-csv' %}Parses cot-logged.txt → cot-logged.csv every 4 s
+              {% endif %}
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:10px">
+            <span id="badge-{{ svc }}" class="svc-badge badge-{{ state }}">{{ state }}</span>
+            <div class="svc-btns">
+              <button class="svc-btn" onclick="svcAction('{{ svc }}.service','start')">Start</button>
+              <button class="svc-btn" onclick="svcAction('{{ svc }}.service','stop')">Stop</button>
+              <button class="svc-btn" onclick="svcAction('{{ svc }}.service','restart')">Restart</button>
+            </div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      <div style="margin-top:16px">
+        <button class="btn btn-ghost" onclick="refreshStatuses()" style="font-size:12px">↻ Refresh statuses</button>
+        <span id="svc-msg" style="font-size:12px;margin-left:10px;color:var(--text-dim)"></span>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Quick Actions</div>
+      <div style="display:flex;gap:10px;flex-wrap:wrap">
+        <button class="btn btn-success" onclick="allSvcs('start')">▶ Start All</button>
+        <button class="btn btn-ghost" style="border-color:var(--yellow);color:var(--yellow)" onclick="allSvcs('stop')">■ Stop All</button>
+        <button class="btn btn-ghost" onclick="allSvcs('restart')">↺ Restart All</button>
+        <button class="btn btn-ghost" style="color:var(--red);border-color:var(--red)" onclick="document.getElementById('uninstall-modal').classList.add('open')">🗑 Uninstall</button>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- DEPLOY TAB -->
+  <div id="tab-deploy" class="tab-panel">
+    <div class="card">
+      <div class="card-title">{% if esri.installed %}Re-Deploy / Update{% else %}Deploy TAK-Esri{% endif %}</div>
+      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
+        Clicking Deploy will install system packages, copy pipeline scripts to <code>/opt/TAK-Esri/</code>,
+        generate <code>csv-download.py</code> from the saved Survey123 URL, write ArcGIS helper scripts,
+        and install &amp; enable all four systemd services.<br><br>
+        <strong>Note:</strong> The ArcGIS append loop (<code>append.py</code>) requires a separate Miniconda
+        environment with the Esri ArcGIS SDK — see the INSTALL_INSTRUCTIONS.md Phase 6.
+      </p>
+      {% if deploying %}
+      <div id="deploy-log-box" class="log-box" style="margin-bottom:16px">Waiting for log…</div>
+      <button class="btn btn-ghost" disabled>⏳ Installing…</button>
+      {% elif deploy_done %}
+      <div id="deploy-log-box" class="log-box" style="margin-bottom:16px"></div>
+      <button id="deploy-btn" class="btn btn-success" onclick="startDeploy()">✓ Deployed — Re-Deploy</button>
+      {% elif deploy_error %}
+      <div id="deploy-log-box" class="log-box" style="margin-bottom:16px"></div>
+      <button id="deploy-btn" class="btn btn-danger" onclick="startDeploy()" style="background:var(--red)">✗ Failed — Retry</button>
+      {% else %}
+      <div id="deploy-log-box" class="log-box" style="display:none;margin-bottom:16px"></div>
+      <button id="deploy-btn" class="btn btn-primary" onclick="startDeploy()">🚀 Deploy TAK-Esri</button>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- INFO TAB -->
+  {% if esri.installed %}
+  <div id="tab-info" class="tab-panel">
+    <div class="card">
+      <div class="card-title">Working Directory — /opt/TAK-Esri/</div>
+      <div class="grid-2">
+        <div class="info-item"><div class="info-label">Survey123 Data</div><div class="info-value">/opt/TAK-Esri/survey.csv</div></div>
+        <div class="info-item"><div class="info-label">Download Script</div><div class="info-value">/opt/TAK-Esri/csv-download.py</div></div>
+        <div class="info-item"><div class="info-label">CSV → CoT Script</div><div class="info-value">/opt/TAK-Esri/csv-cot.py</div></div>
+        <div class="info-item"><div class="info-label">CSV → KML Script</div><div class="info-value">/opt/TAK-Esri/csv-kml.py</div></div>
+        <div class="info-item"><div class="info-label">CoT → CSV Script</div><div class="info-value">/opt/TAK-Esri/cot-csv.py</div></div>
+        <div class="info-item"><div class="info-label">ArcGIS Scripts</div><div class="info-value">/opt/TAK-Esri/ArcGIS/</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">Apache Web Root — /var/www/html/</div>
+      <div class="grid-2">
+        <div class="info-item"><div class="info-label">CoT XML (TAK clients pull)</div><div class="info-value">/var/www/html/survey-cot.txt</div></div>
+        <div class="info-item"><div class="info-label">KML (Google Earth/QGIS)</div><div class="info-value">/var/www/html/survey123.kml</div></div>
+        <div class="info-item"><div class="info-label">CoT log (written by TAK)</div><div class="info-value">/var/www/html/cot-logged.txt</div></div>
+        <div class="info-item"><div class="info-label">CoT CSV (pushed to ArcGIS)</div><div class="info-value">/var/www/html/cot-logged.csv</div></div>
+        <div class="info-item"><div class="info-label">Timestamped CoT archives</div><div class="info-value">/var/www/html/cot-messages-logged/</div></div>
+      </div>
+    </div>
+    <div class="card">
+      <div class="card-title">ArcGIS Conda Setup (manual — Phase 6)</div>
+      <div style="font-family:'JetBrains Mono',monospace;font-size:12px;color:var(--text-secondary);line-height:2">
+        <div>conda create -n arcgis_env python=3.9 -y</div>
+        <div>conda activate arcgis_env</div>
+        <div>conda install -c esri arcgis -y</div>
+        <div>python /opt/TAK-Esri/ArcGIS/sign-in.py</div>
+        <div># Copy printed layer ID → paste into ArcGIS config above</div>
+        <div>python /opt/TAK-Esri/ArcGIS/push.py</div>
+        <div>python /opt/TAK-Esri/ArcGIS/append.py  # persistent loop</div>
+      </div>
+    </div>
+  </div>
+  {% endif %}
+
+</div>
+
+<!-- Uninstall modal -->
+<div class="modal-overlay" id="uninstall-modal">
+  <div class="modal">
+    <h3>⚠ Uninstall TAK-Esri?</h3>
+    <p>This will stop and remove all four systemd services and delete <code>/opt/TAK-Esri/</code>. Apache and existing output files in <code>/var/www/html/</code> are left intact.</p>
+    <div class="form-group">
+      <label class="form-label">Admin Password</label>
+      <input type="password" id="uninstall-password" class="form-input" placeholder="Enter admin password">
+    </div>
+    <p id="uninstall-msg" style="color:var(--red);font-size:12px;margin-bottom:8px"></p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" onclick="document.getElementById('uninstall-modal').classList.remove('open')">Cancel</button>
+      <button class="btn btn-danger" onclick="doUninstall()">Uninstall</button>
+    </div>
+  </div>
+</div>
+
+<script>
+function showTab(name){
+  document.querySelectorAll('.tab-panel').forEach(function(p){p.classList.remove('active')});
+  document.querySelectorAll('.tab').forEach(function(t){t.classList.remove('active')});
+  var panel=document.getElementById('tab-'+name);
+  if(panel) panel.classList.add('active');
+  var tabs=document.querySelectorAll('.tab');
+  var labels={'config':'⚙️ Configuration','services':'🔧 Services','deploy':'🚀 {% if esri.installed %}Re-Deploy{% else %}Deploy{% endif %}','info':'ℹ️ Paths & Files'};
+  tabs.forEach(function(t){if((t.textContent||'').trim().toLowerCase().indexOf(name.toLowerCase().replace('_',' '))>=0||(t.getAttribute('onclick')||'').indexOf("'"+name+"'")>=0){t.classList.add('active');}});
+}
+
+function collectConfig(){
+  return {
+    survey123_url:document.getElementById('survey123_url').value.trim(),
+    arcgis_enterprise_url:document.getElementById('arcgis_enterprise_url').value.trim(),
+    arcgis_username:document.getElementById('arcgis_username').value.trim(),
+    arcgis_password:document.getElementById('arcgis_password').value.trim(),
+    feature_layer_id:document.getElementById('feature_layer_id').value.trim()
+  };
+}
+
+function saveConfig(){
+  var msg=document.getElementById('save-msg');
+  msg.textContent='Saving…';msg.style.color='var(--text-dim)';
+  fetch('/api/tak-esri/save-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(collectConfig()),credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.success){msg.textContent='✓ Saved';msg.style.color='var(--green)';}
+      else{msg.textContent='✗ '+(d.error||'Error');msg.style.color='var(--red)';}
+      setTimeout(function(){msg.textContent='';},3000);
+    }).catch(function(e){msg.textContent='Request failed';msg.style.color='var(--red)';});
+}
+
+var _logIdx=0,_logPoll=null;
+function startDeploy(){
+  var btn=document.getElementById('deploy-btn');
+  var box=document.getElementById('deploy-log-box');
+  if(btn){btn.disabled=true;btn.textContent='⏳ Installing…';}
+  if(box){box.style.display='block';box.textContent='';}
+  _logIdx=0;
+  fetch('/api/tak-esri/install',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:collectConfig()}),credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.error){if(btn){btn.disabled=false;btn.textContent='✗ Error — Retry';}if(box)box.textContent=d.error;return;}
+      _logPoll=setInterval(pollLog,1200);
+    }).catch(function(e){if(btn){btn.disabled=false;btn.textContent='✗ Failed — Retry';}});
+}
+
+function pollLog(){
+  fetch('/api/tak-esri/install/log?index='+_logIdx,{credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      var box=document.getElementById('deploy-log-box');
+      if(d.entries&&d.entries.length){
+        if(box) box.textContent+=(box.textContent?'\n':'')+d.entries.join('\n');
+        if(box) box.scrollTop=box.scrollHeight;
+        _logIdx=d.total;
+      }
+      if(!d.running){
+        clearInterval(_logPoll);_logPoll=null;
+        var btn=document.getElementById('deploy-btn');
+        if(d.error){if(btn){btn.disabled=false;btn.textContent='✗ Failed — Retry';btn.className='btn btn-danger';}}
+        else if(d.complete){if(btn){btn.disabled=false;btn.textContent='✓ Deployed — Re-Deploy';btn.className='btn btn-success';}
+          setTimeout(function(){location.reload();},1500);}
+      }
+    }).catch(function(){});
+}
+
+function svcAction(svc,action){
+  fetch('/api/tak-esri/service-control',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({service:svc,action:action}),credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      var svcShort=svc.replace('.service','');
+      var badge=document.getElementById('badge-'+svcShort);
+      if(badge&&d.state){
+        badge.textContent=d.state;
+        badge.className='svc-badge badge-'+(d.state==='active'?'active':d.state==='failed'?'failed':'inactive');
+      }
+      var msg=document.getElementById('svc-msg');
+      if(msg){msg.textContent=d.success?'Done':'Failed';setTimeout(function(){msg.textContent='';},2000);}
+    }).catch(function(){});
+}
+
+function allSvcs(action){
+  ['csv-download','csv-cot','csv-kml','cot-csv'].forEach(function(s){svcAction(s+'.service',action);});
+}
+
+function refreshStatuses(){
+  fetch('/api/tak-esri/service-status',{credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      Object.keys(d).forEach(function(svc){
+        var badge=document.getElementById('badge-'+svc);
+        if(badge){
+          badge.textContent=d[svc];
+          badge.className='svc-badge badge-'+(d[svc]==='active'?'active':d[svc]==='failed'?'failed':'inactive');
+        }
+      });
+      var msg=document.getElementById('svc-msg');
+      if(msg){msg.textContent='Refreshed';setTimeout(function(){msg.textContent='';},1500);}
+    }).catch(function(){});
+}
+
+function doUninstall(){
+  var pw=document.getElementById('uninstall-password').value;
+  var msg=document.getElementById('uninstall-msg');
+  msg.textContent='';
+  fetch('/api/tak-esri/uninstall',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({password:pw}),credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.error){msg.textContent=d.error;return;}
+      msg.textContent='Uninstalled. Reloading…';
+      setTimeout(function(){location.reload();},1200);
+    }).catch(function(e){msg.textContent=e.message||'Request failed';});
+}
+
+{% if deploying %}
+_logPoll=setInterval(pollLog,1200);
+{% endif %}
+</script>
+</body></html>'''
+
+
 # ── Node-RED ──────────────────────────────────────────────────────────────────
 nodered_deploy_log = []
 nodered_deploy_status = {'running': False, 'complete': False, 'error': False, 'cancelled': False}

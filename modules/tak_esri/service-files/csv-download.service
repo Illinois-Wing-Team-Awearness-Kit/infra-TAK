@@ -1,0 +1,15 @@
+[Unit]
+Description=TAK-Esri — CSV Download (Survey123 poll)
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/TAK-Esri/csv-download.py
+WorkingDirectory=/opt/TAK-Esri
+StandardOutput=file:/var/log/tak-esri-csv-download.log
+StandardError=file:/var/log/tak-esri-csv-download.log
+Restart=on-failure
+RestartSec=10
+User=root
+
+[Install]
+WantedBy=multi-user.target

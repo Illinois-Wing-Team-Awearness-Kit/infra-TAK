@@ -1,0 +1,15 @@
+[Unit]
+Description=TAK-Esri — CSV to KML converter
+After=network.target
+
+[Service]
+ExecStart=/usr/bin/python3 /opt/TAK-Esri/csv-kml.py
+WorkingDirectory=/opt/TAK-Esri
+StandardOutput=journal
+StandardError=journal
+Restart=always
+RestartSec=5
+User=root
+
+[Install]
+WantedBy=multi-user.target

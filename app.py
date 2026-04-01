@@ -20063,6 +20063,47 @@ def tak_esri_test_download():
         return jsonify({'success': False, 'error': str(e)})
 
 
+
+
+@app.route('/api/tak-esri/apply-url', methods=['POST'])
+@login_required
+def tak_esri_apply_url():
+    """Save feature-layer URL, rewrite csv-download.py, restart service."""
+    data = request.get_json(silent=True) or {}
+    url = (data.get('survey123_url') or '').strip()
+    if not url:
+        return jsonify({'success': False, 'error': 'No URL provided'})
+    if not url.rstrip('/').endswith('/0/query'):
+        url = url.rstrip('/') + '/0/query'
+    # Persist
+    cfg = _tak_esri_load_config()
+    cfg['survey123_url'] = url
+    _tak_esri_save_config(cfg)
+    # Rewrite script
+    csv_download_src = (
+        "import geopandas as gpd\n"
+        "import time\n\n"
+        f"url = {repr(url)}\n\n"
+        "while True:\n"
+        "    try:\n"
+        "        gdf = gpd.read_file(url + '?where=1%3D1&outFields=*&f=geojson')\n"
+        "        gdf.to_csv('/opt/TAK-Esri/survey.csv', index=False)\n"
+        "        print('Feature layer downloaded')\n"
+        "    except Exception as e:\n"
+        "        print(f'Error: {e}')\n"
+        "    time.sleep(30)\n"
+    )
+    script_path = os.path.join(TAK_ESRI_DIR, 'csv-download.py')
+    try:
+        os.makedirs(TAK_ESRI_DIR, exist_ok=True)
+        with open(script_path, 'w') as fh:
+            fh.write(csv_download_src)
+        subprocess.run(['systemctl', 'restart', 'csv-download.service'],
+                       capture_output=True, timeout=15)
+        return jsonify({'success': True, 'url': url})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)})
+
 @app.route('/tak-esri/pipeline')
 @login_required
 def tak_esri_pipeline_page():
@@ -20345,26 +20386,6 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .form-input:focus{outline:none;border-color:var(--accent)}
 .form-group{margin-bottom:14px}
 .log-box{background:#070a12;border:1px solid var(--border);border-radius:8px;padding:16px;font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);max-height:380px;overflow-y:auto;white-space:pre-wrap;line-height:1.6}
-.svc-row{display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid var(--border)}
-.svc-row:last-child{border-bottom:none}
-.svc-name{font-family:'JetBrains Mono',monospace;font-size:13px}
-.svc-badge{font-size:11px;font-weight:600;padding:3px 10px;border-radius:20px;font-family:'JetBrains Mono',monospace}
-.badge-active{background:rgba(16,185,129,.15);color:var(--green)}
-.badge-inactive{background:rgba(234,179,8,.15);color:var(--yellow)}
-.badge-failed{background:rgba(239,68,68,.15);color:var(--red)}
-.badge-unknown{background:rgba(148,163,184,.1);color:var(--text-dim)}
-.svc-btns{display:flex;gap:6px}
-.svc-btn{font-size:11px;padding:4px 12px;border-radius:6px;cursor:pointer;border:1px solid var(--border);background:rgba(255,255,255,.04);color:var(--text-secondary);font-family:inherit;transition:all .15s}
-.svc-btn:hover{color:var(--text-primary);border-color:var(--cyan)}
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:1000;display:none;align-items:center;justify-content:center}
-.modal-overlay.open{display:flex}
-.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:420px;max-width:90vw}
-.modal h3{font-size:16px;margin-bottom:8px;color:var(--red)}.modal p{font-size:13px;color:var(--text-secondary);margin-bottom:20px}
-.modal-actions{display:flex;gap:10px;justify-content:flex-end}
-.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-.info-item{background:#0a0e1a;border-radius:8px;padding:12px 14px}
-.info-label{font-size:11px;color:var(--text-dim);margin-bottom:3px;text-transform:uppercase;letter-spacing:.05em}
-.info-value{font-size:13px;font-family:'JetBrains Mono',monospace;word-break:break-all}
 .tab-bar{display:flex;gap:0;border-bottom:1px solid var(--border);margin-bottom:20px}
 .tab{padding:9px 18px;font-size:13px;font-weight:500;cursor:pointer;color:var(--text-dim);border-bottom:2px solid transparent;background:none;border-top:none;border-left:none;border-right:none;transition:all .15s}
 .tab.active{color:var(--cyan);border-bottom-color:var(--cyan)}
@@ -20374,71 +20395,45 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
 .pill-active{background:rgba(16,185,129,.12);color:var(--green);border:1px solid rgba(16,185,129,.2)}
 .pill-inactive{background:rgba(234,179,8,.1);color:var(--yellow);border:1px solid rgba(234,179,8,.2)}
 .pill-unknown{background:rgba(148,163,184,.08);color:var(--text-dim);border:1px solid var(--border)}
+.pill-ready{background:rgba(6,182,212,.08);color:var(--cyan);border:1px solid rgba(6,182,212,.2)}
 .dot{width:7px;height:7px;border-radius:50%;background:currentColor;flex-shrink:0}
 .cta-box{background:rgba(6,182,212,.06);border:1px solid rgba(6,182,212,.2);border-radius:10px;padding:16px 20px;display:flex;align-items:center;justify-content:space-between;gap:12px;margin-top:16px}
-.breadcrumb{font-size:12px;color:var(--text-dim);margin-bottom:6px}
-.breadcrumb a{color:var(--cyan);text-decoration:none}
-.breadcrumb a:hover{text-decoration:underline}
+.info-row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-bottom:1px solid var(--border);font-size:13px}
+.info-row:last-child{border-bottom:none}
+.step-badge{display:inline-block;background:rgba(59,130,246,.15);color:var(--accent);border-radius:20px;padding:2px 10px;font-size:11px;font-weight:600;margin-right:6px}
+.warn-card{background:rgba(234,179,8,.05);border:1px solid rgba(234,179,8,.25);border-radius:10px;padding:14px 18px;font-size:13px;color:var(--yellow);margin-bottom:16px}
+.ok-card{background:rgba(16,185,129,.05);border:1px solid rgba(16,185,129,.2);border-radius:10px;padding:14px 18px;font-size:13px;color:var(--green);margin-bottom:16px}
 </style></head>
 <body>
 {{ sidebar_html }}
 <div class="main">
   <div class="page-header">
     <h1>🌐 TAK-Esri — Download Setup</h1>
-    <p>Step 1 of 2 — configure and verify the Survey123 feature-layer download before deploying the full pipeline.</p>
+    <p>Step 1 of 2 — install the download service, configure the feature layer URL, then verify data is flowing.</p>
   </div>
 
   <div class="tab-bar">
-    <button class="tab active" onclick="showTab('setup')">⚙️ Setup</button>
-    <button class="tab" onclick="showTab('deploy')">🚀 {% if esri.installed %}Re-Deploy{% else %}Deploy{% endif %}</button>
+    <button class="tab active" onclick="showTab('deploy')">🚀 {% if esri.installed %}Re-Deploy{% else %}Deploy{% endif %}</button>
+    <button class="tab" onclick="showTab('setup')">⚙️ Setup</button>
     <button class="tab" onclick="showTab('verify')">✅ Verify</button>
+    <button class="tab" onclick="showTab('conda');checkCondaStatus()">🐍 Conda</button>
   </div>
 
-  <!-- SETUP TAB -->
-  <div id="tab-setup" class="tab-panel active">
-    <div class="card">
-      <div class="card-title">Survey123 Feature Layer URL</div>
-      <div class="form-group">
-        <label class="form-label">Feature Layer URL</label>
-        <input id="survey123_url" class="form-input" type="text"
-               placeholder="https://services.arcgis.com/.../FeatureServer"
-               value="{{ cfg.survey123_url or '' }}">
-        <p class="hint">The ArcGIS FeatureServer URL for your Survey123 form. <code>/0/query</code> is appended automatically if missing.</p>
-      </div>
-      <div style="display:flex;align-items:center;gap:12px">
-        <button id="save-btn" class="btn btn-success" onclick="saveConfig()">💾 Save URL</button>
-        <span id="save-msg" style="font-size:12px;margin-left:4px"></span>
-      </div>
-    </div>
-
-    <div class="card">
-      <div class="card-title">What Phase 1 Deploys</div>
-      <div style="font-size:13px;color:var(--text-secondary);line-height:1.8">
-        <div>📦 <strong>Packages:</strong> python3-geopandas, python3-pandas, apache2</div>
-        <div>📄 <strong>Script:</strong> /opt/TAK-Esri/csv-download.py (generated from your URL)</div>
-        <div>⚙️ <strong>Service:</strong> csv-download.service (polls every 30 s → survey.csv)</div>
-      </div>
-      {% if esri.installed %}
-      <div style="margin-top:14px;display:flex;align-items:center;gap:10px">
-        <span style="font-size:13px;color:var(--text-dim)">csv-download.service:</span>
-        <span class="status-pill {% if csv_dl_active %}pill-active{% else %}pill-inactive{% endif %}">
-          <span class="dot"></span>{% if csv_dl_active %}active{% else %}inactive{% endif %}
-        </span>
-      </div>
-      {% endif %}
-    </div>
-  </div>
-
-  <!-- DEPLOY TAB -->
-  <div id="tab-deploy" class="tab-panel">
+  <!-- DEPLOY TAB (first / default) -->
+  <div id="tab-deploy" class="tab-panel active">
     <div class="card">
       <div class="card-title">{% if esri.installed %}Re-Deploy Phase 1{% else %}Deploy Phase 1{% endif %}</div>
-      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
-        Installs system packages, creates <code>/opt/TAK-Esri/</code>, generates
-        <code>csv-download.py</code> from the saved URL, then installs and starts
-        <code>csv-download.service</code>.<br><br>
-        Save your Survey123 URL on the <strong>Setup</strong> tab before clicking Deploy.
-      </p>
+      <div style="font-size:13px;color:var(--text-secondary);line-height:1.8;margin-bottom:16px">
+        Installs all dependencies and gets the download service running.<br>
+        <strong>What gets deployed:</strong>
+        <div style="margin-top:8px">
+          <div>📦 <strong>Packages:</strong> python3-geopandas, python3-pandas, apache2</div>
+          <div>📁 <strong>Directory:</strong> /opt/TAK-Esri/</div>
+          <div>📄 <strong>Script:</strong> csv-download.py (uses placeholder URL until configured)</div>
+          <div>⚙️ <strong>Service:</strong> csv-download.service (polls every 30 s → survey.csv)</div>
+        </div>
+      </div>
+      <p class="hint" style="margin-bottom:16px">After deploying, go to the <strong>Setup</strong> tab to enter your feature layer URL.</p>
       {% if deploying %}
       <div id="deploy-log-box" class="log-box" style="margin-bottom:16px">Waiting for log…</div>
       <button class="btn btn-ghost" disabled>⏳ Installing…</button>
@@ -20450,9 +20445,49 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <button id="deploy-btn" class="btn btn-danger" onclick="startDeploy()">✗ Failed — Retry</button>
       {% else %}
       <div id="deploy-log-box" class="log-box" style="display:none;margin-bottom:16px"></div>
-      <button id="deploy-btn" class="btn btn-primary" onclick="startDeploy()">🚀 Deploy Phase 1</button>
+      <button id="deploy-btn" class="btn btn-primary" onclick="startDeploy()">🚀 Deploy</button>
       {% endif %}
     </div>
+  </div>
+
+  <!-- SETUP TAB (second) -->
+  <div id="tab-setup" class="tab-panel">
+    {% if not esri.installed %}
+    <div class="warn-card">⚠ Deploy Phase 1 first before configuring the feature layer URL.</div>
+    {% endif %}
+    <div class="card">
+      <div class="card-title">Feature Layer URL</div>
+      <div class="form-group">
+        <label class="form-label">Survey123 / ArcGIS Feature Layer URL</label>
+        <input id="survey123_url" class="form-input" type="text"
+               placeholder="https://services.arcgis.com/.../FeatureServer"
+               value="{{ cfg.survey123_url or '' }}"
+               {% if not esri.installed %}disabled{% endif %}>
+        <p class="hint"><code>/0/query</code> is appended automatically if missing.</p>
+      </div>
+      <div style="display:flex;align-items:center;gap:12px">
+        <button id="apply-btn" class="btn btn-success" onclick="applyUrl()"
+                {% if not esri.installed %}disabled{% endif %}>💾 Save &amp; Apply</button>
+        <span id="apply-msg" style="font-size:12px;margin-left:4px"></span>
+      </div>
+      <p class="hint" style="margin-top:12px">Saves the URL, rewrites csv-download.py with the new URL, and restarts csv-download.service.</p>
+    </div>
+
+    {% if esri.installed %}
+    <div class="card">
+      <div class="card-title">Service Status</div>
+      <div class="info-row">
+        <span>csv-download.service</span>
+        <span class="status-pill {% if csv_dl_active %}pill-active{% else %}pill-inactive{% endif %}">
+          <span class="dot"></span>{% if csv_dl_active %}active{% else %}inactive{% endif %}
+        </span>
+      </div>
+      <div class="info-row">
+        <span>Current URL</span>
+        <span style="font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--text-dim);word-break:break-all;max-width:65%">{{ cfg.survey123_url or '(not set)' }}</span>
+      </div>
+    </div>
+    {% endif %}
   </div>
 
   <!-- VERIFY TAB -->
@@ -20461,14 +20496,19 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       <div class="card-title">Test Feature Layer Download</div>
       <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
         Runs a one-shot GeoJSON fetch from your Survey123 URL and saves the result to
-        <code>/opt/TAK-Esri/survey.csv</code>. Shows the row count and column names on success.
-        Phase 1 must be deployed first.
+        <code>/opt/TAK-Esri/survey.csv</code>. Shows row count and column names on success.
       </p>
+      {% if not esri.installed %}
+      <p style="font-size:13px;color:var(--accent)">Deploy Phase 1 first, then configure your URL on the Setup tab.</p>
+      {% elif not cfg.survey123_url %}
+      <p style="font-size:13px;color:var(--yellow)">⚠ No feature layer URL set — go to the <strong>Setup</strong> tab to add one.</p>
+      {% else %}
       <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
         <button id="test-dl-btn" class="btn btn-ghost" onclick="testDownload()">⬇ Test Download</button>
         <span id="test-dl-msg" style="font-size:12px"></span>
       </div>
       <div id="test-dl-result" style="display:none;margin-top:16px;padding:14px 16px;background:#070a12;border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;line-height:1.7"></div>
+      {% endif %}
     </div>
 
     {% if csv_dl_active %}
@@ -20479,15 +20519,37 @@ body{background:var(--bg-deep);color:var(--text-primary);font-family:'DM Sans',s
       </div>
       <a href="/tak-esri/pipeline" class="btn btn-primary">→ Go to Pipeline</a>
     </div>
-    {% elif esri.installed %}
-    <div class="card" style="border-color:rgba(234,179,8,.3)">
-      <p style="font-size:13px;color:var(--yellow)">⚠ csv-download.service is not active. Start it from the Deploy tab or check the service logs.</p>
-    </div>
-    {% else %}
-    <div class="card" style="border-color:rgba(59,130,246,.2)">
-      <p style="font-size:13px;color:var(--accent)">Deploy Phase 1 first, then come back here to verify the download.</p>
-    </div>
+    {% elif esri.installed and cfg.survey123_url %}
+    <div class="warn-card">⚠ csv-download.service is not active. Check the Deploy tab or service logs.</div>
     {% endif %}
+  </div>
+
+  <!-- CONDA TAB (new) -->
+  <div id="tab-conda" class="tab-panel">
+    <div id="conda-status-card" class="card">
+      <div class="card-title">Conda &amp; ArcGIS SDK Status</div>
+      <div id="conda-status-body" style="font-size:13px;color:var(--text-dim)">Checking…</div>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Install Miniconda + ArcGIS SDK</div>
+      <p style="font-size:13px;color:var(--text-secondary);margin-bottom:16px">
+        Installs Miniconda3 to <code>/root/miniconda/</code>, creates a <code>arcgis_env</code>
+        (Python 3.9) environment, and installs the <code>arcgis</code> package from the Esri channel.<br>
+        <strong>This can take 10–20 minutes.</strong> The log streams live below.
+      </p>
+      <div id="conda-log-box" class="log-box" style="display:none;margin-bottom:16px"></div>
+      <button id="conda-install-btn" class="btn btn-primary" onclick="startCondaInstall()">🐍 Install Conda + ArcGIS SDK</button>
+      <span id="conda-install-msg" style="font-size:12px;margin-left:12px"></span>
+    </div>
+
+    <div class="card">
+      <div class="card-title">Next Step</div>
+      <p style="font-size:13px;color:var(--text-secondary)">
+        Once Conda is ready, head to the <a href="/tak-esri/pipeline" style="color:var(--cyan)">Pipeline page</a>
+        → <strong>ArcGIS Setup</strong> tab to test your credentials, push the feature layer, and start the append loop.
+      </p>
+    </div>
   </div>
 
 </div>
@@ -20503,34 +20565,7 @@ function showTab(name){
   });
 }
 
-function saveConfig(){
-  var btn=document.getElementById('save-btn');
-  var msg=document.getElementById('save-msg');
-  var origLabel=btn?btn.textContent:'';
-  if(btn){btn.disabled=true;btn.textContent='Saving…';}
-  if(msg){msg.textContent='';msg.style.color='';}
-  fetch('/api/tak-esri/save-config',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({survey123_url:(document.getElementById('survey123_url')||{value:''}).value.trim()}),
-    credentials:'same-origin'})
-    .then(function(r){
-      if(!r.ok)throw new Error('HTTP '+r.status);
-      return r.json();
-    })
-    .then(function(d){
-      if(d.success){
-        if(btn){btn.disabled=false;btn.textContent='✓ URL Saved';btn.className='btn btn-success';}
-        if(msg){msg.textContent='';}
-        setTimeout(function(){if(btn){btn.textContent=origLabel;btn.className='btn btn-success';}},4000);
-      } else {
-        if(btn){btn.disabled=false;btn.textContent=origLabel;}
-        if(msg){msg.textContent='✗ '+(d.error||'Save failed');msg.style.color='var(--red)';}
-      }
-    }).catch(function(e){
-      if(btn){btn.disabled=false;btn.textContent=origLabel;}
-      if(msg){msg.textContent='✗ '+(e.message||'Request failed');msg.style.color='var(--red)';}
-    });
-}
-
+// ── Deploy ──────────────────────────────────────────────────────────────────
 var _logIdx=0,_logPoll=null;
 function startDeploy(){
   var btn=document.getElementById('deploy-btn');
@@ -20539,8 +20574,7 @@ function startDeploy(){
   if(box){box.style.display='block';box.textContent='';}
   _logIdx=0;
   fetch('/api/tak-esri/install',{method:'POST',headers:{'Content-Type':'application/json'},
-    body:JSON.stringify({phase:1,config:{survey123_url:document.getElementById('survey123_url').value.trim()}}),
-    credentials:'same-origin'})
+    body:JSON.stringify({phase:1}),credentials:'same-origin'})
     .then(function(r){return r.json();})
     .then(function(d){
       if(d.error){if(btn){btn.disabled=false;btn.textContent='✗ Error — Retry';}if(box)box.textContent=d.error;return;}
@@ -20567,6 +20601,34 @@ function pollLog(){
     }).catch(function(){});
 }
 
+// ── Apply URL ────────────────────────────────────────────────────────────────
+function applyUrl(){
+  var btn=document.getElementById('apply-btn');
+  var msg=document.getElementById('apply-msg');
+  var url=(document.getElementById('survey123_url')||{value:''}).value.trim();
+  if(!url){if(msg){msg.textContent='✗ Enter a URL first';msg.style.color='var(--red)';}return;}
+  var origLabel=btn?btn.textContent:'';
+  if(btn){btn.disabled=true;btn.textContent='Saving…';}
+  if(msg){msg.textContent='';msg.style.color='';}
+  fetch('/api/tak-esri/apply-url',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({survey123_url:url}),credentials:'same-origin'})
+    .then(function(r){if(!r.ok)throw new Error('HTTP '+r.status);return r.json();})
+    .then(function(d){
+      if(d.success){
+        if(btn){btn.disabled=false;btn.textContent='✓ Saved & Applied';btn.className='btn btn-success';}
+        if(msg){msg.textContent='';}
+        setTimeout(function(){if(btn){btn.textContent=origLabel;btn.className='btn btn-success';}},4000);
+      } else {
+        if(btn){btn.disabled=false;btn.textContent=origLabel;}
+        if(msg){msg.textContent='✗ '+(d.error||'Failed');msg.style.color='var(--red)';}
+      }
+    }).catch(function(e){
+      if(btn){btn.disabled=false;btn.textContent=origLabel;}
+      if(msg){msg.textContent='✗ '+(e.message||'Request failed');msg.style.color='var(--red)';}
+    });
+}
+
+// ── Test Download ────────────────────────────────────────────────────────────
 function testDownload(){
   var btn=document.getElementById('test-dl-btn');
   var msg=document.getElementById('test-dl-msg');
@@ -20580,20 +20642,91 @@ function testDownload(){
       if(btn){btn.disabled=false;btn.textContent='⬇ Test Download';}
       if(d.success){
         if(msg){msg.textContent='✓ Success';msg.style.color='var(--green)';}
-        var colList=(d.columns||[]).join(', ');
-        if(result){
-          result.style.display='block';result.style.color='var(--green)';
-          result.textContent='Rows: '+d.rows+'\nColumns: '+colList;
-        }
+        if(result){result.style.display='block';result.style.color='var(--green)';
+          result.textContent='Rows: '+d.rows+'\nColumns: '+(d.columns||[]).join(', ');}
       } else {
         if(msg){msg.textContent='✗ Failed';msg.style.color='var(--red)';}
         if(result){result.style.display='block';result.style.color='var(--red)';result.textContent=d.error||'Unknown error';}
       }
-      setTimeout(function(){if(msg)msg.textContent='';},4000);
+      setTimeout(function(){if(msg)msg.textContent='';},5000);
     }).catch(function(){
       if(btn){btn.disabled=false;btn.textContent='⬇ Test Download';}
       if(msg){msg.textContent='Request failed';msg.style.color='var(--red)';}
     });
+}
+
+// ── Conda ─────────────────────────────────────────────────────────────────────
+function checkCondaStatus(){
+  fetch('/api/tak-esri/conda/status',{credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      var body=document.getElementById('conda-status-body');
+      if(!body)return;
+      var html='<div style="display:flex;flex-direction:column;gap:10px">';
+      html+='<div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);padding-bottom:8px">';
+      html+='<span>Miniconda3 (/root/miniconda/)</span>';
+      html+=d.conda_installed
+        ?'<span class="status-pill pill-active"><span class="dot"></span>Installed</span>'
+        :'<span class="status-pill pill-inactive"><span class="dot"></span>Not installed</span>';
+      html+='</div>';
+      html+='<div style="display:flex;align-items:center;justify-content:space-between;border-bottom:1px solid var(--border);padding-bottom:8px">';
+      html+='<span>arcgis_env + ArcGIS SDK</span>';
+      html+=d.arcgis_ready
+        ?'<span class="status-pill pill-active"><span class="dot"></span>Ready (v'+d.arcgis_version+')</span>'
+        :'<span class="status-pill pill-inactive"><span class="dot"></span>Not installed</span>';
+      html+='</div>';
+      html+='</div>';
+      body.innerHTML=html;
+      if(d.arcgis_ready){
+        var installBtn=document.getElementById('conda-install-btn');
+        if(installBtn){installBtn.textContent='✓ Re-Install';installBtn.className='btn btn-ghost';}
+      }
+    }).catch(function(){
+      var body=document.getElementById('conda-status-body');
+      if(body)body.textContent='Could not fetch status.';
+    });
+}
+
+var _condaLogIdx=0,_condaLogPoll=null;
+function startCondaInstall(){
+  var btn=document.getElementById('conda-install-btn');
+  var box=document.getElementById('conda-log-box');
+  var msg=document.getElementById('conda-install-msg');
+  if(btn){btn.disabled=true;btn.textContent='⏳ Installing…';}
+  if(box){box.style.display='block';box.textContent='';}
+  if(msg){msg.textContent='';}
+  _condaLogIdx=0;
+  fetch('/api/tak-esri/conda/install',{method:'POST',credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      if(d.error){if(btn){btn.disabled=false;btn.textContent='✗ Error — Retry';}if(box)box.textContent=d.error;return;}
+      _condaLogPoll=setInterval(pollCondaLog,2000);
+    }).catch(function(){if(btn){btn.disabled=false;btn.textContent='✗ Failed — Retry';}});
+}
+function pollCondaLog(){
+  fetch('/api/tak-esri/conda/log?index='+_condaLogIdx,{credentials:'same-origin'})
+    .then(function(r){return r.json();})
+    .then(function(d){
+      var box=document.getElementById('conda-log-box');
+      if(d.entries&&d.entries.length){
+        if(box)box.textContent+=(box.textContent?'\n':'')+d.entries.join('\n');
+        if(box)box.scrollTop=box.scrollHeight;
+        _condaLogIdx=d.total;
+      }
+      if(!d.running){
+        clearInterval(_condaLogPoll);_condaLogPoll=null;
+        var btn=document.getElementById('conda-install-btn');
+        var msg=document.getElementById('conda-install-msg');
+        if(d.error){
+          if(btn){btn.disabled=false;btn.textContent='✗ Failed — Retry';btn.className='btn btn-danger';}
+          if(msg){msg.textContent='Install failed — check log above';msg.style.color='var(--red)';}
+        } else if(d.complete){
+          if(btn){btn.disabled=false;btn.textContent='✓ Done — Re-Install';btn.className='btn btn-success';}
+          if(msg){msg.textContent='✓ Conda + ArcGIS SDK ready';msg.style.color='var(--green)';}
+          checkCondaStatus();
+        }
+      }
+    }).catch(function(){});
 }
 
 {% if deploying %}

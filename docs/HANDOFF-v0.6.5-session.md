@@ -159,14 +159,9 @@ Bump `VERSION = "0.6.4-alpha"` → `VERSION = "0.6.5-alpha"` at `app.py:276`. No
 
 ### 8.5 Tag & push
 
-```bash
-git checkout main
-git merge --ff-only dev
-git tag -a v0.6.5-alpha -m "v0.6.5-alpha: Configurator stable-ID multi-field picker + multi-layer intersection + strict mission ownership + Purge Orphans"
-git push origin main --tags
-```
+**Do not** `git merge dev` into `main` — that copies **HANDOFF** and other internal-only files to `main`. Use the **selective merge** block in **`docs/COMMANDS.md`** (`git fetch` → `git checkout -B dev origin/dev` → `git checkout -B main origin/main` → `git checkout dev --` only the listed paths → Python `VERSION` check → `git commit` → `git push origin main` → `git tag v0.6.5-alpha` → `git push origin v0.6.5-alpha`).
 
-Before pushing the tag, confirm `git show v0.6.5-alpha:app.py | grep '^VERSION = '` prints `VERSION = "0.6.5-alpha"` (v0.6.4 taught us why — see `RELEASE-v0.6.4-alpha.md`).
+Before pushing the tag, confirm `git show HEAD:app.py | grep '^VERSION = '` prints `VERSION = "0.6.5-alpha"` (see `docs/RELEASE-v0.6.4-alpha.md` for why mismatches break **Update Now**).
 
 ---
 

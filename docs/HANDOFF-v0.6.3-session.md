@@ -209,6 +209,77 @@ Then delete/refresh `agent-transcripts` cache if needed; Guard Dog on all boxes 
 - **Icon catalog is read at deploy time**; adding new icon sets to `/opt/tak/icons` requires a `./deploy.sh`. Documented; fine for now.
 - **Large services (>5k features)**: Configurator still previews only the first 50 features. Filtering UI scales fine, but the preview table isn’t paginated. Not a regression — carried over from v0.6.2.
 
+### 9a. OBJECTID rotation on NOAA-style services — hash does not save us
+
+**Problem observed 2026-04-17 on NOAA FLOOD feed.** With `idField = OBJECTID`, a steady-state reconcile produced ~80 DELETE + ~15 PUT on a ~40-item feed, despite no real-world changes. Cause: NOAA republishes the "past week" storm reports feed periodically and **all OBJECTIDs rotate**. Every UID (`uidPrefix + idField`) changes → reconcile treats every item as "old UID gone, new UID added" → mass ATAK notifications every cycle.
+
+**Important clarification — the hash is for _change detection_, not _identity_:**
+
+```js
+// nodered/build-flows.js (FN_PARSE_COT)
+var hp = [gKey];                                                // geometry
+hp.push(String(a[cfg.mapping.idField] || ''));                  // ID field value
+if (cfg.style.labelField) hp.push(String(a[cfg.style.labelField] || ''));
+if (cfg.remarksFields) { for (...) hp.push(...); }
+var _hash = djb2(hp.join('|'));                                 // change-detection hash
+
+var uid = (cfg.uidPrefix || 'arcgis') + layerTag + String(idVal);  // identity still = idField
+```
+
+The **hash** only tells the engine whether a given **UID**'s content changed (skip vs re-stream). The **UID** itself is still built from `idField`. If `idField` rotates, the UID-level match in reconcile fails and items look deleted+added.
+
+**Current operator workaround (v0.6.3):** pick a stable non-OBJECTID field. For NOAA storm reports, `INCIDENT_CODE` appears stable and matches what was done on the known-good NOAA STORM (multi-layer) and POWER-OUTAGES (`IncidentId`) feeds.
+
+**v0.6.4 candidate — synthetic/compound ID option in the Configurator:**
+
+When the service exposes no stable native ID (or the operator wants extra insurance), let Step 3 offer:
+
+- A multi-select **"Compound ID fields"** picker (e.g. `INCIDENT_DATETIME + LATITUDE + LONGITUDE + INCIDENT_TYPE`).
+- Engine builds UID from a hash of those fields' values instead of a single attribute.
+- Stable across OBJECTID rotation because the underlying attributes describe the real-world event.
+
+Implementation notes (for the agent doing v0.6.4):
+
+1. Extend `mapping` schema in the saved config: `mapping.idFields` (array) alongside existing `mapping.idField` (string). If both present, `idFields` wins.
+2. In `FN_PARSE_COT`, change:
+   ```js
+   var idVal = a[cfg.mapping.idField] || ('f' + i);
+   ```
+   to:
+   ```js
+   var idVal;
+   if (cfg.mapping.idFields && cfg.mapping.idFields.length) {
+     var parts = cfg.mapping.idFields.map(function(f) { return String(a[f] || ''); });
+     idVal = djb2(parts.join('|'));  // stable synthetic ID
+   } else {
+     idVal = a[cfg.mapping.idField] || ('f' + i);
+   }
+   ```
+3. Configurator Step 3: add an **"Advanced — synthetic ID"** toggle that reveals the multi-select. When enabled, `idField` is disabled and `idFields` is used.
+4. Test matrix: NOAA FLOOD with compound `INCIDENT_DATETIME + LATITUDE + LONGITUDE + INCIDENT_TYPE` should give steady `0 streamed, N unchanged, 0 PUT, 0 DELETE` after one transition cycle.
+
+**Until v0.6.4 ships:** operator guidance is to pick a stable attribute or accept per-republish churn on NOAA-style feeds. Document in the README changelog for v0.6.3 that feeds with rotating OBJECTIDs should use a non-OBJECTID ID field.
+
+### 9b. Icon vs color mismatch between ATAK map and mission list
+
+**Problem observed 2026-04-17.** User selected an iconset PNG (`Hazard Flood`) and a blue class color in Step 3c. Mission list shows a **blue bullet**, map shows the **original black/white icon** — no tint. Not a bug; ATAK only tints iconset PNGs that were authored as monochrome templates.
+
+Operator options (already documented in v0.6.3 release path):
+
+- Want blue markers on map → **clear the icon**, keep color → ATAK's default point marker renders blue.
+- Want the icon to show cleanly → **pick the no-color (⊘) swatch** in Step 3c → list badge goes neutral.
+- Leave as-is → list color = quick class identifier, map icon = specific incident type.
+
+No engine change needed. A future nice-to-have: detect monochrome PNGs in the icon catalog and flag them as "tintable" in the picker.
+
+### 9c. Load function node — not templateable (existing dynamic tabs miss code fixes)
+
+**Observed 2026-04-17 while fixing `INVALID_EXPR` for spaces in configName.** The per-feed `Load <configName>` function node in each dynamic engine tab has the feed name baked in via several string interpolations (`configs[i].configName === '<name>'`, `node.warn('Polling: <name>')`, `topic: '<name>'`, etc.), so it carries **no `_templateKey`**. Result: bug fixes inside that function body do not auto-propagate via `deploy.sh` template sync — operators have to delete + re-save each affected engine tab.
+
+Today's fix (`af7e721`, sanitize `pollKey` for `global.get`/`set`) is already in `ENGINE_TAB_TEMPLATE`, so **new** tabs are fine. Existing tabs created pre-fix must be recreated.
+
+**v0.6.4 candidate:** refactor `fn_load` to read `cfg.configName` entirely from `msg.topic` (set by the inject node) or by looking up the enclosing tab's label. That removes the string interpolations, the function body becomes identical across all feeds, and it can carry a `_templateKey` like the other shared engine nodes — deploy.sh will auto-sync future fixes with no manual tab rebuild.
+
 ---
 
 ## 10. Git state at handoff

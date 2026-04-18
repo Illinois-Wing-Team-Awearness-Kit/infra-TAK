@@ -724,7 +724,7 @@ sudo systemctl restart takwerx-console
 
 When you want to release a version but **not** put internal/reference files on `main` (no HANDOFF, PROMPT, testing notes, retention PDFs, etc.), merge only the files users need to run, update, or start fresh. Run from repo root (e.g. `~/infra-TAK`).
 
-**Included on main:** app, overlay, start/scripts, static, modules, Guard Dog scripts, user-facing docs (README, COMMANDS, GUARDDOG, DISK-AND-LOGS, MEDIAMTX-TAKPORTAL-ACCESS, WORKFLOW-8446-WEBADMIN, REFERENCES, FED-HUB, FEDHUB-LOGIN-RUNBOOK, email template, OpenAPI spec), **docs/TESTING-UPDATES.md** (maintainer pre-release protocol), and **only the latest** release doc (e.g. `docs/RELEASE-v0.6.4-alpha.md` — change each release). Past release notes are on the GitHub Releases tab.
+**Included on main:** app, overlay, start/scripts, static, modules, Guard Dog scripts, user-facing docs (README, COMMANDS, GUARDDOG, DISK-AND-LOGS, MEDIAMTX-TAKPORTAL-ACCESS, WORKFLOW-8446-WEBADMIN, REFERENCES, FED-HUB, FEDHUB-LOGIN-RUNBOOK, email template, OpenAPI spec), **docs/TESTING-UPDATES.md** (maintainer pre-release protocol), and **only the latest** release doc (e.g. `docs/RELEASE-v0.6.5-alpha.md` — change each release). Past release notes are on the GitHub Releases tab.
 
 **Excluded from main:** older `docs/RELEASE-*.md` (only the current release is copied), `docs/HANDOFF-LDAP-AUTHENTIK.md`, `docs/PROMPT-update-handoff.txt`, `docs/TAK-Data-Retention-notes.md`, `docs/TAK_Server_Configuration_Guide.pdf`, `docs/TAK-Data-Retention-Tool.pdf`, `TESTING.md`, `scripts/ldap-diagnose-and-fix.sh` (and any other internal-only files you add to dev).
 
@@ -751,7 +751,7 @@ git checkout dev -- \
   scripts/guarddog/ \
   README.md \
   docs/COMMANDS.md \
-  docs/RELEASE-v0.6.4-alpha.md \
+  docs/RELEASE-v0.6.5-alpha.md \
   docs/TESTING-UPDATES.md \
   docs/GUARDDOG.md \
   docs/DISK-AND-LOGS.md \
@@ -769,7 +769,7 @@ git checkout dev -- \
 git add -A && git status
 python3 - <<'PY'
 import re, sys
-tag = "v0.6.4-alpha"  # change each release
+tag = "v0.6.5-alpha"  # change each release
 want = tag.lstrip("v")
 app = open("app.py", encoding="utf-8").read()
 m = re.search(r'^VERSION\s*=\s*"([^"]+)"', app, re.M)
@@ -782,13 +782,13 @@ if got != want:
     sys.exit(1)
 print(f"OK: app.py VERSION matches tag ({tag})")
 PY
-git commit -m "v0.6.4-alpha"
+git commit -m "v0.6.5-alpha"
 git push origin main
-git tag v0.6.4-alpha && git push origin v0.6.4-alpha
+git tag v0.6.5-alpha && git push origin v0.6.5-alpha
 git checkout dev
 ```
 
-**Note:** If a file doesn’t exist on dev (e.g. you removed `scripts/fix-mediamtx-stream-redirect.sh`), drop that line from the `git checkout dev --` list. For a new release, change the release doc (e.g. `docs/RELEASE-v0.3.2-alpha.md` → next release), the commit message, and the tag; then run the tag push. Keep the Python check in the block and update the `tag = "..."` line each release — it prevents update-loop bugs caused by VERSION/tag mismatch.
+**Note:** Do **not** `git merge dev` into `main` for a release — that would put **HANDOFF** and other internal-only files on `main`. Use **only** the `git checkout dev -- …` paths below. If a file doesn’t exist on dev (e.g. you removed `scripts/fix-mediamtx-stream-redirect.sh`), drop that line from the list. For a new release, change the release doc (e.g. `docs/RELEASE-v0.6.5-alpha.md` → next), the commit message, and the tag; then run the tag push. Keep the Python check and update the `tag = "..."` line each release — it prevents update-loop bugs when **`app.py` `VERSION`** does not match the Git tag. Before pushing a new tag, optionally run `git show $(git rev-parse HEAD):app.py | grep '^VERSION = '` and confirm it matches the tag (see [RELEASE-v0.6.4-alpha.md](RELEASE-v0.6.4-alpha.md)).
 
 ---
 

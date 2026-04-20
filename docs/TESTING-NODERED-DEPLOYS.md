@@ -36,6 +36,15 @@ git checkout -B dev origin/dev
 
 ---
 
+## ⛔ Never do a raw `docker cp` of flows.json
+
+```bash
+# WRONG — wipes all dynamic engine tabs (user feeds)
+docker cp nodered/flows.json nodered:/data/flows.json
+```
+
+Always use `deploy.sh`. It backs up global context, merges preserved engine tabs, restores credentials, then installs. A raw copy skips all of that and destroys every feed the operator configured. Recovery requires re-Saving each config in the Configurator to rebuild the engine tabs.
+
 ## What `deploy.sh` does (high level)
 
 - Copies **`build-flows.js`** / **`configurator.html`** into the **`nodered`** container and runs **`node build-flows.js`** to regenerate **`flows.json`** / **`template-functions.json`**.

@@ -1,5 +1,7 @@
 # Node-RED Deploy Cheat Sheet
 
+**Validate a full `dev` deploy + smoke tests:** **[docs/TESTING-NODERED-DEPLOYS.md](TESTING-NODERED-DEPLOYS.md)** (checkout `dev`, `./nodered/deploy.sh --no-pull`, curl + browser checks).
+
 After every `docker cp flows.json` + `docker restart nodered`, you need to reconfigure these settings in the Node-RED editor. Copy-paste from below.
 
 Node-RED uses **two separate TLS configs** to isolate streaming from the Mission API:

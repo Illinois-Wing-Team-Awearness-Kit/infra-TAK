@@ -105,6 +105,10 @@ Use **Guard Dog → Send test email** first if Email Relay is not verified.
 - Wrong **VERSION** vs tag after restart.
 - Service restart failures.
 
+## See also
+
+- **Node-RED / Configurator only** (checkout `dev`, `nodered/deploy.sh --no-pull`, curl + UI smoke tests): **[TESTING-NODERED-DEPLOYS.md](TESTING-NODERED-DEPLOYS.md)**
+
 ## Quick reference
 
 | Action | Who sees “Update Available”? |

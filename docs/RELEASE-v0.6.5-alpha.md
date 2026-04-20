@@ -27,17 +27,18 @@ A full three-step wizard that mirrors the ArcGIS Configurator in every detail.
 
 ### Step 2 — Field Mapping & Style
 
-- **Stable ID pill picker** — same interaction as ArcGIS; auto-suggests `GlobalID` / `OBJECTID` from discovered keys
+- **Stable ID pill picker** — same interaction as ArcGIS; blank on fresh config (no auto-selection)
 - **Time field** select (populated after Fetch) + **epoch-ms checkbox** — for feeds where timestamps are numeric epoch milliseconds
 - **Deduplicate by** select (populated after Fetch) — keeps latest record per value each poll cycle
-- **Label template pills** — click fields to compose callsigns; optional custom text prefix; live preview
-- **Remarks pills** — click fields to add in order; auto-suggests `type`, `mission`, `source`, `description`
+- **Label template pills** — click fields to compose callsigns; optional custom text prefix; live preview; blank on fresh config
+- **Remarks pills** — click fields to add in order; blank on fresh config
 - Style controls — stroke color, fill color, fill opacity, stroke weight, labels on/off, uppercase, center label
 
 ### Step 3 — TAK Integration & Save
 
 - **Time window (TTL)** — value + unit (Minutes / Hours / Days); `0` = no time filter, default CoT stale (1 h)
 - Data Sync Mission toggle, Config name, TAK Mission name, UID prefix, Creator UID, Strict mission ownership
+- **Save section matches ArcGIS** — Save & Generate Config JSON, Copy to Clipboard, Download, Export Template, Import Template buttons
 
 ### Attribute parsing
 
@@ -57,6 +58,36 @@ http in → fn_kml_prep → http request (main) → fn_kml_check_nl
 ```
 
 15-second request timeout on each hop; HTTP 4xx/5xx errors surface as JSON `{ error }` responses.
+
+### KML Engine — `require` bug fix
+
+The initial KML engine tab used `require('url')`, `require('https')`, and `require('http')` inside a `function` node. Node-RED's sandbox blocks `require`, causing every poll cycle to throw `ReferenceError: require is not defined`.
+
+**Fix:** engine tab now uses the same node chain pattern as the configurator fetch. `FN_KML_CHECK_NL` detects and resolves `<NetworkLink>` using `new URL()` (no require). `FN_KML_TO_FEATURES` is pure synchronous parsing. A dedicated `http request` node handles the inner NetworkLink fetch.
+
+```
+build_kml → GET KML (main) → check_nl (2 outputs)
+                                ├─ NetworkLink → GET KML (inner) → parse_kml → reconcile
+                                └─ No NetworkLink ──────────────→ parse_kml → reconcile
+```
+
+Confirmed working in production — `KML CA AIR INTEL` logs:
+```
+Polling KML: KML CA AIR INTEL
+KML CA AIR INTEL: dedup by source: 7 -> 4 features
+KML CA AIR INTEL: 4 CoT events built from 4 features
+KML CA AIR INTEL: 4 streamed, 0 unchanged, 4 PUT, 0 DELETE
+```
+
+### Saved config reload
+
+When reopening a saved KML config the Configurator now:
+1. Automatically calls Fetch to repopulate the sample attributes table with live data
+2. Restores all saved field selections (stable ID pills, time field, epoch-ms flag, dedup field, label template, remarks pills)
+
+### Google Earth logo
+
+Embedded in the source type selector card and top nav pill (matches ArcGIS / FAA TFR logo treatment).
 
 ---
 
@@ -125,13 +156,16 @@ Same post-update shape as v0.6.3 / v0.6.4: Guard Dog + Node-RED `deploy.sh` merg
 
 | Area | Change |
 |------|--------|
-| KML Configurator | Three-step wizard (`kmlStep1/2/3`); `Fetch` button; pill pickers for ID / label / remarks; time field + epoch-ms; dedup field; TTL value + unit; sample table |
-| KML fetch endpoint | `hi_kml_fetch` → `fn_kml_prep` → `hr_kml_main` → `fn_kml_check_nl` → `hr_kml_inner` → `fn_kml_parse` → `ho_kml_fetch`; 15 s timeout; NetworkLink follow |
+| KML Configurator | Three-step wizard (`kmlStep1/2/3`); Fetch button; pill pickers for ID / label / remarks (blank on fresh config); time field + epoch-ms; dedup field; TTL value + unit; sample table; save section matches ArcGIS (copy / download / export / import template) |
+| KML saved-config reload | `selectConfig()` fetches live KML then restores all saved field selections |
+| KML fetch endpoint | `hi_kml_fetch → fn_kml_prep → hr_kml_main → fn_kml_check_nl → hr_kml_inner → fn_kml_parse → ho_kml_fetch`; 15 s timeout; NetworkLink follow |
 | KML parse | `FN_KML_PARSE_FIELDS`: HTML attr table, ExtendedData/SimpleData, name/OBJECTID; up to 20 geo placemarks, 15 samples |
+| KML engine | Removed `require()` from `FN_KML_TO_FEATURES`; split into `FN_KML_CHECK_NL` + inner `http request` node; confirmed working in production |
 | ArcGIS Reconcile | `strictMode`, `oneShotPurge`, `cleanOrphans`; `isMultiLayerPass` via `msg._layerPrefix`; hotfix disables strict on multi-layer passes |
 | ArcGIS Engine | `FN_PARSE_COT`: `idFields[]` + legacy `idField`; compound UID `c` + djb2; `FN_RECONCILE` strict branches |
 | API | `POST /arcgis-tak/tak/purge-orphans`; `POST /arcgis-tak/kml/fetch` |
-| ArcGIS Configurator | Stable-ID pill picker; Step 5 strict checkbox; sidebar **Purge** |
+| ArcGIS Configurator | Stable-ID pill picker; Step 5 strict checkbox; sidebar Purge |
+| UI logos | Google Earth logo in KML source card + top nav; ArcGIS + FAA logos in respective source cards |
 | Docs | `docs/TESTING-NODERED-DEPLOYS.md` (new); `.cursorrules` deploy safety rule |
 | Artifacts | Regenerated `flows.json`, `template-functions.json` |
 

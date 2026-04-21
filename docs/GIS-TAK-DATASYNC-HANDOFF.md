@@ -75,11 +75,24 @@ TAK Portal's "Download Integration Certs" ZIP sometimes contains stale or mismat
 
 First attempt used `creatorUid=nodered-arcgis-engine` in the configurator but the TLS cert was for `nodered-global-airdata` → **403 Forbidden** on every PUT. The `creatorUid` in the URL **must match the CN (common name) of the client cert** the TLS config is using. Fix: set Creator UID in the configurator to the exact cert name.
 
-### 3. Mission `defaultRole` controls API writes, not just client UI
+### 3. Mission `defaultRole` and admin write access — RESOLVED 2026-04-20
 
-The DataSync feed "CA AIR INTEL" was created with `defaultRole: MISSION_READONLY_SUBSCRIBER` (permissions: `[MISSION_READ]` only). This blocked **all** PUT/DELETE calls from the integration user — **403 Forbidden** even with correct cert + creatorUid + group membership.
+**Original understanding (incorrect):** `MISSION_READONLY_SUBSCRIBER` as `defaultRole` was believed to block all API writes for everyone including admin, requiring `MISSION_SUBSCRIBER` to allow PUT/DELETE.
 
-**Fix**: The feed's default role must be **`MISSION_SUBSCRIBER`** (read/write) for the integration user to PUT contents via API. You set this when creating the feed in TAK Portal. "Read-only" means read-only for **everyone** — the API doesn't have a separate "write via API but read-only for clients" mode at the mission level.
+**Correct behavior:** TAK Server CAN support read-only missions where admin writes and field users only read. The mechanism:
+
+1. Create the mission with `defaultRole: MISSION_READONLY_SUBSCRIBER` in TAK Portal — field devices that subscribe get read-only automatically.
+2. Admin must be explicitly elevated to `MISSION_OWNER` after subscribing. TAK Server's `PUT /subscription` assigns the mission's `defaultRole` to the subscriber, **even for admin**. This silently downgrades admin to read-only.
+3. The fix: immediately after `PUT /subscription?uid=admin`, call `PUT /Marti/api/missions/{name}/role?username=admin&clientUid=admin&role=MISSION_OWNER`. This overrides the defaultRole assignment.
+
+**Implementation in infra-TAK (v0.6.7+):** The `Build subscribe URL` function node in all DataSync engine tabs (ArcGIS + TFR) performs the role elevation automatically, 5 seconds after subscribe, using a fire-and-forget `https.request()` with the admin cert at `/certs/admin.pem`. The warn log confirms it:
+```
+"Subscribing to READ ONLY TEST as admin"          ← subscribe fires
+"Elevated admin to MISSION_OWNER on READ ONLY TEST (HTTP 200)"  ← 5s later
+"CA AIR INTEL PUT -> 13 UIDs -> ..."              ← 30s later, writes succeed
+```
+
+**Verified 2026-04-20:** Mission created as `MISSION_READONLY_SUBSCRIBER`, admin cert (Node-RED) writes 13 UIDs successfully, ATAK field devices see the data read-only. No `defaultRole` change needed.
 
 ### 4. CoT must stream via TCP BEFORE the DataSync PUT
 
@@ -327,7 +340,7 @@ PUT /Marti/api/missions/{name}/contents (HTTPS :8443, TLS via admin.pem)
 
 | Setting | Value | Why |
 |---------|-------|-----|
-| `defaultRole` | `MISSION_SUBSCRIBER` | Required for PUT/DELETE to work. `MISSION_READONLY_SUBSCRIBER` silently blocks writes (returns 200 but UIDs don't stick). **TODO: test changing to READONLY after integration user is subscribed as SUBSCRIBER — may work if subscription role overrides default.** |
+| `defaultRole` | `MISSION_READONLY_SUBSCRIBER` | Set this for field-user read-only access. Node-RED auto-elevates admin to `MISSION_OWNER` after subscribe so writes succeed. Old workaround of requiring `MISSION_SUBSCRIBER` is no longer needed. |
 | Integration cert | `admin` (`CN=admin`) | Admin has `ROLE_ADMIN`, bypasses x509 group direction issues. Any cert can work IF it has IN direction on the mission's group AND is subscribed to the mission. |
 | Cert paths in `build-flows.js` | `cert: '/certs/admin.pem', key: '/certs/admin.key'` | These go in the `tls_tak` node's `cert`/`key` properties (NOT `certname`/`keyname` — see TLS lesson below). |
 | Passphrase | `atakatak` | Must be entered once in Node-RED TLS config UI after first deploy. Stored encrypted in `flows_cred.json`. |
@@ -488,26 +501,17 @@ req.write(body); req.end();
 ```
 Expect `204` on success. After deploying new flow code, Configurator settings (saved in global context) persist — no need to reconfigure feeds. Only the TLS passphrase needs to be injected (handled by the deploy command above).
 
-#### Tomorrow's priority: read-only missions
+#### Read-only missions — SOLVED 2026-04-20
 
-**Goal**: field users get `MISSION_READONLY_SUBSCRIBER` (can see data, can't edit) while admin retains write access to PUT/DELETE UIDs.
+**Goal achieved**: field users get `MISSION_READONLY_SUBSCRIBER` (can see data, can't edit), admin retains full write access via automatic role elevation in Node-RED flow.
 
-**Test plan**:
-1. Confirm current state works with `defaultRole: MISSION_SUBSCRIBER`
-2. Change `defaultRole` to `MISSION_READONLY_SUBSCRIBER` on one mission (e.g. CA AIR INTEL) via TAK Server GUI
-3. Check if admin's existing SUBSCRIBER subscription overrides the new default — does admin's PUT still return 200?
-4. If yes: done — new subscribers get read-only, admin keeps write
-5. If no: investigate `PUT /missions/{name}/subscription?uid=admin` with explicit role parameter, or whether `ROLE_ADMIN` cert bypasses role checks entirely
-6. Also test: create a brand new mission with `defaultRole: MISSION_READONLY_SUBSCRIBER` from the start, subscribe admin, and see if writes work
-
-**What we know so far**: `MISSION_READONLY_SUBSCRIBER` as default role previously blocked ALL writes (returns 200 but UIDs don't stick). But that was before we used the `admin` cert which has `ROLE_ADMIN`. Admin may bypass mission role checks entirely — needs testing.
+See "Known issue 3" above for full explanation. Summary: create mission as read-only in TAK Portal, Node-RED auto-elevates admin to `MISSION_OWNER` 5 seconds after every cold-start subscribe. No manual intervention needed.
 
 #### Open questions
 
-1. **Read-only default role + admin write** — see test plan above
-2. **`StreamingEndpointRewriteFilter` error** — cosmetic, not blocking data flow. May resolve if admin subscription propagates to streaming layer. Low priority.
-3. **Ghost mission package files on ATAK** — server shows 0 contents but ATAK still displays old files from Enterprise Sync era. Unsubscribe/resubscribe didn't clear them. May need to clear ATAK's local file cache manually (`/sdcard/atak/tools/datapackage/` or similar).
-4. **Non-admin integration user** — if we ever switch from admin to a dedicated user, that user needs: (a) IN direction on the mission's group, (b) explicit subscription to the mission, (c) cert CN matching the `creatorUid` in the Configurator.
+1. **`StreamingEndpointRewriteFilter` error** — cosmetic, not blocking data flow. Low priority.
+2. **Ghost mission package files on ATAK** — server shows 0 contents but ATAK still displays old files from Enterprise Sync era. Unsubscribe/resubscribe didn't clear them. May need to clear ATAK's local file cache manually (`/sdcard/atak/tools/datapackage/` or similar).
+3. **Non-admin integration user** — if we ever switch from admin to a dedicated user, that user needs: (a) IN direction on the mission's group, (b) explicit subscription to the mission, (c) cert CN matching the `creatorUid` in the Configurator, (d) explicit role elevation to `MISSION_OWNER` (same mechanism, different cert path).
 
 ### 2026-04-12 — New global integration user + DataSync PUT 403 / group direction investigation
 

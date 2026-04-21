@@ -140,6 +140,8 @@ Added `x509useGroupCacheRequiresExtKeyUsage="false"` to the generated `<auth>` b
 
 **Context:** Channels normally require an Extended Key Usage extension only added during enrollment. Setting this attribute to `false` makes TAK Server grant channels to all valid certs regardless of EKU — the right default when supporting non-enrollment devices.
 
+**How to apply on existing servers:** In the infra-TAK console, click **"Connect TAK Server to LDAP"** on the main dashboard. This re-patches `CoreConfig.xml` with the full `<auth>` block (including the new attribute) and restarts TAK Server. Existing certs and users are not affected — only the auth block is rewritten.
+
 ---
 
 ## Upgrade notes

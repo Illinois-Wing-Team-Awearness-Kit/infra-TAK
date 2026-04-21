@@ -16,6 +16,18 @@ Use docs/HANDOFF-LDAP-AUTHENTIK.md as the single source of truth for what's done
 
 ---
 
+## TAK Server Authentication Paths — Visual Reference
+
+The diagram below (credit: mytecknet.com) shows the three certificate authentication paths in TAK Server side by side. Key takeaways for the infra-TAK / Authentik setup:
+
+- **Manual cert generation (top):** `makeCert.sh` creates the cert; `certmod -g __ANON__` places the user in the flat file under the ANON group. Group can be changed with subsequent `certmod` calls.
+- **Certificate enrollment — Flat File (middle):** Client presents username/password → TAK Server validates against `UserAuthenticationFile.xml` → issues cert. User was pre-created in Manage Users.
+- **Certificate enrollment — AD/LDAP (bottom):** Client presents username/password → TAK Server sends the challenge to the AD/LDAP source (Authentik LDAP outpost in infra-TAK) → if validated, TAK Server issues the cert. The cert is always TAK Server-signed; Authentik handles identity validation in the middle of the flow. The user is **not** added to the flat file via this path.
+
+![TAK Server Authentication Diagrams](TAK-SERVER-AUTH-DIAGRAMS.png)
+
+---
+
 ## LDAP vs flat-file and `webadmin` (8446) — why infra-TAK strips one XML row
 
 **What we abandoned:** Deleting or emptying `UserAuthenticationFile.xml` wholesale, or expecting it to stay gone — TAK Server can **rewrite** that file on restart, so that approach was brittle.

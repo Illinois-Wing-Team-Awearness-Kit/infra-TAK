@@ -732,6 +732,8 @@ When you want to release a version but **not** put internal/reference files on `
 
 ```bash
 # 1) Sync local branches to remote (clean deterministic base)
+# NOTE: always run git fetch before git checkout -B so local tracking refs are current.
+# Without fetch, checkout -B uses a stale origin/dev pointer and deploys old code.
 git fetch origin --tags
 git checkout -B dev origin/dev
 

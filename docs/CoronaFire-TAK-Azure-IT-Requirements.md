@@ -161,26 +161,10 @@ The DB Node's private IP address must be configured as **static** (not dynamic) 
 - Azure Monitor enabled on both VMs
 - CPU, memory, and disk alerts at 85% threshold — notify fire department technical contact
 - VM availability alert — notify fire department technical contact on any unplanned downtime
-- Monthly cost report to fire department and city IT
 
 ---
 
-## 11. Estimated Monthly Cost
-
-Estimates based on pay-as-you-go pricing in East US region, April 2026. Actual costs may vary by region.
-
-| Item | SKU | Pay-as-you-go | 1-Year Reserved | Notes |
-|------|-----|---------------|-----------------|-------|
-| App Node | Standard_D16ds_v5 | ~$660/mo | ~$470/mo | Primary application server |
-| DB Node | Standard_E4ds_v5 | ~$210/mo | ~$142/mo | Database server |
-| Premium SSD Disks | P30 + P20 + OS disks | ~$110/mo | ~$110/mo | P30 on App Node required for disk performance |
-| Azure Backup | Daily snapshots | ~$30/mo | ~$30/mo | 30-day retention |
-| Networking / Egress | Public IP + egress | ~$20/mo | ~$20/mo | Estimated operational traffic |
-| **TOTAL ESTIMATED** | | **~$1,030/mo** | **~$772/mo** | **1-yr reserved recommended** |
-
----
-
-## 12. Provisioning Checklist for City IT
+## 11. Provisioning Checklist for City IT
 
 Before handing off to the fire department technical contact, please confirm:
 
@@ -201,7 +185,7 @@ Before handing off to the fire department technical contact, please confirm:
 
 ---
 
-## 13. Fire Department Technical Contact
+## 12. Fire Department Technical Contact
 
 All provisioning questions and access requests should be coordinated with the fire department technical contact. Once VMs are provisioned with OS and SSH access, the fire department will handle all application installation and configuration independently.
 

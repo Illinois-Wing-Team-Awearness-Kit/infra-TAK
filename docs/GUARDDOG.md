@@ -20,6 +20,9 @@ Guard Dog is TAK Server health monitoring and auto-recovery: nine monitors plus 
 | **Certificate**| Daily | Let's Encrypt / TAK Server cert expiry (`takserver-le.jks`) | Alert when **40 days or less** remaining until expiry. **v0.3.2-alpha+:** the watch script reads the **actual keystore alias** (TAK hostname), not a hardcoded `takserver` name — redeploy Guard Dog after upgrading so `/opt/tak-guarddog/tak-cert-watch.sh` updates. |
 | **Root CA / Intermediate CA** | Escalating | Monitors Root CA and Intermediate CA certificate expiry | First alert at 90 days, then 75, 60, 45, 30, then daily until expiry. Email includes CA name, days remaining, and exact expiry date. |
 
+
+> **Caddy certificates are NOT monitored by Guard Dog.** Caddy manages its own Let's Encrypt certificates (90-day validity) and auto-renews them when ~30 days remain. If your Caddy cert shows "1 month 19 days left," that is normal — Caddy will auto-renew autonomously and no action is needed. Guard Dog's **Certificate** monitor only watches `takserver-le.jks` (the TAK Server's JKS cert, separate from the web/HTTPS cert Caddy manages) and alerts at ≤ 40 days.
+
 ## Avoiding restart loops and boot races
 
 Guard Dog is designed so that **a restart does not trigger another monitor to restart again in a loop**. Multiple safeguards prevent that:

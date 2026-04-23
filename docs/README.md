@@ -18,7 +18,7 @@ Quick reference for what's in this folder. Internal docs (HANDOFF, session notes
 | Doc | What it covers |
 |-----|----------------|
 | [COMMANDS.md](COMMANDS.md) | Git workflow, deploy, merge dev→main, tagging |
-| [PULL-AND-RESTART.md](PULL-AND-RESTART.md) | Update from dev or main on a VPS |
+| [PULL-AND-RESTART.md](PULL-AND-RESTART.md) | Update from dev or main on a VPS; then **`bash nodered/deploy.sh`** for Node-RED |
 | [DISK-AND-LOGS.md](DISK-AND-LOGS.md) | Log rotation, disk cleanup |
 | [GUARDDOG.md](GUARDDOG.md) | Guard Dog monitor reference |
 | [WORKFLOW-8446-WEBADMIN.md](WORKFLOW-8446-WEBADMIN.md) | webadmin flat-file vs LDAP, 8446 login |

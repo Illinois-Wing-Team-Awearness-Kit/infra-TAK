@@ -26,6 +26,33 @@ git checkout -B dev origin/dev
 sudo systemctl restart takwerx-console
 ```
 
+## After pulling dev: redeploy Node-RED (Configurator / new flow tabs)
+
+Changes under `nodered/` (new tabs such as **PulsePoint**, `build-flows.js`, `configurator.html`) only affect the running **Docker** stack after you redeploy. Use the **same repo directory** as above:
+
+```bash
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
+bash nodered/deploy.sh
+```
+
+What **`nodered/deploy.sh`** does: runs **`git pull`** on your current branch (unless you pass **`--no-pull`**), runs **`build-flows.js`** inside the **`nodered`** container, copies **`flows.json`** and static assets, tries to preserve TLS/TCP settings from the running container, then **`docker restart nodered`**.
+
+If you **just** finished a manual `git fetch` / `git checkout` and do not want another pull:
+
+```bash
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
+bash nodered/deploy.sh --no-pull
+```
+
+Then:
+
+1. Open the **Node-RED** editor → click **Deploy** once if new tabs appear (TLS/TCP checklist: **[NODERED-DEPLOY.md](NODERED-DEPLOY.md)**).
+2. Open the **Configurator** (default: **`http://<host>:1880/configurator`**, or your Authentik/Caddy URL) to test feeds. If something is missing after a restart, **TAK Settings** → **Save** can restore flow context (see deploy script header comments).
+
+**No `grep -oP`?** `cd` to the path from `grep WorkingDirectory /etc/systemd/system/takwerx-console.service`, then run `bash nodered/deploy.sh`.
+
+**Maintainers:** full deploy smoke steps — **[TESTING-NODERED-DEPLOYS.md](TESTING-NODERED-DEPLOYS.md)**.
+
 ## Pull latest main (stable) and restart
 
 Prefer fetching **canonical** **`main`** (official repo). **`git fetch origin main`** only works if **`git remote -v`** points at **`takwerx/infra-TAK`**; otherwise **`origin/main`** can stay years out of date.

@@ -20,17 +20,16 @@
 
 | Commit | What |
 |--------|------|
-| `be3291e` | **fix:** added `tls: 'tls_tak'` to Tablet Command and PulsePoint TCP out nodes — they were missing TLS, CoT would not have flowed over encrypted connection |
-| `caff840` | **fix:** deploy.sh now validates context backup before stopping Node-RED; falls back to persistent host snapshot `/opt/tak/nodered-ctx-backup.json`; hard-aborts instead of silently wiping configs |
-| `8172389` | **feat:** per-source CoT TCP stream port on all 5 sources (ArcGIS, TC, PulsePoint, TFR, KML) — each source's config panel has its own "CoT TCP stream port" field; global TAK Settings port is the fallback |
+| `e21ddba` | **fix:** `ldap-authentication-login` session_duration=seconds=120 — password changes now propagate within 2 min instead of 24 hrs; revert token_validity (wrong field, silently ignored) |
+| `104d056` | **fix (reverted):** token_validity=minutes=2 on LDAP provider — this was the wrong field; superseded by e21ddba |
+| `fa1e859` | **fix:** TC AVL flow creation + add test connection button |
 
 ---
 
 ## What we are testing next
 
-1. **Tablet Command AVL streaming** — configure a TC agency in the Configurator, set a discrete CoT stream port, deploy, verify CoT appears in Node-RED debug and on TAK Server/ATAK
-2. **PulsePoint streaming** — same flow, confirm incidents arrive as CoT on the right port
-3. **Per-source port routing on TAK Server** — verify each source's ingest port routes to the correct channel/group
+1. **LDAP password propagation** — confirmed working on tak-10; new password takes effect immediately, old password rejected within 2 min
+2. **Node-RED work (separate chat)** — Tablet Command AVL streaming, PulsePoint, per-source port routing
 
 ---
 

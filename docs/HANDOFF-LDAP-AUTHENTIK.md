@@ -91,6 +91,68 @@ The diagram below (credit: mytecknet.com) shows the three certificate authentica
 | **v0.4.2** | TAK Portal `TAK_URL` FQDN; release notes + operator digest. |
 | **v0.4.3** | Guard Dog **8089**, **Authentik** probe + retry, **Auto-VACUUM** logging; **↻ Update Guard Dog** after console upgrade. |
 | **v0.4.4** | Guard Dog **8089** TCP connect probe replaces queue-depth (stops restart loops); **↻ Update Guard Dog** after console upgrade. |
+| **v0.7.3** | `ldap-authentication-login` `session_duration=seconds=120` — password propagation fix. |
+
+---
+
+## April 2026 — LDAP Cached Bind / Password Propagation (v0.7.3)
+
+### Problem
+
+Users who reset their password via TAK Portal could not log in with the new password for up to 24 hours. Old credentials continued to authenticate on iTAK/ATAK during that window.
+
+### Root Cause
+
+Authentik's LDAP outpost runs `bind_mode: cached`. When a user successfully authenticates, Authentik creates a session and caches the successful bind result for the lifetime of that session. Future bind attempts for the same user are served from cache without re-validating against the user store.
+
+TAK Portal resets passwords by calling Authentik's `POST /api/v3/core/users/{id}/set_password/` directly. This updates the stored credential but **does not invalidate existing sessions or cached binds**. The LDAP outpost continues to honour the cached session until it expires.
+
+The expiry is controlled by `session_duration` on the User Login stage bound to the LDAP flow (`ldap-authentication-login`). It was set to `seconds=0`, which Authentik interprets as "use the system default browser session duration" — effectively ~24 hours for LDAP cached binds.
+
+### Why Not `bind_mode: direct`?
+
+TAK Server is extremely chatty on LDAP — bind+search cycles on the order of every ~2 seconds while any client is connected (confirmed by Christian Elsen, AWS). `bind_mode: direct` re-executes the full authentication flow on every single bind request. At scale (hundreds of users, active sessions) this drives Authentik worker CPU and PostgreSQL connections to unsustainable levels. Cached mode is the correct architecture; the cache lifetime just needed to be bounded.
+
+### What Was Tried (and Why It Didn't Work)
+
+`token_validity` on the LDAP provider was patched to `minutes=2`. Authentik silently ignores this field on LDAP providers — it only applies to OAuth/proxy providers for cookie session duration. The API accepted the PATCH but the field had no effect on LDAP bind caching. Confirmed by reading the field back after PATCH: it returned `null`.
+
+### Fix (v0.7.3)
+
+Set `session_duration: seconds=120` on the `ldap-authentication-login` User Login stage. This bounds the cached bind session to 2 minutes. After a password reset, the old credential will be rejected within 2 minutes as the cache expires.
+
+**API verification:**
+```bash
+TOKEN=$(grep AUTHENTIK_BOOTSTRAP_TOKEN ~/authentik/.env | cut -d= -f2)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:9090/api/v3/stages/user_login/?search=ldap' | \
+  python3 -c "import sys,json; r=json.loads(sys.stdin.read())['results']; [print(f'name={s[\"name\"]} session_duration={s.get(\"session_duration\")}') for s in r]"
+# Expected: name=ldap-authentication-login session_duration=seconds=120
+```
+
+**Manual patch (emergency, without console Resync):**
+```bash
+TOKEN=$(grep AUTHENTIK_BOOTSTRAP_TOKEN ~/authentik/.env | cut -d= -f2)
+STAGE_PK=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:9090/api/v3/stages/user_login/?search=ldap' | \
+  python3 -c "import sys,json; print(json.loads(sys.stdin.read())['results'][0]['pk'])")
+curl -s -X PATCH \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"session_duration": "seconds=120"}' \
+  "http://127.0.0.1:9090/api/v3/stages/user_login/${STAGE_PK}/"
+```
+
+### How It's Automated
+
+`_ensure_ldap_flow_authentication_none()` (called by **Resync LDAP to TAK Server**) now unconditionally looks up `ldap-authentication-login` by name and patches `session_duration=seconds=120` on every run. This means:
+- Existing deployments: self-heal after one Resync
+- Fresh deploys: blueprint YAML sets `seconds=120` at creation time
+- Future console updates: Resync run during auto-update re-applies the value idempotently
+
+### Scope / Boundaries
+
+infra-TAK does not control TAK Portal's password reset flow. TAK Portal calls Authentik's `set_password` API directly without session invalidation. That is a TAK Portal upstream limitation. The infra-TAK fix works around it by ensuring the cache window is short enough to be operationally acceptable (2 minutes vs 24 hours).
 
 ---
 

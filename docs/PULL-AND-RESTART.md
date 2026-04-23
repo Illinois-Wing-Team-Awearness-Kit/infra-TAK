@@ -77,6 +77,21 @@ git remote set-branches origin '*'
 
 Then retry the pull commands above. This only happens on VPS installs that used `--depth 1`.
 
+## `checkout` / `git pull` blocked: local changes to `nodered/flows.json`
+
+After **`nodered/deploy.sh`** (or copying flows from the container), **`git status`** may show **`nodered/flows.json`** modified. **`git checkout dev`** or **`git pull`** then aborts with *would be overwritten*.
+
+If you do **not** need to keep those working-tree edits (you will rebuild flows on deploy anyway):
+
+```bash
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
+git restore nodered/flows.json
+```
+
+Older Git: **`git checkout -- nodered/flows.json`**. Then retry **Pull latest dev** (or **`git pull`**) and **`bash nodered/deploy.sh`**.
+
+To keep a copy first: **`cp nodered/flows.json /tmp/flows.json.bak`** then restore as above.
+
 ## Upgrading to v0.2.0+
 
 v0.2.0 switches from Flask dev server to gunicorn (production server). After pulling, run `start.sh` once to upgrade the service:

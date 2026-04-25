@@ -768,7 +768,8 @@ git checkout dev -- \
   docs/FED-HUB.md \
   docs/FEDHUB-LOGIN-RUNBOOK.md \
   docs/email-template-user-created-without-password.html \
-  docs/TAK_Server_OpenAPI_v0.json
+  docs/TAK_Server_OpenAPI_v0.json \
+  docs/EXTERNAL-DB-SETUP.md
 git add -A && git status
 python3 - <<'PY'
 import re, sys

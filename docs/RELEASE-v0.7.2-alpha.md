@@ -32,3 +32,15 @@ Then update to v0.7.2-alpha normally.
 |------|--------|
 | `nodered/deploy.sh` | `chown -R node-red:node-red /data/context` after `docker start` |
 | `app.py` | Same chown after context migration `docker cp`; VERSION → 0.7.2-alpha |
+
+---
+
+## ⚠️ Reminder from v0.7.1: Resync LDAP to TAK Server
+
+If you haven't already done this after updating to v0.7.1, **do it now.**
+
+Go to **TAK Server page → Resync LDAP to TAK Server**.
+
+This fixes password changes taking up to 24 hours to propagate to ATAK/iTAK devices. Without this one-click fix, users who reset their password can still authenticate with the old password for up to 24 hours. After Resync, new passwords take effect within 2 minutes.
+
+This applies to every existing deployment. Fresh installs get the correct setting automatically.

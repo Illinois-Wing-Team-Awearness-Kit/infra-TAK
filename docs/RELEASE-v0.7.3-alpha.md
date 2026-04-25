@@ -1,4 +1,16 @@
-# v0.7.3-alpha — Immediate Password Propagation via LDAP Session Fix
+# v0.7.3-alpha Release Notes
+
+---
+
+## ⚠️ ACTION REQUIRED FOR EXISTING DEPLOYMENTS
+
+After pulling this update, go to the **TAK Server page → Resync LDAP to TAK Server**.
+
+This fixes password changes taking up to 24 hours to take effect on ATAK/iTAK devices. The fix is applied automatically every time Resync runs — one click and your deployment is current.
+
+---
+
+# Part 1 — Immediate Password Propagation via LDAP Session Fix
 
 ## What's New
 

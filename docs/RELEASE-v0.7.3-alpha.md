@@ -75,6 +75,16 @@ After updating, watch the Node-RED debug sidebar for one of:
 
 **For your data:** if `arcgis_configs` was stored as a stringified array (the most common corruption mode), the actual config bytes are still on disk — `JSON.parse` recovers them losslessly. Your `serviceUrl`, `where` clauses, field mappings, colors, remarks templates — everything comes back exactly as you saved it. If a key was completely missing (e.g. `pp_configs` lost during multi-agency migration), it gets re-created as empty and you'll need to re-add those agencies in the Configurator.
 
+### Last-mile hardening: configs are now unloseable, period
+
+After Bug 1-4 were fixed, one more pass added three never-lose-data guarantees so that even an unforeseen corruption mode can't wipe configs silently:
+
+- **Quarantine on coerce in `ctx_cleanup_fn`**: if a value can't be normalized into the expected type AND the original was non-empty, the original is saved to `<key>_quarantine_<timestamp>` BEFORE replacing with empty. Recoverable via `/context/global` REST API.
+- **Quarantine in `fn_deploy_restore`**: if a deploy.sh-supplied value can't be coerced AND the existing in-memory cache value is good and non-empty, the existing value is **kept** and the bad payload is quarantined. Even if a future deploy.sh sends garbage, your live configs survive.
+- **Shrink gate in `deploy.sh`**: before writing the normalized `global.json`, deploy.sh compares it to the existing on-disk file. If any `*_configs` key would shrink from non-empty to empty, deploy.sh **refuses to overwrite** and logs `!! REFUSING to overwrite global.json`. Existing on-disk data stays intact.
+
+Net effect: there is no longer any single code path that can wipe Configurator state on update. Worst case a value becomes unusable AND gets quarantined for inspection — never silently zeroed.
+
 ### What this means for you
 
 - **New installs**: Saves are written to disk *the instant you click Save*. Configs are durable across any restart, kill, or update.

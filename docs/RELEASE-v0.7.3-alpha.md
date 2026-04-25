@@ -1,5 +1,7 @@
 # v0.7.3-alpha Release Notes
 
+> **Note:** v0.7.1-alpha and v0.7.2-alpha were dev milestones that never shipped to main. All of their changes are included here in this release.
+
 ---
 
 ## ⚠️ ACTION REQUIRED FOR EXISTING DEPLOYMENTS
@@ -10,7 +12,72 @@ This fixes password changes taking up to 24 hours to take effect on ATAK/iTAK de
 
 ---
 
-# Part 1 — Immediate Password Propagation via LDAP Session Fix
+# Part 1 — Critical: Node-RED Configs Wiped on Update Now (v0.7.1)
+
+## What Was Fixed
+
+Older installs stored Node-RED global context **in memory only** (default `contextStorage`). Any container restart wiped every Configurator config — ArcGIS layers, KML feeds, TAK settings, IPAWS — with no recovery path.
+
+During **Update Now**, `deploy.sh` tried to `docker cp` the context file out of the container before stopping it. The file didn't exist (memory storage never writes it), so the backup silently failed, the container stopped, and on restart all configs appeared erased.
+
+**Fix (`app.py` — `_auto_nodered_settings()`):**
+- Detects missing `contextStorage` in `settings.js`
+- Before patching, exports the **live in-memory context** via the Node-RED REST API (`GET /context/global`) while the container is still running
+- Writes it to `/data/context/global/global.json` inside the container
+- Then adds `contextStorage: localfilesystem` to `settings.js` and restarts
+- On restart Node-RED loads from the file — **no config loss**
+- All subsequent deploys are safe because context is now on disk
+
+**Fix (`nodered/deploy.sh`):**
+- Context backup now uses **REST API first** (`docker exec nodered curl http://localhost:1880/context/global`) instead of relying on the file existing
+- Falls back to `docker cp` only if the API is unavailable
+- Restore step creates the `/data/context/global/` directory before copying, preventing failures on fresh volumes
+
+**Migration:** On the first Update Now after this release, installs without `contextStorage` automatically export context to disk, patch `settings.js`, and restart — configs preserved with no operator action.
+
+| File | Change |
+|------|--------|
+| `app.py` | `_auto_nodered_settings()`: detect missing contextStorage, export live context via API before patching |
+| `nodered/deploy.sh` | REST API backup first; restore creates directory; file fallback retained |
+
+---
+
+# Part 2 — Tablet Command AVL Integration (v0.7.2)
+
+## Tablet Command AVL → ATAK CoT Streaming
+
+Agencies using [Tablet Command](https://tabletcommand.com) can now stream vehicle positions (fire engines, ambulances, command vehicles, helicopters) directly into ATAK as live CoT events.
+
+- In the Configurator, click **Tablet Command AVL** → fill in your agency name and Feature Service URL
+- Click **Deploy & Activate** — a dedicated Node-RED tab is created for that agency
+- The tab polls the Tablet Command FeatureServer every 1–5 minutes (configurable)
+- Each vehicle becomes a live CoT point on the TAK map, updating in place
+
+**CoT type auto-detection** based on radio name prefix:
+
+| Prefix | CoT Type |
+|--------|---------|
+| `E`, `ENG` | Engine (a-f-G-E-V-C) |
+| `T`, `TRK`, `LAD` | Truck/Ladder (a-f-G-E-V-C) |
+| `M`, `MED`, `AMB`, `ALS`, `BLS` | Medic (a-f-G-E-V-M) |
+| `BC`, `BAT`, `CHIEF`, `AC`, `DC` | Chief/Command (a-f-G-E-V-C) |
+| `H`, `HELO`, `AIR`, `HT` | Helicopter (a-f-A-C-H) |
+| `WT`, `WAT`, `WATER` | Water Tender (a-f-G-E-V-C) |
+| `RES`, `RESCUE`, `SQ`, `SQUAD` | Rescue/Squad (a-f-G-E-V-C) |
+
+**Known Units / Remapping Table:**
+Each agency config has a per-agency remapping table to override radio names with custom callsigns (e.g. `CA342` → `Corona Engine 42`) and override CoT types for specific units. Upload/download as CSV (`radioName,callsign,cotType`).
+
+**Multi-agency:** Each agency gets its own named config card, its own Node-RED tab, and its own remapping table.
+
+| File | Change |
+|------|--------|
+| `nodered/build-flows.js` | `makeTCEngineTab()`, TC config persistence nodes, TC template injection |
+| `nodered/configurator.html` | TC source button, TC panel, TC JavaScript helpers |
+
+---
+
+# Part 3 — Immediate Password Propagation via LDAP Session Fix
 
 ## What's New
 
@@ -74,7 +141,7 @@ Expected output: `name=ldap-authentication-login session_duration=seconds=120`
 
 ---
 
-# v0.7.3-alpha — Node-RED Configurator: ArcGIS Save Fix, Multi-Agency PulsePoint, UI Polish
+# Part 4 — Node-RED Configurator: ArcGIS Save Fix, Multi-Agency PulsePoint, UI Polish
 
 ## Critical Bug Fix: ArcGIS Save Hanging Indefinitely
 
@@ -156,7 +223,7 @@ This happened because the `oninput` handler was pushing every partial value dire
 
 ---
 
-# Part 3 — External / Managed Database Deployment Mode
+# Part 5 — External / Managed Database Deployment Mode
 
 ## New: AWS RDS, Azure, and Cloud SQL Support
 
@@ -191,7 +258,7 @@ See `docs/EXTERNAL-DB-SETUP.md` for full pre-flight SQL, network/firewall steps,
 
 ---
 
-# Part 4 — Certificate Auto-Renewal Display Fixes
+# Part 6 — Certificate Auto-Renewal Display Fixes
 
 ## Cert Expiry Card: No More False Alarms
 

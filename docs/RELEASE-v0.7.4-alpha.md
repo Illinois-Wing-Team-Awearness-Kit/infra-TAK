@@ -20,11 +20,16 @@ This fixes password changes taking up to 24 hours to propagate to ATAK/iTAK devi
 
 **Root cause:** The `deploy.sh` safety gate introduced in v0.7.3-alpha — which prevents wiping configs by aborting if no context data is found — was triggering incorrectly on fresh installs. A fresh Node-RED has no saved configs by definition, so the gate fired and aborted the deploy before flows were installed. No flows = no `/configurator` route.
 
-**Fix:** Before aborting, `deploy.sh` now checks whether `flows.json` has any `http in` routes. Zero routes = fresh install (nothing to protect) → deploy proceeds normally. Non-zero routes + missing context = potentially lost data → abort still fires to protect existing configs.
+**Fix:** Before aborting, `deploy.sh` now checks two things:
+
+1. Does `flows.json` have any `http in` routes? Zero routes = fresh install → proceed.
+2. Did the live API backup confirm all config arrays are length 0? Empty context on a server that hasn't saved any feeds is not a data loss event → proceed.
+
+The abort only fires when routes exist AND at least one config array was previously non-empty but is now missing — the one case where aborting is genuinely protecting you.
 
 | File | Change |
 |------|--------|
-| `nodered/deploy.sh` | Fresh-install detection added to abort gate — skips abort when `flows.json` has zero http-in routes |
+| `nodered/deploy.sh` | Abort gate now distinguishes fresh installs, unconfigured servers, and actual data loss events |
 
 ---
 

@@ -33,4 +33,30 @@ The abort only fires when routes exist AND at least one config array was previou
 
 ---
 
-*More fixes and features will be added to this release. Notes are in progress.*
+### External / Managed Database (AWS RDS): one-click provisioning and fully automated deploy
+
+The External / Managed DB deploy mode introduced in v0.7.1 now handles AWS RDS end-to-end without any manual SQL or SSH.
+
+**New: Provision Database button**
+
+The TAK Server deploy page now has a **Provision Database** step directly in the External DB config panel. Fill in your RDS admin credentials and click **Provision Database** before deploying — infra-TAK connects as your admin user and:
+
+- Creates the `martiuser` application account (or updates its password if it already exists)
+- Grants full database and schema privileges
+- On AWS RDS, automatically grants `rds_superuser` to `martiuser` — the permission required for TAK Server to manage PostGIS extensions
+
+If you leave the App User Password blank, a strong password is auto-generated and filled in for you.
+
+**Automated deploy — no post-deploy SQL**
+
+CoreConfig.xml is now patched to the RDS endpoint immediately after package install, before TAK Server's first start. SchemaManager runs against RDS from the start and again as a safety net during the final restart step. On a correctly provisioned database, the full deploy completes without any manual intervention.
+
+**UI**
+
+- Password fields in the External DB panel now have show/hide toggles
+- The selected deployment mode (Single Server / Two-Server / External DB) now persists correctly when navigating the deploy config — it no longer reverts to Single Server when you open the config panel
+
+| File | Change |
+|------|--------|
+| `app.py` | `POST /api/takserver/external-db/provision`: creates user, grants privileges, auto-grants `rds_superuser` on RDS; pre-deploy JDBC patch; explicit SchemaManager step at final restart |
+| `static/takserver.js` | Provision Database panel, App User Password + Admin Password show/hide toggles, deployment mode persistence fix |

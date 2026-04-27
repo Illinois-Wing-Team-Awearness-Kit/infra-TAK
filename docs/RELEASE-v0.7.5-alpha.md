@@ -27,3 +27,28 @@ After updating, go to **Caddy SSL → Domains → Save & Reload Caddy** to regen
 | File | Change |
 |------|--------|
 | `app.py` | Removed `header Access-Control-Allow-Origin *` from `tiles.<domain>` and `video.<domain>` Caddyfile stanzas |
+
+---
+
+## New Feature: Service Domain Aliases
+
+### Per-service "Alias" field in Caddy → Service Domains
+
+Every service in the **Caddy SSL → Service Domains** editor now has an optional **Alias** column alongside the existing Domain column.
+
+Set an alias when you are migrating a service to a new domain name and need the old URL to keep working during the transition. Caddy will issue a certificate for the alias and redirect every request from `alias.<domain>` → `canonical.<domain>` with an HTTP 301.
+
+**Use cases:**
+- Renaming a subdomain (e.g. `stream.example.com` → `mediamtx.example.com`) without breaking bookmarks or client configs
+- Consolidating services from a legacy domain while users catch up
+- Running A/B traffic during a staged migration
+
+**How it works:**
+1. Open **Caddy SSL** → expand **Service Domains**
+2. Enter the old domain in the **Alias** column for the relevant service
+3. Click **Save & Reload Caddy**
+4. Caddy obtains a certificate for the alias and emits a `redir https://<canonical>{uri} permanent` stanza
+
+| File | Change |
+|------|--------|
+| `app.py` | Added `Alias` column to Service Domains UI; `GET /api/caddy/domains` returns `alias` per service; `POST /api/caddy/domains` persists `{key}_domain_alias` in settings; `generate_caddyfile` emits 301-redirect stanza for each set alias |

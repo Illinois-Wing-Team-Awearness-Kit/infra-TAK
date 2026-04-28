@@ -5,12 +5,17 @@
 ## Prompt for a new chat (copy and paste this)
 
 ```
-Read docs/HANDOFF-LDAP-AUTHENTIK.md section "0. Current Session State" — we're on v0.2.6-alpha.
+Read docs/HANDOFF-LDAP-AUTHENTIK.md — current release is v0.8.3-alpha.
 
-CRITICAL: v0.2.4-alpha introduced a broken updater (git pull --rebase) that caused rebase conflicts on customer boxes. v0.2.6-alpha fixes it (fetch + force-checkout). See Section 0 for full details, customer recovery command, and new testing protocol (docs/TESTING-UPDATES.md).
+CRITICAL INCIDENTS:
+- v0.8.0: introduced AUTHENTIK_HOST internal-URL fix (correct) but the post-update migration unconditionally restarted the LDAP outpost, causing thundering herd (bind cache wipe → all clients re-auth simultaneously → worker/Postgres exhaustion) on active installs.
+- v0.8.1: hotfix — LDAP migration now health-gated (checks websocket + no TLS error before patching/restart).
+- v0.8.2: post-update migration auto-sets AUTHENTIK_WEB_WORKERS=4 and restarts server only (never ldap).
+- v0.8.3: Authentik's enterprise license check leaks idle-in-transaction Postgres connections. With 120s timeout and 8 workers this exhausted the 300-connection pool (228 connections, 500-800% CPU). Fixed by reducing idle_in_transaction_session_timeout from 120s → 30s and force-recreating postgresql to apply it. Note: 10s was tried first and broke Authentik startup (migration lifecycle holds a transaction open during module loading with idle gaps of 10-20s).
 
-v0.2.5-alpha fixed: MediaMTX External Sources UI corruption (stale overlay on server), Guard Dog Updates monitor staying red (missing systemd timer). v0.2.6-alpha fixed: Update Now button rebase conflicts (rewrote updater to use deterministic git checkout --force).
+NEVER restart the LDAP outpost in a migration unless it is provably broken. NEVER use fewer than 4 Authentik web workers on an active install. NEVER set idle_in_transaction_session_timeout below 30s — Authentik startup will crash-loop.
 
+See "April 2026 — LDAP outpost thundering herd" section for full incident details and rules.
 Use docs/HANDOFF-LDAP-AUTHENTIK.md as the single source of truth for what's done and what to do next.
 ```
 
@@ -39,6 +44,37 @@ The diagram below (credit: mytecknet.com) shows the three certificate authentica
 **What the code does:** It does **not** remove the `<File …/>` provider from CoreConfig by default. It **only removes the `<user identifier="webadmin" …>` element** from `UserAuthenticationFile.xml` when Authentik is in use, after sync — minimal change so there is no second password store for that one account. Optional: TAK Server page **flat-file auth toggle** if you want to disable the File provider entirely.
 
 **Complexity tradeoff:** Extra moving parts in exchange for a **narrow** fix (one user, one file) instead of fighting TAK’s file lifecycle or over-disabling flat-file for everyone.
+
+---
+
+## April 2026 — LDAP outpost thundering herd (v0.8.0 regression → v0.8.2 fix)
+
+**Incident summary:** v0.8.0 introduced a correct fix (LDAP outpost `AUTHENTIK_HOST` pointed at `https://<fqdn>` instead of `http://authentik-server-1:9000`, causing `tls: internal error` on fresh installs). The fix was correct. The post-update migration was not: it patched the compose file and **restarted the LDAP outpost unconditionally on all existing installs**, including healthy ones.
+
+**What restarting the LDAP outpost does:** The outpost's `bind_mode: cached` holds all active bind sessions in memory. A restart wipes every cached session. With active TAK clients, every client re-authenticates simultaneously. Each bind drives the full Authentik flow executor (3 HTTP round-trips + heavy Django ORM queries against Postgres). On a box with many clients, 50–100+ concurrent flow executor requests saturate Authentik's 2 default server workers, causing request queuing. Each worker processes one request at a time; requests queue and take 100–200 seconds each. The LDAP outpost has an HTTP timeout shorter than this queue depth, so it returns EOF. TAK Server retries the bind. The retry creates more concurrent requests. The system locks into a death spiral that does not self-resolve without intervention.
+
+**Postgres symptom:** `max_connections` (default 300) is exhausted because each queued flow executor request holds a Postgres connection for its entire 100–200 second duration. Postgres logs show hundreds of `FATAL: terminating connection due to administrator command` or idle-session timeout kills.
+
+**Recovery:**
+1. Restart Authentik (`docker compose restart`) to kill all queued requests and Postgres connections.
+2. Scale workers: add `AUTHENTIK_WEB_WORKERS=4` to `~/authentik/.env`, then `docker compose restart server` (NOT ldap — do not clear bind caches again).
+3. Wait 3–5 minutes for runtimes to drop to under 1000ms. Caches rebuild automatically.
+
+**v0.8.1 fix:** Migration made conditional — checks LDAP outpost websocket connection and TLS error state before patching. Skips entirely if outpost is healthy.
+
+**v0.8.2 fix:** Post-update migration automatically sets `AUTHENTIK_WEB_WORKERS=4` if not already ≥ 4, then restarts only the server container. LDAP outpost is never touched. This runs on every Update Now and requires no operator action.
+
+**Verified resolution:** Flow executor runtimes dropped from 200,000ms to under 7,000ms immediately after the server restarted with 4 workers.
+
+**v0.8.3 fix:** Discovered a separate Postgres exhaustion vector: Authentik 2026.2.2's enterprise license check opens a DB transaction on every flow executor request and does not commit it cleanly, leaving `idle in transaction` connections that accumulate until the pool (max 300) is exhausted. On the dev box (tak-10) with 8 workers this produced 228 `idle in transaction` connections, Postgres at 500–800% CPU, and 4.6GB RAM usage. Reduced `idle_in_transaction_session_timeout` from `120s` to `30s` in the PostgreSQL command-line args in `docker-compose.yml`. The post-update migration (`_apply_authentik_pg_tuning`) now force-recreates the postgresql container when args change (required — command-line args need a full container recreate, not just a config reload). **Note:** 10s was tried first and caused a crash-loop: Authentik's migration lifecycle holds a transaction open for the full startup sequence (module loading has idle-in-transaction gaps of 10–20s), so any timeout below ~20s will kill the startup connection. 30s is the safe minimum.
+
+### Rules established by this incident
+
+- **NEVER restart the LDAP outpost in a post-update migration unless the outpost is provably broken.** Test: check `docker logs authentik-ldap-1 --tail=60` for `successfully connected websocket` (healthy) and absence of `remote error: tls: internal error`. If healthy, skip migration entirely.
+- **NEVER restart `docker compose restart` (all services) to fix LDAP issues on a live box.** Restarting the LDAP outpost on a live active deployment causes a guaranteed thundering herd. Restart only `server` and `worker` if capacity is the issue. Only restart `ldap` if the outpost is provably broken (TLS error, not connected).
+- **`AUTHENTIK_WEB_WORKERS` must be set to 4 or higher on any install with more than ~10 active TAK clients.** Default is 2 workers, which is insufficient to handle bind storms after any restart. The v0.8.2 migration sets this automatically on update.
+- **The LDAP outpost bind cache is your most important performance asset.** A cached session costs zero Postgres queries. An uncached bind costs 3+ HTTP round-trips and multiple ORM queries. On a box with 50 active clients, losing the cache means 50 simultaneous full-cost flow executions hitting the server at once.
+- **Post-update migrations that touch running containers must be gated by a health check.** The pattern: check health first → if healthy, skip → if broken, patch + restart. No exceptions.
 
 ---
 
@@ -1240,6 +1276,12 @@ cd ~/infra-TAK && sudo ./start.sh
 - **NEVER use `git pull --rebase` in `update_apply()` or any automated update flow.** Field installs have unpredictable git state (detached HEAD, stale rebase, local divergence). Always use `fetch + checkout --force`. See problem #31.
 - **MediaMTX overlay on disk can be stale.** If the MediaMTX External Sources UI looks broken (duplicated badges/buttons) on an infra-TAK install but fine on vanilla MediaMTX, the overlay file on the server is outdated. Run Patch web editor or `mediamtx_recovery()`. See problem #29.
 - **Guard Dog Updates timer may not exist on older installs.** If the Updates monitor is red, click Update Guard Dog. `guarddog_update()` now ensures the systemd timer unit exists. See problem #30.
+- **NEVER restart the LDAP outpost in a migration unless it is provably broken.** A restart wipes all cached bind sessions. On an active deployment this causes every TAK client to re-authenticate simultaneously (thundering herd), saturating Authentik workers and Postgres connections. Gate every migration that touches the LDAP container with a health check: read logs for `successfully connected websocket` + absence of `remote error: tls: internal error`. See April 2026 thundering herd incident above.
+- **`AUTHENTIK_WEB_WORKERS` defaults to 2 — this is insufficient for active deployments.** Set to 4+ for any install with more than ~10 active TAK clients. The v0.8.2 post-update migration sets this automatically. When debugging slow runtimes (flow executor > 5s), check this first before any other change.
+- **Thundering herd recovery sequence (live broken box):** (1) `cd ~/authentik && docker compose restart` to drain queued requests and free Postgres connections, (2) add `AUTHENTIK_WEB_WORKERS=4` to `~/authentik/.env`, (3) `docker compose restart server` only — do NOT restart ldap again, (4) wait 3–5 min for bind caches to repopulate. Running Update Now on v0.8.2+ automates steps 2–3.
+- **`AUTHENTIK_HOST` in the LDAP outpost must point to the internal Docker network URL**, not the public FQDN or Caddy. Use `http://authentik-server-1:9000`. Routing LDAP→Caddy→Authentik fails with `tls: internal error` when Caddy has no valid cert yet (cold start, cert rotation). This also creates an unnecessary external network round-trip inside the same host.
+- **`idle_in_transaction_session_timeout` must be `30s` or higher — never lower.** Authentik's migration lifecycle opens a transaction at startup and holds it open during module loading (several minutes total, with idle gaps of 10–20s). Any timeout below ~20s kills this connection, crashing the worker and server into a restart loop. The current shipped value is `30s` (in the `command:` line of the `postgresql` service in `docker-compose.yml`). If Postgres is at 500–800% CPU with hundreds of `idle in transaction` connections all querying `django_postgres_cache_cacheentry` for `goauthentik.io/enterprise/license`, this is Authentik's license check leak — reduce the timeout but stay at or above `30s`. Diagnosis: `docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT state, wait_event_type, query FROM pg_stat_activity WHERE state='idle in transaction' LIMIT 5;"`.
+- **Changing PostgreSQL command-line args requires a container force-recreate**, not just a config reload. `ALTER SYSTEM` + `pg_reload_conf()` cannot override command-line parameters (command-line takes highest precedence). To apply a new value: edit the `command:` line in `docker-compose.yml` then run `docker compose up -d --force-recreate postgresql`. The `_apply_authentik_pg_tuning()` function now does this automatically when it detects the args changed.
 
 ### Edge-Case Logic That Must Not Be Removed
 
@@ -1255,6 +1297,10 @@ cd ~/infra-TAK && sudo ./start.sh
 - `update_apply()`: Must use `fetch --tags` + `checkout --force` only. NO `git pull`, NO `git rebase`, NO `git merge`. Any merge-like operation will break on customer installs.
 - `mediamtx_recovery()`: Must copy `mediamtx_ldap_overlay.py` from repo to `/opt/mediamtx-webeditor/` before restarting the web editor service. If this step is removed, old overlay code will persist on server.
 - `guarddog_update()`: Must write + enable `takupdatesguard.timer` systemd unit (not just refresh scripts). If this is removed, the Updates monitor will stay red on installs where the timer was never created.
+- **LDAP post-update migration health gate (v0.8.1+):** Must check `authentik-ldap-1` logs for `successfully connected websocket` and absence of `remote error: tls: internal error` before patching compose and restarting LDAP. If the gate returns healthy, migration must skip. **Removing or weakening this gate will unconditionally restart LDAP on every update and cause thundering herd on every active install.** See April 2026 incident.
+- **`AUTHENTIK_WEB_WORKERS=4` migration (v0.8.2+):** Must only restart the `server` container, never `ldap`. Only upgrades workers if current value < 4 (idempotent). If changed to restart `ldap`, it will wipe all bind caches on every update.
+- **`_apply_authentik_pg_tuning()` force-recreate (v0.8.3+):** When `_ensure_authentik_compose_patches()` returns `True` (compose file changed), `_apply_authentik_pg_tuning()` must run `docker compose up -d --force-recreate postgresql`. This is the only way to apply new command-line args — a config reload is insufficient. Do not remove or short-circuit the `if compose_changed:` branch. `ALTER SYSTEM RESET ALL` must also run before the recreate to clear any manual overrides that would shadow the command-line value.
+- **`idle_in_transaction_session_timeout` floor is 30s (v0.8.3+):** The `needs_pg_update` trigger list in both migration paths must include `10s` and `120s` as old values to upgrade FROM, but must NOT include `30s` (the target). If you change the target value, update the trigger list accordingly. Never set the value below `30s` — see gotcha above.
 
 ### Authentik LDAP Flow Architecture (MUST understand to debug)
 

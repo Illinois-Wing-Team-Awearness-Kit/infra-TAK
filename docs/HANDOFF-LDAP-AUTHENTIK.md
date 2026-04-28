@@ -5,18 +5,19 @@
 ## Prompt for a new chat (copy and paste this)
 
 ```
-Read docs/HANDOFF-LDAP-AUTHENTIK.md — current release is v0.8.4-alpha.
+Read docs/HANDOFF-LDAP-AUTHENTIK.md — current release is v0.8.5-alpha.
 
 CRITICAL INCIDENTS:
 - v0.8.0: introduced AUTHENTIK_HOST internal-URL fix (correct for fresh installs) but the post-update migration unconditionally restarted the LDAP outpost, causing thundering herd (bind cache wipe → all clients re-auth simultaneously → worker/Postgres exhaustion) on active installs.
 - v0.8.1: hotfix — LDAP migration now health-gated (checks websocket + no TLS error before patching/restart).
 - v0.8.2: post-update migration auto-sets AUTHENTIK_WEB_WORKERS=4 and restarts server only (never ldap).
 - v0.8.3: idle_in_transaction_session_timeout 120s → 30s with force-recreate to apply (10s was tried first and broke Authentik startup — migration lifecycle has idle gaps of 10-20s).
-- v0.8.4: REVERSED the v0.8.0 routing migration for boxes whose outpost was spiraling on http://authentik-server-1:9000. Through Caddy (https://<fqdn> + extra_hosts:host-gateway), HTTP/2 multiplexing and connection pooling shape the request flow and prevent parallel unbounded queries from exposing Authentik 2026.2.2's slow policybindingmodel evaluation. Tak-10 dropped from 200+ active Postgres queries to 1 the moment routing was reversed. Migration is health-gated (only runs when spiral signature present), has Caddy probe (only migrates when FQDN actually serves), and auto-rolls-back on validation failure.
+- v0.8.4: REVERSED the v0.8.0 routing migration for boxes whose outpost was spiraling on http://authentik-server-1:9000. Through Caddy (https://<fqdn> + extra_hosts:host-gateway), HTTP/2 multiplexing and connection pooling shape the request flow and prevent parallel unbounded queries from exposing Authentik 2026.2.2's slow policybindingmodel evaluation. Tak-10 dropped from 200+ active Postgres queries to 1 the moment routing was reversed.
+- v0.8.5: HARDENING of v0.8.4. Dual-signal spiral detection (Postgres idle-in-trans ≥30 OR ≥2 outpost log markers in --tail 1000) so high bind volume can't hide spiral evidence. Periodic 10-min monitor thread (PID-locked single instance, 6h repair rate limit) so spirals manifesting after Update Now self-heal. Granular gate logging at every early-return so silent skips can't hide bugs. Forensics persisted to settings.authentik_spiral_last_repair.
 
 NEVER restart the LDAP outpost in a migration unless it is provably broken. NEVER use fewer than 4 Authentik web workers on an active install. NEVER set idle_in_transaction_session_timeout below 30s — Authentik startup will crash-loop. Caddy is a request shaper for the LDAP outpost — direct routing to authentik-server-1:9000 exposes the upstream Authentik 2026.2.2 LDAP-flow regression.
 
-See "April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal" section for full incident details and rules.
+See "April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal" and "April 2026 — v0.8.5 hardening" sections for full incident details and rules.
 Use docs/HANDOFF-LDAP-AUTHENTIK.md as the single source of truth for what's done and what to do next.
 ```
 
@@ -115,6 +116,60 @@ The v0.8.0+ migration that enforces internal URL is preserved for genuine `tls: 
 - **Routing migrations must validate before committing.** Any compose change that targets the LDAP service must (a) backup, (b) recreate, (c) validate within 30s, (d) auto-rollback on failure. The new function follows this pattern; future migrations should as well.
 - **`idle_in_transaction_session_timeout` detection must be value-agnostic.** v0.8.4 generalized `needs_pg_update` to catch any value other than `30s` (was previously hardcoded list of `300s/10s/120s`, missing operator manual values like `15s`).
 - **The `AUTHENTIK_HOST=https://<fqdn>` value in `~/authentik/.env` is the canonical FQDN source of truth.** Other env vars (`AUTHENTIK_COOKIE_DOMAIN`) derive from it. Migrations that need the FQDN should read it from there, not from settings or Caddyfile.
+
+---
+
+## April 2026 — v0.8.5 hardening: dual-signal detection + periodic monitor
+
+**Why v0.8.5 was needed.** Field testing of v0.8.4 on `tak-10`, `responder`, and `ssdnodes` exposed two real-world failure modes in the v0.8.4 routing-repair migration:
+
+1. **Detection blind spot from high bind volume.** v0.8.4 sampled `docker logs authentik-ldap-1 --tail 200` for ≥2 spiral markers. On busy boxes (Mission API / DataSync / many CoT clients), normal `Bind request` lines accumulate at thousands per minute and push the spiral markers off the visible 200-line window. On `ssdnodes` during testing, full-log `bash grep` showed 14 spiral markers; the v0.8.4 sample showed 0 → migration logged "0/2 markers — leaving alone" while the box was actively spiraling.
+2. **One-shot timing.** The migration only runs once, immediately after Update Now. A spiral that manifests 30 minutes later (after traffic ramps, after a clock-aligned Mission API poll, after a Caddy bounce) gets no second chance — the operator has to notice the CPU spike and re-run Update Now. The v0.8.4 promise of "easy update no hit this or that" silently breaks.
+
+**v0.8.5 fix #1 — dual-signal detection (`_detect_authentik_ldap_spiral`):**
+
+The repair function now confirms the spiral via **either** signal:
+
+| Signal | Threshold | Why it works |
+|---|---|---|
+| LDAP outpost log | ≥2 unique markers in last **1000** lines (was 200) | Faster check; catches early-stage spirals before Postgres congestion |
+| Postgres `idle in transaction` from `application_name LIKE '%authentik%'` | **≥30** | Durable signal — survives LDAP container recreates (which wipe outpost log) and can't be drowned out by high bind volume. Healthy boxes sit at 0–3; spiraling boxes at 50–200+ |
+
+The Postgres signal is the breakthrough: it's the same metric Amos's report (Samsung Azure VM) used to identify the spiral originally, and the same metric we used to confirm the fix worked on `tak-10` (200+ → 1 idle-in-trans within seconds of routing reversal).
+
+**v0.8.5 fix #2 — periodic monitor (`_authentik_spiral_monitor`):**
+
+A daemon thread inside the console runs every 10 minutes, calls the dual-signal detector, and if a spiral is confirmed, runs the same idempotent `_apply_authentik_ldap_routing_repair` function. Same gates, same Caddy probe, same auto-rollback. Fully automatic; no operator action.
+
+Safeguards:
+- **Single-instance lock** (`/tmp/takwerx-spiral-monitor.lock`, PID-checked) — gunicorn runs N workers; only one runs the monitor. Steals the lock if the holder PID is dead so restarts always have a live monitor.
+- **Repair rate limit**: max 1 repair attempt per 6 hours (recorded in `settings.json` under `authentik_spiral_last_repair`). Prevents thrashing on pathological boxes (spiral confirmed but Caddy unreachable — repair would skip every 10 min anyway, but cap the noise).
+- **No-op on healthy boxes** — most boxes will see the monitor wake every 10 min, find nothing, sleep again. One log line at startup, then silent.
+
+**v0.8.5 fix #3 — granular gate logging.** Every early-return in the routing repair now logs *why* it skipped, all under the `routing repair: ...` prefix so operators can grep one stream. The diagnostic gap that hid the `ssdnodes` issue (logged "0/2 markers" without saying which 0/2 it sampled or how big the window was) is now closed.
+
+**v0.8.5 fix #4 — spiral repair forensics in `settings.json`.** Every repair attempt persists `{ts, outcome, evidence, outpost_markers}` under `authentik_spiral_last_repair`. Used for the rate limit; also useful when an operator reports "I think it spiraled and recovered last night" — the timestamp + evidence is right there.
+
+### Operator-visible diagnostics
+
+```bash
+# Postgres spiral signal — should be 0–3 on healthy boxes, ≥30 means spiraling
+docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc \
+  "SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction' AND application_name LIKE '%authentik%';"
+
+# Last spiral repair attempt (if any)
+jq '.authentik_spiral_last_repair // "no repair attempts recorded"' /opt/takwerx/settings.json
+
+# Monitor activity (one line at startup, then silent on healthy boxes)
+sudo journalctl -u takwerx-console --since "1 hour ago" | grep -E "spiral monitor|routing repair"
+```
+
+### Rules added by v0.8.5
+
+- **Two-signal detection beats one-signal detection for spiral diagnosis.** Outpost log is fast but maskable; Postgres idle-in-trans is durable and unmaskable. Use both. (Generalizes to any future Authentik failure mode that produces a Postgres state signature.)
+- **One-shot post-update migrations are insufficient for self-healing.** Anything that fixes a runtime drift (spiral, cache wipe, Caddy bounce, network blip) must run on a periodic schedule, not just at update time. The operator promise is "the update fixes it"; that means the update fixes it the first time *and* keeps fixing it as conditions change.
+- **Background threads in gunicorn must hold a single-instance PID-checked lock.** N workers means N copies of every module-load thread. Without a lock, monitors thrash; with a stale lock, restarts have no monitor. The `os.kill(pid, 0)` pattern (used by `_post_update_auto_deploy` and the spiral monitor) is the standard.
+- **Every gate-skip in a migration must log why.** Silent skips hide bugs (the `ssdnodes` `0/2 markers` case). The `routing repair: <reason> — skipping (<context>)` format is the standard.
 
 ---
 

@@ -15,37 +15,28 @@
 - Installs that already had a working LDAP outpost before updating to v0.8.0 and experienced CPU/Postgres issues.
 - Installs that rolled back from v0.8.0 are safe to update to v0.8.1.
 
-**Recovery for affected v0.8.0 installs:**
+**Recovery for affected v0.8.0 installs — no command line needed for most operators:**
 
-**Step 1 — Restart Authentik to clear the connection storm:**
-- infra-TAK console → Authentik page → **Restart**
-- Or via SSH: `cd ~/authentik && docker compose restart`
-- Wait 2–3 minutes for Postgres to recover and the LDAP outpost to reconnect.
+**Step 1:** infra-TAK console → Authentik page → **Restart** → wait 2 minutes.
 
-**Step 2 — Update to v0.8.1:**
-- infra-TAK console → **Update Now**
-- The migration will detect the outpost is healthy and skip the disruptive restart entirely.
+**Step 2:** infra-TAK console → **Update Now**.
 
-**If your box is still overloaded after Step 1 (runtimes > 60s, constant EOF errors):**
+That's it for the majority of installs. The v0.8.1 migration will see the outpost is healthy after the restart and skip the disruptive operation entirely.
 
-Your box has too many active TAK clients re-authenticating simultaneously for Authentik's default 2 server workers to handle. Scale up workers first:
+> If your normal domain is unreachable due to load, access the console via the backdoor: `https://<server-IP>:5001`
+
+---
+
+**Advanced: only if your box is still overloaded after the restart (large deployments with many simultaneous TAK clients)**
+
+If you have many active clients and the box is still showing high CPU and LDAP errors several minutes after the Authentik restart, Authentik's default 2 server workers are being overwhelmed by all clients re-authenticating at once. Fix via SSH:
 
 ```bash
 echo 'AUTHENTIK_WEB_WORKERS=4' >> ~/authentik/.env
 cd ~/authentik && docker compose restart server
 ```
 
-Wait 3–5 minutes. Once LDAP bind latency drops below 1000ms (visible in server logs), the bind cache will rebuild and load will self-resolve. Then run Step 2 (Update Now).
-
-**If your console is unreachable due to load**, use the backdoor: `https://<server-IP>:5001`
-
-**If nothing is working and you need TAK Server operational immediately:**
-```bash
-cd ~/authentik && docker compose restart
-# wait 2 min
-echo 'AUTHENTIK_WEB_WORKERS=4' >> ~/authentik/.env
-cd ~/authentik && docker compose restart server
-```
+Wait 3–5 minutes for the load to drop, then run **Update Now** from the console.
 
 | File | Change |
 |------|--------|

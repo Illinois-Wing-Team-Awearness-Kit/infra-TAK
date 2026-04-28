@@ -5,17 +5,18 @@
 ## Prompt for a new chat (copy and paste this)
 
 ```
-Read docs/HANDOFF-LDAP-AUTHENTIK.md — current release is v0.8.3-alpha.
+Read docs/HANDOFF-LDAP-AUTHENTIK.md — current release is v0.8.4-alpha.
 
 CRITICAL INCIDENTS:
-- v0.8.0: introduced AUTHENTIK_HOST internal-URL fix (correct) but the post-update migration unconditionally restarted the LDAP outpost, causing thundering herd (bind cache wipe → all clients re-auth simultaneously → worker/Postgres exhaustion) on active installs.
+- v0.8.0: introduced AUTHENTIK_HOST internal-URL fix (correct for fresh installs) but the post-update migration unconditionally restarted the LDAP outpost, causing thundering herd (bind cache wipe → all clients re-auth simultaneously → worker/Postgres exhaustion) on active installs.
 - v0.8.1: hotfix — LDAP migration now health-gated (checks websocket + no TLS error before patching/restart).
 - v0.8.2: post-update migration auto-sets AUTHENTIK_WEB_WORKERS=4 and restarts server only (never ldap).
-- v0.8.3: Authentik's enterprise license check leaks idle-in-transaction Postgres connections. With 120s timeout and 8 workers this exhausted the 300-connection pool (228 connections, 500-800% CPU). Fixed by reducing idle_in_transaction_session_timeout from 120s → 30s and force-recreating postgresql to apply it. Note: 10s was tried first and broke Authentik startup (migration lifecycle holds a transaction open during module loading with idle gaps of 10-20s).
+- v0.8.3: idle_in_transaction_session_timeout 120s → 30s with force-recreate to apply (10s was tried first and broke Authentik startup — migration lifecycle has idle gaps of 10-20s).
+- v0.8.4: REVERSED the v0.8.0 routing migration for boxes whose outpost was spiraling on http://authentik-server-1:9000. Through Caddy (https://<fqdn> + extra_hosts:host-gateway), HTTP/2 multiplexing and connection pooling shape the request flow and prevent parallel unbounded queries from exposing Authentik 2026.2.2's slow policybindingmodel evaluation. Tak-10 dropped from 200+ active Postgres queries to 1 the moment routing was reversed. Migration is health-gated (only runs when spiral signature present), has Caddy probe (only migrates when FQDN actually serves), and auto-rolls-back on validation failure.
 
-NEVER restart the LDAP outpost in a migration unless it is provably broken. NEVER use fewer than 4 Authentik web workers on an active install. NEVER set idle_in_transaction_session_timeout below 30s — Authentik startup will crash-loop.
+NEVER restart the LDAP outpost in a migration unless it is provably broken. NEVER use fewer than 4 Authentik web workers on an active install. NEVER set idle_in_transaction_session_timeout below 30s — Authentik startup will crash-loop. Caddy is a request shaper for the LDAP outpost — direct routing to authentik-server-1:9000 exposes the upstream Authentik 2026.2.2 LDAP-flow regression.
 
-See "April 2026 — LDAP outpost thundering herd" section for full incident details and rules.
+See "April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal" section for full incident details and rules.
 Use docs/HANDOFF-LDAP-AUTHENTIK.md as the single source of truth for what's done and what to do next.
 ```
 
@@ -75,6 +76,45 @@ The diagram below (credit: mytecknet.com) shows the three certificate authentica
 - **`AUTHENTIK_WEB_WORKERS` must be set to 4 or higher on any install with more than ~10 active TAK clients.** Default is 2 workers, which is insufficient to handle bind storms after any restart. The v0.8.2 migration sets this automatically on update.
 - **The LDAP outpost bind cache is your most important performance asset.** A cached session costs zero Postgres queries. An uncached bind costs 3+ HTTP round-trips and multiple ORM queries. On a box with 50 active clients, losing the cache means 50 simultaneous full-cost flow executions hitting the server at once.
 - **Post-update migrations that touch running containers must be gated by a health check.** The pattern: check health first → if healthy, skip → if broken, patch + restart. No exceptions.
+
+---
+
+## April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal (the real upstream story)
+
+**Headline:** v0.8.0's URL change from `https://<fqdn>` (Caddy hop) to `http://authentik-server-1:9000` (direct Docker network) was the *only* meaningful infra-TAK change between v0.7.9 and v0.8.0. Operators who were running fine for months reported their boxes melting after the v0.8.0 update. Field operator (Amos's Samsung Azure VM) reported the same on v0.7.5, v0.8.0, and v0.8.2 — eliminating "infra-TAK version" as the variable. Comparing tak-10 (broken) and responder (healthy) showed identical Authentik configuration, identical roles, identical flow stage bindings, identical LDAP provider config — both on Authentik 2026.2.2.
+
+**The actual variable:** **LDAP request volume crossing the spiral threshold.** Streaming-only Node-RED (responder) generates almost no LDAP traffic — one cert auth per long-lived TLS connection. Mission API / DataSync clients (tak-10) re-authenticate per HTTP request and produce continuous LDAP volume. With the v0.8.0 direct-internal routing, parallel unbounded HTTP/1.1 connections from the LDAP outpost slam Authentik's slow `policybindingmodel` flow evaluation simultaneously, exhaust Postgres `max_connections`, and the outpost panics on `EOF` from the choked server, wiping the bind cache and cascading into the spiral.
+
+**The Caddy hop was acting as a pressure valve we didn't realize we needed.** HTTP/2 multiplexing serializes requests over a small number of connections; connection pooling caps the parallelism Authentik sees. The v0.8.0 fix removed it.
+
+**Verified live on tak-10 (April 2026):**
+
+| Metric | v0.8.0+ direct internal URL | v0.8.4 reversed via Caddy |
+|---|---|---|
+| Postgres `active` queries | 200+ on `policybindingmodel` | **1** |
+| LDAP outpost errors / minute | hundreds (`Result Code 50` / nil pointer / EOF) | **0** |
+| Authentik flow latency | 100–135 seconds | low (cache rebuilds) |
+
+The change took effect within seconds of `docker compose up -d --no-deps --force-recreate ldap` with the new compose. The bind cache rebuilds naturally over the next minutes. Server `unhealthy` state lingered for a couple minutes while it digested the queued requests but resolved without intervention.
+
+**v0.8.4 fix:** New post-update migration (`_apply_authentik_ldap_routing_repair`) detects the spiral and reverses the routing. Strict gates:
+
+1. LDAP service must currently be on `http://authentik-server-1:9000` (skip otherwise — leaves boxes that were correctly on FQDN alone).
+2. Outpost log must show ≥2 spiral markers (`Result Code 50`, `nil pointer`, `failed to execute flow`, `EOF`, `502`, `503`, `exceeded stage recursion depth`). Healthy outposts skip.
+3. `https://<fqdn>/-/health/live/` must respond from inside the LDAP container (probe via `docker exec wget`). If Caddy isn't ready or the FQDN doesn't resolve, skip — don't migrate boxes onto a broken FQDN path.
+4. After rewriting compose and recreating LDAP, validate within 30s: outpost must show `successfully connected websocket` and no `tls:` / `502` / `503` errors. On failure, restore backup and recreate LDAP back on internal URL.
+
+The v0.8.0+ migration that enforces internal URL is preserved for genuine `tls: internal error` cases (fresh installs where Caddy isn't ready). The two migrations are mutually exclusive by design: v0.8.0+ fires only when on FQDN and broken, v0.8.4 fires only when on internal and broken. Healthy boxes skip both.
+
+**The upstream Authentik 2026.2.2 regression itself is not fixed by infra-TAK.** Per Amos's data, `policybindingmodel` evaluation jumped from sub-second (older Authentik) to 100+ seconds (2026.2.2). We're working around it by keeping Caddy in the path. Once Authentik ships a fix in 2026.3+, this workaround can stay (it's not harmful) or be revisited.
+
+### Rules added by this incident
+
+- **Caddy is a required hop for the LDAP outpost on busy installs.** Direct internal routing (`http://authentik-server-1:9000`) only works on light-load installs and fresh installs without Caddy. Active installs with Mission API / DataSync clients must route through `https://<fqdn>` for request shaping.
+- **Spiral signature in LDAP outpost logs = "provably broken"** for the cardinal-rule purposes. The HANDOFF gate says don't restart LDAP unless provably broken; finding ≥2 of [`Result Code 50`, `nil pointer`, `EOF`, `503`, `502`, recursion depth] in `--tail 200` qualifies.
+- **Routing migrations must validate before committing.** Any compose change that targets the LDAP service must (a) backup, (b) recreate, (c) validate within 30s, (d) auto-rollback on failure. The new function follows this pattern; future migrations should as well.
+- **`idle_in_transaction_session_timeout` detection must be value-agnostic.** v0.8.4 generalized `needs_pg_update` to catch any value other than `30s` (was previously hardcoded list of `300s/10s/120s`, missing operator manual values like `15s`).
+- **The `AUTHENTIK_HOST=https://<fqdn>` value in `~/authentik/.env` is the canonical FQDN source of truth.** Other env vars (`AUTHENTIK_COOKIE_DOMAIN`) derive from it. Migrations that need the FQDN should read it from there, not from settings or Caddyfile.
 
 ---
 

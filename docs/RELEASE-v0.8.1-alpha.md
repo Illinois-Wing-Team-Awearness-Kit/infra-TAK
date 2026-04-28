@@ -15,7 +15,11 @@
 - Installs that already had a working LDAP outpost before updating to v0.8.0 and experienced CPU/Postgres issues.
 - Installs that rolled back from v0.8.0 are safe to update to v0.8.1.
 
-**Operator action:** None required on v0.8.1. If you are still on v0.8.0 and experiencing high CPU from this issue, update to v0.8.1 — the migration will not re-trigger on healthy outposts.
+**Recovery for affected v0.8.0 installs (two steps):**
+1. **infra-TAK console → Authentik page → Restart** — clears the bind storm and Postgres connection flood. Wait 2 minutes.
+2. **infra-TAK console → Update Now** — updates to v0.8.1. The migration will see the outpost is healthy and skip it.
+
+If your domain is unreachable due to the load, use the backdoor at `https://<server-IP>:5001` to access the console.
 
 | File | Change |
 |------|--------|

@@ -43,6 +43,17 @@ The two LDAP `AUTHENTIK_HOST` migrations now coexist and are mutually exclusive 
 | v0.8.0 (existing, retained) | `https://<fqdn>` | `tls: internal error` (no websocket) | Force to `http://authentik-server-1:9000` |
 | v0.8.4 (new) | `http://authentik-server-1:9000` | spiral signature (≥2 markers) | Reverse to `https://<fqdn>` if Caddy serves |
 
+### Fix: post-update migration thread now survives gunicorn worker recycle
+
+**Problem:** During `systemctl restart takwerx-console`, gunicorn briefly spawns and reaps a transient worker before the new master takes over. The pre-v0.8.4 `_post_update_auto_deploy` would (1) save `last_console_version = VERSION` to `settings.json` immediately, (2) spawn a daemon thread that sleeps 10s before doing anything, and (3) print "scheduling auto-deploy". Then the transient worker would be killed by the master roughly 2-7 seconds later — taking the daemon thread with it. The new worker would then import `app.py`, see `last_ver == VERSION` (already saved by the dead worker), and short-circuit. **Migrations silently never ran.** This was the failure mode discovered in the field on the broken `0.8.4-alpha` dev build: the routing repair, the PG tuning, and AUTHENTIK_WEB_WORKERS adjustments all looked like they had run because the version ticket was saved, but no migration code actually executed.
+
+**Fix:**
+1. **Version save moved to AFTER migrations complete.** The `last_console_version = VERSION` write now lives in a `finally` block that runs only after `_run_post_update()` returns (whether successfully or with an exception caught and logged). If the worker is killed mid-migration, the version stays at the old value and the next worker re-runs the migration.
+2. **PID-checked lockfile (`/tmp/takwerx-post-update.lock`) prevents concurrent runs.** Multiple gunicorn workers boot in close succession during `systemctl restart`. The lockfile contains the holder PID. New workers acquire it only if (a) the file doesn't exist, (b) the holder PID is dead (`os.kill(pid, 0)` raises `ProcessLookupError`), or (c) the lock is older than 30 minutes. This means a killed worker holding a stale lock doesn't block recovery; a new worker takes over within seconds.
+3. **All migration prints now use `flush=True`.** Gunicorn's stdout was being lost when the worker was killed mid-buffer. Forcing flush ensures each step is journalled.
+
+**Operator impact:** none on healthy boxes. On boxes where the broken dev build of 0.8.4-alpha set the version ticket prematurely, the **first restart after pulling the fixed v0.8.4-alpha tag** will run all migrations to completion. (The dev build's bad ticket was only saved on tak-10 and was repaired manually before main was tagged; production boxes upgrading from v0.8.3-alpha will see this work correctly on the first try.)
+
 ### Fix: detect any non-30s `idle_in_transaction_session_timeout`, not just hardcoded values
 
 The `needs_pg_update` check in `_ensure_authentik_compose_patches` previously triggered only on `300s`, `10s`, `120s` literal values. Operators who manually edited `docker-compose.yml` (e.g. `15s` during debugging) would not have their setting auto-corrected on Update Now. v0.8.4 generalizes the check: any value other than `30s` triggers a migration to `30s`.
@@ -68,6 +79,7 @@ If the migration's auto-rollback fires (validation failed because Caddy wasn't r
 | `app.py` | New function `_apply_authentik_ldap_routing_repair(ak_dir, plog)` — the v0.8.4 migration. Health-gated, Caddy-probed, validated, auto-rollback on failure |
 | `app.py` | `_post_update_auto_deploy` calls the new function after the existing v0.8.0 LDAP HOST check, before AUTHENTIK_WEB_WORKERS |
 | `app.py` | `needs_pg_update` (2 call sites) generalized to detect any value other than `30s` |
+| `app.py` | `_post_update_auto_deploy`: version save moved to `finally` after migration completes; PID-checked lockfile prevents stale-ticket short-circuit on worker recycle; migration prints use `flush=True` |
 | `app.py` | VERSION bumped to `0.8.4-alpha` |
 | `docs/HANDOFF-LDAP-AUTHENTIK.md` | New incident section "v0.8.0 → v0.8.4 LDAP outpost routing reversal" with measured data, gates, and rules |
 

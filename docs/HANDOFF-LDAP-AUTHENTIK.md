@@ -13,7 +13,7 @@ CRITICAL INCIDENTS:
 - v0.8.2: post-update migration auto-sets AUTHENTIK_WEB_WORKERS=4 and restarts server only (never ldap).
 - v0.8.3: idle_in_transaction_session_timeout 120s → 30s with force-recreate to apply (10s was tried first and broke Authentik startup — migration lifecycle has idle gaps of 10-20s).
 - v0.8.4: REVERSED the v0.8.0 routing migration for boxes whose outpost was spiraling on http://authentik-server-1:9000. Through Caddy (https://<fqdn> + extra_hosts:host-gateway), HTTP/2 multiplexing and connection pooling shape the request flow and prevent parallel unbounded queries from exposing Authentik 2026.2.2's slow policybindingmodel evaluation. Tak-10 dropped from 200+ active Postgres queries to 1 the moment routing was reversed.
-- v0.8.5: HARDENING of v0.8.4. Dual-signal spiral detection (Postgres idle-in-trans ≥30 OR ≥2 outpost log markers in --tail 1000) so high bind volume can't hide spiral evidence. Periodic 10-min monitor thread (PID-locked single instance, 6h repair rate limit) so spirals manifesting after Update Now self-heal. Granular gate logging at every early-return so silent skips can't hide bugs. Forensics persisted to settings.authentik_spiral_last_repair.
+- v0.8.5: HARDENING of v0.8.4. (a) PROACTIVE routing migration `_ensure_authentik_ldap_outpost_on_fqdn` — migrates boxes from internal direct routing to FQDN on Authentik deploy / TAK Server deploy / Update Now / every 10 min, gated on `/opt/tak` installed AND FQDN configured AND Caddy reachable. Catches the responder-class latent misroute that the reactive detector cannot see (cached SA session masks the spiral until first fresh bind). (b) Verifier hardening — `_test_ldap_bind_dn_verdict` returns tri-state `'ok' | 'fail' | 'inconclusive'`; `_ensure_authentik_webadmin` no longer does destructive DELETE+POST recreate on inconclusive verdicts and re-queries before POST on confirmed-fail (kills the responder `400 username must be unique` regression). (c) Dual-signal spiral detection (Postgres idle-in-trans ≥30 OR ≥2 outpost log markers in --tail 1000) so high bind volume can't hide spiral evidence. (d) Periodic 10-min monitor thread (PID-locked, 6h rate limit) so spirals manifesting after Update Now self-heal. (e) Granular gate logging at every early-return. (f) Forensics persisted to settings.authentik_spiral_last_repair and settings.authentik_proactive_routing_migration.
 
 NEVER restart the LDAP outpost in a migration unless it is provably broken. NEVER use fewer than 4 Authentik web workers on an active install. NEVER set idle_in_transaction_session_timeout below 30s — Authentik startup will crash-loop. Caddy is a request shaper for the LDAP outpost — direct routing to authentik-server-1:9000 exposes the upstream Authentik 2026.2.2 LDAP-flow regression.
 
@@ -150,6 +150,36 @@ Safeguards:
 
 **v0.8.5 fix #4 — spiral repair forensics in `settings.json`.** Every repair attempt persists `{ts, outcome, evidence, outpost_markers}` under `authentik_spiral_last_repair`. Used for the rate limit; also useful when an operator reports "I think it spiraled and recovered last night" — the timestamp + evidence is right there.
 
+**v0.8.5 fix #5 (added during responder field test) — PROACTIVE routing migration (`_ensure_authentik_ldap_outpost_on_fqdn`).** Field-testing on `responder` exposed a case the reactive detector cannot catch: a TAK-installed box on internal direct routing (`http://authentik-server-1:9000`) where the cached `adm_ldapservice` session was masking all outpost failures. There was no spiral signature in the outpost log because the only client successfully binding was the cached SA. The bug was invisible until `webadmin` (no cache) attempted a fresh bind, which immediately recursed and threw "exceeded stage recursion depth". By the time the operator hit "Resync LDAP" the box was already broken; reactive detection was correctly NOT firing, but the box was one fresh-bind away from spiraling.
+
+The proactive function migrates the LDAP outpost to FQDN routing **without waiting for a spiral**, gated only on the box's load profile:
+
+| Precondition | Why |
+|---|---|
+| `~/authentik/docker-compose.yml` + `.env` exist | Authentik installed |
+| Outpost is currently on `http://authentik-server-1:9000` | Migration target is internal direct routing |
+| `.env` has `AUTHENTIK_HOST=https://<fqdn>` | FQDN configured (no migration target otherwise) |
+| `https://<fqdn>/-/health/live/` reachable from inside the LDAP container | Caddy is up; if down we'd brick the box |
+| `/opt/tak` exists | TAK Server installed = heavy LDAP load profile that exposes the bug |
+
+When ALL hold: backup compose → rewrite to FQDN + `extra_hosts:host-gateway` → `docker compose up -d --no-deps --force-recreate ldap` → 30s validation → restore on failure. Idempotent — no-op on FQDN-routed boxes, on light-load boxes (no `/opt/tak`), on Caddy-not-ready boxes.
+
+**Triggers:**
+1. Authentik deploy / reconfigure completion
+2. TAK Server deploy completion (catches the Authentik-then-TAK install order)
+3. Post-update migration after every Update Now
+4. Periodic spiral monitor (every 10 min, runs the proactive pass before the reactive pass)
+
+The reactive `_apply_authentik_ldap_routing_repair` still runs second as a fallback for boxes where the proactive preconditions weren't met (e.g. Caddy temporarily down) but the box has already started spiraling.
+
+**v0.8.5 fix #6 (added during responder field test) — verifier hardening (`_test_ldap_bind_dn_verdict`).** The responder operator hit `WebAdmin: Authentik API 400: {"username":["This field must be unique."]}` on every Resync LDAP. Root cause: `_test_ldap_bind_dn` returned `False` when ldapsearch was missing on the host AND the outpost log showed `exceeded stage recursion depth` (the spiral signature, not a credential failure). Caller `_ensure_authentik_webadmin` interpreted this as "bind confirmed-failed, recreate webadmin" and ran DELETE+POST. The DELETE silently failed (race / async), the POST returned 400. Repeat forever.
+
+The fix:
+- `_test_ldap_bind_dn_verdict` returns tri-state `'ok' | 'fail' | 'inconclusive'`. Inconclusive = ldapsearch unavailable AND/OR outpost log shows recursion/EOF/nil-pointer (spiral signature, not credential failure).
+- `_test_ldap_bind_dn` is preserved as a backward-compatible wrapper (returns True only on `'ok'`); read-only callers don't change.
+- `_ensure_authentik_webadmin` now: on `'ok'` → success; on `'inconclusive'` → return success WITHOUT destructive recovery, but kick off `_ensure_authentik_ldap_outpost_on_fqdn` (the inconclusive verdict often *is* the responder spiral); on `'fail'` → DELETE, then **re-query** to confirm the user is gone before POST. If the DELETE didn't take, skip the recreate and surface a clear error instead of triggering the 400.
+- `_test_ldap_bind_dn_verdict` calls `_ensure_ldapsearch()` once at the top — so the inconclusive case is rare on Debian/RHEL hosts.
+
 ### Operator-visible diagnostics
 
 ```bash
@@ -157,11 +187,19 @@ Safeguards:
 docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc \
   "SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction' AND application_name LIKE '%authentik%';"
 
-# Last spiral repair attempt (if any)
-jq '.authentik_spiral_last_repair // "no repair attempts recorded"' /opt/takwerx/settings.json
+# Last reactive spiral repair attempt (if any)
+jq '.authentik_spiral_last_repair // "no spiral repair attempts recorded"' /opt/takwerx/settings.json 2>/dev/null \
+  || jq '.authentik_spiral_last_repair // "no spiral repair attempts recorded"' ~/.config/settings.json
 
-# Monitor activity (one line at startup, then silent on healthy boxes)
-sudo journalctl -u takwerx-console --since "1 hour ago" | grep -E "spiral monitor|routing repair"
+# Last proactive routing migration (if any)
+jq '.authentik_proactive_routing_migration // "no proactive migration recorded"' /opt/takwerx/settings.json 2>/dev/null \
+  || jq '.authentik_proactive_routing_migration // "no proactive migration recorded"' ~/.config/settings.json
+
+# Current LDAP outpost routing — should be FQDN on TAK-installed boxes, internal on console-only
+grep -A0 'AUTHENTIK_HOST:' ~/authentik/docker-compose.yml | head -5
+
+# Monitor + migration activity (one line at startup, then silent on healthy boxes)
+sudo journalctl -u takwerx-console --since "1 hour ago" | grep -E "spiral monitor|routing repair|proactive routing"
 ```
 
 ### Rules added by v0.8.5
@@ -170,6 +208,16 @@ sudo journalctl -u takwerx-console --since "1 hour ago" | grep -E "spiral monito
 - **One-shot post-update migrations are insufficient for self-healing.** Anything that fixes a runtime drift (spiral, cache wipe, Caddy bounce, network blip) must run on a periodic schedule, not just at update time. The operator promise is "the update fixes it"; that means the update fixes it the first time *and* keeps fixing it as conditions change.
 - **Background threads in gunicorn must hold a single-instance PID-checked lock.** N workers means N copies of every module-load thread. Without a lock, monitors thrash; with a stale lock, restarts have no monitor. The `os.kill(pid, 0)` pattern (used by `_post_update_auto_deploy` and the spiral monitor) is the standard.
 - **Every gate-skip in a migration must log why.** Silent skips hide bugs (the `ssdnodes` `0/2 markers` case). The `routing repair: <reason> — skipping (<context>)` format is the standard.
+- **Reactive detection is necessary but not sufficient — proactive precondition migrations come first.** Some bugs are silently latent (responder's misroute hidden by the cached SA session) and never produce a reactive signal until the operator's first fresh bind, which is also the first failed bind they see. Configurations that are known to fail under heavy load (`/opt/tak` installed) must be migrated proactively when preconditions are safe — don't wait for proof of failure.
+- **Probe verdicts must be tri-state when the negative result feeds destructive recovery.** Boolean `True/False` conflates "confirmed failure" with "couldn't determine", which is fine for read-only display but a critical bug for any DELETE+POST recreate path. Use `'ok' | 'fail' | 'inconclusive'` and gate destructive paths on confirmed-fail only. (See `_test_ldap_bind_dn_verdict`.)
+- **DELETE before POST must re-query before POSTing.** If your recovery path deletes a uniquely-keyed record and then creates a fresh one, the DELETE can race or silently fail. Always re-query for the unique key after DELETE; if the record still exists, do not POST a duplicate (Authentik API returns `400 username must be unique`). Skip and surface the error.
+- **Don't change passwords if the error is about stages.** "exceeded stage recursion depth" / `LDAP Result Code 50` / `nil pointer dereference` / `EOF` are flow-execution errors. They don't mean the password is wrong, they mean the flow itself can't run. Recreating users or resetting passwords does not help — fix the routing, the cache, or the flow planner instead.
+- **`authentication: none` on the LDAP `ldap-authentication-flow` is required.** Setting it to anything else makes the flow planner refuse to issue a plan to anonymous bind requests. Don't change.
+- **Don't put `password_stage` on the identification stage AND a `password` stage in the flow** — that causes recursion. The identification stage's `password_stage` field should be cleared; let the password stage binding in the flow do the work.
+- **Don't set `configure_flow` on the password stage.** That redirects the flow into a password-change subflow, which recurses.
+- **`bind_mode: cached` hides issues.** Healthy boxes can sit on a stale cached SA bind for hours while every fresh bind fails. Test with a non-cached client periodically (or just check `/api/v3/outposts/instances/<pk>/health/`).
+- **The LDAP outpost gets `bind_flow_slug` from the provider's `authorization_flow` — not `authentication_flow`.** Setting the latter does nothing for LDAP binds.
+- **The cardinal "never restart LDAP unless it's provably broken" rule has two qualifying conditions now (v0.8.5):** (1) reactive — spiral signature in outpost log OR ≥30 idle-in-trans; (2) proactive — outpost on internal direct routing AND `/opt/tak` exists AND FQDN configured AND Caddy reachable. Both qualify; everything else is hands-off.
 
 ---
 

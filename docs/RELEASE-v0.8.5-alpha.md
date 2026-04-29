@@ -1,6 +1,6 @@
 # v0.8.5-alpha Release Notes
 
-## Headline: proactive LDAP routing migration + verifier hardening
+## Headline: proactive LDAP routing migration + gunicorn timeout bump + verifier hardening
 
 v0.8.4 introduced a reactive, one-shot post-update migration that reversed the v0.8.0 internal LDAP routing on boxes already spiraling. Field testing on `tak-10` and `ssdnodes` confirmed it works for actively-spiraling boxes. Field testing on `responder` (April 2026) exposed two **separate** problems v0.8.4 didn't solve:
 
@@ -44,7 +44,40 @@ Idempotent. No-op on FQDN-routed boxes, on light-load boxes, on boxes without an
 
 The reactive `_apply_authentik_ldap_routing_repair` still runs second as a fallback for boxes where the proactive preconditions weren't met (e.g. Caddy temporarily down) but the box has already spiraled.
 
-### 2. Verifier hardening — tri-state bind probe, no destructive recovery on inconclusive
+### 2. Gunicorn worker timeout bump (30s → 120s) — kills the SIGABRT cascade on heavy-load boxes
+
+Field testing during v0.8.5 development on `tak-10` (≈3.5 LDAP binds/sec sustained, 1000+ binds in 5 min) surfaced a separate failure mode that the routing migration alone does not address. With FQDN routing already correct, Caddy logs still showed periodic upstream `EOF` (translated to 502) at 70-90 ms request lifetimes, and outpost logs still showed brief `exceeded stage recursion depth` bursts. Authentik server logs explained why:
+
+```
+[CRITICAL] WORKER TIMEOUT (pid:95632)
+[ERROR] Worker (pid:95632) was sent SIGABRT!
+[INFO] Booting worker with pid: 96213
+```
+
+Authentik 2026.2.2's flow planner under heavy LDAP-bind load occasionally exceeds gunicorn's upstream default 30s worker timeout. Some flow plans we observed completed in 124-136s (status 200, just slow) — others in 211-218s. Gunicorn assumes a worker silent for >30s is hung and SIGABRTs it, which **drops every in-flight TCP connection in that worker** mid-response. Caddy sees connection-reset → returns 502 to the LDAP outpost → the outpost retries → the retry hits "exceeded stage recursion depth" inside the same flow.
+
+The fix is the smallest possible change: a single env var appended to `~/authentik/.env`:
+
+```
+GUNICORN_CMD_ARGS=--timeout=120
+```
+
+Then a server-only `docker compose up -d --no-deps --force-recreate server` to apply it (worker / postgresql / redis / ldap untouched, ~10-30 s of API unavailability with cached LDAP service-account sessions surviving).
+
+Why 120 s and not higher: 124-136 s slow plans complete with status 200 under 120 s (with margin); the 200 s+ outliers are queued requests waiting for an unblocked worker, not a single 200 s request — once any worker frees up, the queue drains. 120 s catches the slow-plan case without leaving workers hung indefinitely on a genuinely-stuck request.
+
+Safety profile (why this is safe everywhere, not just slow boxes):
+
+- **Healthy / fast boxes** (responder, ssdnodes, light-load consoles): timeout never fires (typical request 50-200 ms). No behavioral change.
+- **Heavy-load / slow-flow boxes** (tak-10): absorbs slow plans without dropping connections. SIGABRT cascade goes silent.
+- **Boxes that already set `GUNICORN_CMD_ARGS`** (operator override, future Authentik defaults, etc.): idempotent no-op — we never overwrite.
+- **Operator-revertible**: delete the line, recreate server. Zero state coupling.
+
+The function lives at `_ensure_authentik_gunicorn_timeout(plog, value=120)` in `app.py`, alongside `_ensure_authentik_ldap_outpost_on_fqdn`, and is hooked into the same trigger points (Authentik deploy completion, TAK Server deploy completion, post-update migration). It is **deliberately NOT** hooked into the periodic spiral monitor — this is one-shot config, not a hot fix to re-apply, and any operator override should stick.
+
+Outcome is persisted to `settings.json` under `authentik_gunicorn_timeout_migration`.
+
+### 3. Verifier hardening — tri-state bind probe, no destructive recovery on inconclusive
 
 `_test_ldap_bind_dn` now wraps `_test_ldap_bind_dn_verdict`, which returns `'ok' | 'fail' | 'inconclusive'` instead of `True | False`.
 
@@ -59,7 +92,7 @@ A verdict of `'inconclusive'` is returned when:
 
 Also: the probe now installs `ldap-utils` (or `openldap-clients`) once at the top via `_ensure_ldapsearch()` so the inconclusive case is rare on Debian/RHEL hosts.
 
-### 3. Dual-signal spiral detection — two-tier markers (Postgres + spiral-specific outpost log)
+### 4. Dual-signal spiral detection — two-tier markers (Postgres + spiral-specific outpost log)
 
 New helper `_detect_authentik_ldap_spiral()` returns spiral confirmation if **either**:
 
@@ -77,7 +110,7 @@ The Postgres signal is the durable one — it survives LDAP container recreates 
 
 The outpost log signal is retained because it's faster to check and catches early-stage spirals before Postgres congestion sets in. With the spiral-specific tier, false positives from restart artifacts are eliminated while still catching the responder/`ssdnodes`/Jarrett class within seconds.
 
-### 4. Periodic spiral monitor (background thread)
+### 5. Periodic spiral monitor (background thread)
 
 New `_authentik_spiral_monitor()` runs as a daemon thread inside the console. Every 10 minutes it calls the dual-signal detector, and if a spiral is confirmed it runs the same idempotent `_apply_authentik_ldap_routing_repair` the post-update migration runs.
 
@@ -86,7 +119,7 @@ Safeguards:
 - **Repair rate limit**: max 1 repair attempt per 6 hours, recorded in `settings.json` under `authentik_spiral_last_repair`. Prevents thrashing on pathological boxes (e.g. spiral confirmed but Caddy unreachable — the repair would skip every 10 min anyway, but this caps the noise).
 - **No-op gates**: still skips on healthy boxes, no-FQDN boxes, FQDN-routed boxes, and boxes without Authentik installed. Same gates as the migration — by design.
 
-### 5. Granular gate logging in routing repair
+### 6. Granular gate logging in routing repair
 
 Every early-return in `_apply_authentik_ldap_routing_repair` now logs **why** it skipped, with the same `routing repair: ...` prefix so operators can grep one stream. Examples:
 
@@ -103,7 +136,7 @@ outpost markers (last 1000 lines): result code 50=14, nil pointer=3, exceeded st
 
 This was the diagnostic gap on `ssdnodes`: the v0.8.4 migration logged "0/2 markers — leaving alone" but didn't say which 0/2 it sampled or how big its window was. Now every gate decision is auditable from `journalctl -u takwerx-console`.
 
-### 6. Spiral repair forensics persisted to settings.json
+### 7. Spiral repair forensics persisted to settings.json
 
 Every repair attempt (success, validation failure, recreate failure) writes:
 
@@ -123,14 +156,16 @@ Used by the monitor for rate limiting; also useful when an operator reports "I t
 - **Boxes with TAK Server installed but LDAP outpost still on internal direct routing** (the `responder` class): proactive migration fires on the next Update Now, on the next deploy, or within 10 min via the periodic monitor — whichever comes first. No manual action needed; no waiting for a spiral.
 - **Boxes still actively spiraling after v0.8.4 update** (the `ssdnodes` case): the periodic monitor's reactive pass detects via Postgres signal within 10 min and runs the repair. No manual action needed.
 - **Boxes that drift back into a spiral** later (Caddy bounce, clock-aligned Mission API hammer, etc.): same — within 10 min, automatic repair, rate-limited to 6h.
-- **Console / light-load boxes** (no `/opt/tak`): proactive migration intentionally skips. Internal routing is fine for low LDAP volume and avoids the Caddy round-trip overhead.
-- **Healthy / FQDN-routed boxes**: every trigger is a no-op. Proactive function detects existing FQDN routing and exits in <1s. Monitor stays silent.
+- **Heavy-LDAP-load boxes hitting gunicorn `WORKER TIMEOUT` / SIGABRT** (the `tak-10` class — sustained 3+ binds/sec, slow Authentik flow plans): gunicorn timeout migration fires on the next Update Now (or next deploy), one-shot. Server container restarts with `--timeout=120`. SIGABRT cascade and the 502→outpost-retry→stage-recursion downstream go silent.
+- **Console / light-load boxes** (no `/opt/tak`): proactive routing migration intentionally skips. Gunicorn timeout migration still applies (it's safe everywhere — timeout never fires on fast boxes anyway).
+- **Healthy / FQDN-routed boxes**: routing trigger is a no-op (proactive function detects existing FQDN routing and exits in <1s). Gunicorn timeout migration applies once on first encounter, then idempotent no-op forever after.
 - **Boxes without Authentik installed**: every function sees no `~/authentik/docker-compose.yml` and skips. No errors.
 - **Operators who hit the verifier `400 username must be unique` regression on `responder`**: cannot recur — the destructive DELETE+POST recreate is now gated on a confirmed-fail verdict AND a re-query that confirms the DELETE actually completed.
+- **Operators who already set `GUNICORN_CMD_ARGS`** in `~/authentik/.env` for any reason: untouched — the migration never overwrites an existing value.
 
 ## What v0.8.5 explicitly does NOT change
 
-- **Authentik image tag** — still tracking latest 2026.2.x. The slow `policybindingmodel` flow regression is upstream; FQDN-via-Caddy is the workaround until they ship a fix.
+- **Authentik image tag** — still tracking latest 2026.2.x. The slow `policybindingmodel` flow regression is upstream; FQDN-via-Caddy + the 120s gunicorn timeout are the workarounds until they ship a fix.
 - **The v0.8.4 routing repair function itself** — same compose rewrite, same Caddy probe, same 30s validation, same auto-rollback. Only the *trigger* and *re-run cadence* are improved.
 - **The v0.8.0 LDAP HOST migration** — unchanged from the v0.8.4 patch (only fires on positive TLS-failure evidence, not absence of websocket connect).
 - **`AUTHENTIK_WEB_WORKERS=4`** logic from v0.8.2 — preserved.
@@ -145,7 +180,9 @@ Used by the monitor for rate limiting; also useful when an operator reports "I t
 | File | Change |
 |---|---|
 | `app.py` | New `_ensure_authentik_ldap_outpost_on_fqdn()` — proactive routing migration, gated on TAK installed + FQDN configured + Caddy reachable |
-| `app.py` | Proactive migration hooked into Authentik deploy completion, TAK Server deploy completion, post-update migration, and spiral monitor |
+| `app.py` | Proactive routing migration hooked into Authentik deploy completion, TAK Server deploy completion, post-update migration, and spiral monitor |
+| `app.py` | New `_ensure_authentik_gunicorn_timeout(plog, value=120)` — appends `GUNICORN_CMD_ARGS=--timeout=120` to `~/authentik/.env` if missing, recreates the server container only, validates via `printenv` inside the container, persists outcome to `settings.json` under `authentik_gunicorn_timeout_migration` |
+| `app.py` | Gunicorn timeout migration hooked into Authentik deploy completion, TAK Server deploy completion, and post-update migration (NOT spiral monitor — one-shot config, not a hot fix) |
 | `app.py` | New `_test_ldap_bind_dn_verdict()` — tri-state probe (`'ok' / 'fail' / 'inconclusive'`); installs `ldap-utils` if missing; treats `exceeded stage recursion depth` and similar as inconclusive |
 | `app.py` | `_test_ldap_bind_dn` now wraps the verdict function (returns True only on confirmed-ok; backward-compatible) |
 | `app.py` | `_ensure_authentik_webadmin` no longer does destructive DELETE+POST recreate on inconclusive verdicts; on confirmed-fail it re-queries to confirm DELETE before POST (kills the `400 username must be unique` regression) |
@@ -174,18 +211,31 @@ grep AUTHENTIK_HOST ~/authentik/docker-compose.yml | grep -A0 "ldap" -B0
 # → On a TAK-installed box with Caddy: AUTHENTIK_HOST: https://<your-fqdn>
 # → On a console-only box: AUTHENTIK_HOST: http://authentik-server-1:9000  (intentional)
 
-# 4. Check the proactive migration outcome (if any was needed)
+# 4. Check the proactive routing migration outcome (if any was needed)
 jq '.authentik_proactive_routing_migration' ~/.config/settings.json 2>/dev/null \
   || jq '.authentik_proactive_routing_migration' /root/infra-TAK/.config/settings.json 2>/dev/null
 # → null (no migration needed) OR { ts, outcome: "success", fqdn: "..." }
 
-# 5. Check current spiral state on the box (sanity)
+# 5. Confirm the gunicorn timeout bump applied (the tak-10 fix)
+docker exec authentik-server-1 printenv GUNICORN_CMD_ARGS
+# → --timeout=120
+grep GUNICORN_CMD_ARGS ~/authentik/.env
+# → GUNICORN_CMD_ARGS=--timeout=120
+jq '.authentik_gunicorn_timeout_migration' ~/.config/settings.json 2>/dev/null \
+  || jq '.authentik_gunicorn_timeout_migration' /root/infra-TAK/.config/settings.json 2>/dev/null
+# → { ts, outcome: "success", value: 120 }
+
+# 6. After applying, confirm SIGABRT cascade has stopped on heavy-load boxes
+docker logs authentik-server-1 --since 30m 2>&1 | grep -cE "WORKER TIMEOUT|SIGABRT"
+# → 0 on a box that was hitting it before; 0 on a box that never hit it
+
+# 7. Check current spiral state on the box (sanity)
 docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc \
   "SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction' AND application_name LIKE '%authentik%';"
 # → healthy boxes: 0-3 ; spiraling: 30+
 
-# 6. After 10 min on a misrouted-but-not-yet-spiraling box, look for proactive migration:
-sudo journalctl -u takwerx-console --since "15 min ago" | grep -E "spiral monitor|proactive routing|routing repair"
+# 8. After 10 min on a misrouted-but-not-yet-spiraling box, look for proactive migration:
+sudo journalctl -u takwerx-console --since "15 min ago" | grep -E "spiral monitor|proactive routing|routing repair|gunicorn timeout"
 ```
 
 ## Responder-class manual recovery (already-broken boxes)

@@ -59,16 +59,23 @@ A verdict of `'inconclusive'` is returned when:
 
 Also: the probe now installs `ldap-utils` (or `openldap-clients`) once at the top via `_ensure_ldapsearch()` so the inconclusive case is rare on Debian/RHEL hosts.
 
-### 3. Dual-signal spiral detection (Postgres + outpost log)
+### 3. Dual-signal spiral detection — two-tier markers (Postgres + spiral-specific outpost log)
 
 New helper `_detect_authentik_ldap_spiral()` returns spiral confirmation if **either**:
 
-- LDAP outpost log shows ≥2 unique spiral markers in the last **1000 lines** (was 200 in v0.8.4), OR
-- Postgres has **≥30 connections in `idle in transaction`** state from `application_name LIKE '%authentik%'`
+- LDAP outpost log shows ≥1 **spiral-specific** marker in the last **1000 lines** (was 200 in v0.8.4):
+  - `result code 50` (Authentik flow refusing — LDAP "unwilling to perform")
+  - `nil pointer` (Go runtime crash in outpost)
+  - `exceeded stage recursion` (the responder signature)
+  - `502 bad gateway` (upstream Authentik overloaded)
+  - `503 service unavailable` (upstream Authentik refusing connections)
+- OR Postgres has **≥30 connections in `idle in transaction`** state from `application_name LIKE '%authentik%'`
+
+**General markers** (`failed to execute flow`, `EOF`) are tracked for forensics but **do not trip alone** — they appear on every healthy box (user mistypes a password → `failed to execute flow`; LDAP client disconnects normally → `: EOF`). v0.8.5 dev testing on tak-10 caught this: 2 unique general markers from a transient container restart triggered the v0.8.4-style "≥2 unique" rule even though the box was perfectly healthy (`idle-in-trans=0`). The gate ("already on FQDN — skipping") caught it, but the threshold was wrong. v0.8.5 ships the tightened two-tier logic.
 
 The Postgres signal is the durable one — it survives LDAP container recreates (which wipe the outpost log) and can't be drowned out by high bind volume. Healthy boxes sit at 0–3 idle-in-trans; a spiraling box sits at 50–200+. The 30 threshold is well above peak normal load and well below the spiral floor.
 
-The outpost log signal is retained because it's faster to check and catches early-stage spirals before Postgres congestion sets in.
+The outpost log signal is retained because it's faster to check and catches early-stage spirals before Postgres congestion sets in. With the spiral-specific tier, false positives from restart artifacts are eliminated while still catching the responder/`ssdnodes`/Jarrett class within seconds.
 
 ### 4. Periodic spiral monitor (background thread)
 
@@ -91,7 +98,7 @@ routing repair: no spiral evidence — leaving alone (outpost healthy or pre-spi
 routing repair: cannot reach https://<fqdn> from LDAP container — skipping (Caddy not ready or DNS issue; box would end up worse)
 routing repair: spiral CONFIRMED on http://authentik-server-1:9000 — proceeding to migrate to FQDN
 spiral check: postgres signal: 47 idle-in-trans (≥30 threshold)
-outpost markers (last 1000 lines): result code 50=14, nil pointer=3, eof=8
+outpost markers (last 1000 lines): result code 50=14, nil pointer=3, exceeded stage recursion=2, eof=8
 ```
 
 This was the diagnostic gap on `ssdnodes`: the v0.8.4 migration logged "0/2 markers — leaving alone" but didn't say which 0/2 it sampled or how big its window was. Now every gate decision is auditable from `journalctl -u takwerx-console`.

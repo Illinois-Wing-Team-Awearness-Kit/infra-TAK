@@ -32,6 +32,24 @@ ssh -i ~/.ssh/<vm>_key.pem azureuser@<public-ip>
 
 ---
 
+## Setting up on a new Mac
+
+**Azure `.pem` keys cannot be re-downloaded from the portal.** Copy them from your old Mac before switching.
+
+```bash
+# On the old Mac — copy these files to the new Mac (USB / AirDrop / secure copy)
+ls ~/.ssh/tak-test-*.pem
+
+# On the new Mac — fix permissions after copying
+chmod 600 ~/.ssh/tak-test-1_key.pem
+chmod 600 ~/.ssh/tak-test-2_key.pem
+chmod 600 ~/.ssh/tak-test-3_key.pem
+```
+
+For full new-Mac setup (repo clone, GitHub auth, Cursor) see `docs/MAC-SETUP.md`.
+
+---
+
 ## First time on a new Azure VM
 
 Azure `.pem` keys come from the portal at VM creation time. If you missed the download, the key cannot be retrieved — you must reset SSH auth in the portal (VM → Reset password).

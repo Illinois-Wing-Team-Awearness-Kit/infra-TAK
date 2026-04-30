@@ -128,18 +128,19 @@ Detector logic: skip if `_detect_authentik_ldap_spiral` is currently firing (don
 
 ### 2f. Node-RED: verify all flows fire on container restart / post-update
 
-**Operator concern (tak-10):** Some flows (DataSync) restart cleanly after Node-RED container restart. Others (Tablet Command AVL) appeared to need manual restart. We need to audit which flow patterns auto-fire vs. need explicit kick.
+**Operator concern (tak-10, Apr 30 2026):** Tablet Command AVL feed appeared not to be flowing data. Resolved itself once the operator logged into Node-RED — i.e. the act of accessing Node-RED through the Authentik proxy warmed the upstream session and the flow's WebSocket / mTLS connection re-established. **This confirms the flow itself is fine; the issue was an upstream dependency (Authentik proxy session) being slow/cold while Authentik server CPU was pinned (item 2e).** Once item 2e (periodic auto-restart) is in place, this symptom should disappear.
 
-**Audit checklist:**
+**Audit checklist (still worth doing for resilience):**
 - ArcGIS engine tabs (dynamic, Configurator-driven): confirmed auto-fire after `nodered/deploy.sh` (context restore restores credentials and engine state).
 - TFR / TC / PulsePoint / KML feeds: same path — confirmed.
 - TAK Mission API (mTLS): inject node "fire on deploy" must be set; otherwise depends on first incoming event.
-- DataSync flows: depend on TAK Server WebSocket being reachable on container start; if Authentik proxy was slow during restart, the WebSocket connect can fail silently. Add a `catch + 30s retry` pattern as a flow template.
+- DataSync / Tablet Command flows: depend on TAK Server WebSocket being reachable on container start; if Authentik proxy was slow during restart, the WebSocket connect can fail silently and the flow waits idly until something pokes it. Add a `catch + 30s retry` pattern as a flow template.
 
 **Proposed:**
 - Add a "Flow health check" Node-RED endpoint that reports per-tab connection status, scraped by the dashboard.
 - Document the "fire on deploy" inject-node pattern in `nodered/README.md`.
 - Add a CHANGELOG note in v0.8.7 explaining what auto-fires vs. what needs manual restart.
+- For flows with WebSocket / persistent connections (DataSync, Tablet Command, Mission API): add an upstream-health-check inject node that pings the upstream every 60s and triggers a reconnect if the connection has died silently.
 
 ### 2g. TAK Server: webadmin admin-role assignment regression
 
@@ -183,5 +184,5 @@ Detector logic: skip if `_detect_authentik_ldap_spiral` is currently firing (don
 Three issues surfaced during a tak-10 deep-dive after v0.8.6 was already shipped to main. None are v0.8.6 regressions; all are pre-existing or operational items now scoped into v0.8.7:
 
 1. **Authentik runtime state accumulation** (item 2e above) — `server+worker --force-recreate` cleared sustained 99%/93% CPU back to bursty pattern. Manual restart works; need automation.
-2. **Tablet Command flow not flowing data on Node-RED** (parked separately for triage outside v0.8.7) — likely related to flow restart behavior (item 2f) OR a TAK Server mission-channel mismatch. Will diagnose live; if it points to a code-fixable pattern, fold the fix into v0.8.7.
+2. **Tablet Command flow appeared stalled on Node-RED** — resolved by operator logging into Node-RED through the Authentik proxy. Root cause: same as item 1 (Authentik server CPU saturated → proxy sessions cold → WebSocket connect failed silently → flow waited). Folded into item 2f as a flow-resilience hardening (upstream health check + reconnect). Auto-restart in 2e prevents recurrence.
 3. **TAK Server webadmin redirected to WebTAK instead of Admin Console** (item 2g above) — fixed by running "Resync LDAP webadmin" a second time. Investigate why one resync wasn't sufficient and add a final-state verifier.

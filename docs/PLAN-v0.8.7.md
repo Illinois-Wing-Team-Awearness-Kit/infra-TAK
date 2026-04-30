@@ -108,6 +108,54 @@ Azure detected — ensure NSG allows: 443, 5001, 8089, 8443, 8446
 See docs/azure-nsg-infra-tak.json for the ARM template.
 ```
 
+### 2e. Authentik server+worker periodic auto-restart on heavy-load boxes
+
+**Field evidence (tak-10, Apr 30 2026):** After ~5h of heavy LDAP load on a DataSync/Node-RED box, Authentik server + postgres CPU pinned at p50 99% / 93% even with bind volume 489/5min and 96% cache hit rate. **A simple `docker compose up -d --no-deps --force-recreate server worker` immediately dropped postgres p50 to ~30% and server to bursty pattern matching responder.** Confirms runtime state accumulation (memory growth, query plan cache fragmentation, or session tracker drift) in long-running Authentik server containers under sustained event-trigger load.
+
+**Proposed:** Weekly (or every 72h) auto-recreate of `authentik-server-1` + `authentik-worker-1`, scheduled off-peak (e.g. 04:00 local). LDAP outpost stays up so cached SA bind survives — no thundering herd, no LDAP downtime. ~15-30s API outage during recreate is acceptable in the maintenance window. Add a "Restart Authentik server now" button in the console for manual on-demand triggering.
+
+**Settings:**
+```json
+{
+  "authentik_periodic_restart_enabled": true,
+  "authentik_periodic_restart_interval_hours": 168,
+  "authentik_periodic_restart_window_hour_local": 4,
+  "authentik_periodic_restart_last_run": 0
+}
+```
+
+Detector logic: skip if `_detect_authentik_ldap_spiral` is currently firing (don't restart during an active spiral; let the spiral monitor handle it).
+
+### 2f. Node-RED: verify all flows fire on container restart / post-update
+
+**Operator concern (tak-10):** Some flows (DataSync) restart cleanly after Node-RED container restart. Others (Tablet Command AVL) appeared to need manual restart. We need to audit which flow patterns auto-fire vs. need explicit kick.
+
+**Audit checklist:**
+- ArcGIS engine tabs (dynamic, Configurator-driven): confirmed auto-fire after `nodered/deploy.sh` (context restore restores credentials and engine state).
+- TFR / TC / PulsePoint / KML feeds: same path — confirmed.
+- TAK Mission API (mTLS): inject node "fire on deploy" must be set; otherwise depends on first incoming event.
+- DataSync flows: depend on TAK Server WebSocket being reachable on container start; if Authentik proxy was slow during restart, the WebSocket connect can fail silently. Add a `catch + 30s retry` pattern as a flow template.
+
+**Proposed:**
+- Add a "Flow health check" Node-RED endpoint that reports per-tab connection status, scraped by the dashboard.
+- Document the "fire on deploy" inject-node pattern in `nodered/README.md`.
+- Add a CHANGELOG note in v0.8.7 explaining what auto-fires vs. what needs manual restart.
+
+### 2g. TAK Server: webadmin admin-role assignment regression
+
+**Field evidence (tak-10, Apr 30 2026):** After webadmin password rotation / Authentik webadmin user re-creation (via "Resync LDAP webadmin"), the TAK Server WebUI redirected webadmin to **WebTAK (operator UI)** instead of the **Admin Console** — meaning TAK Server's `UserAuthenticationFile.xml` did not list the new webadmin user with the `admin` role. **Mitigation that worked:** running "Resync LDAP webadmin" again from the console resolved it. So the resync flow has the admin-role assignment, but the *first* run didn't fully complete the role propagation (or the role got dropped during a subsequent reconcile).
+
+**Suspect paths:**
+- `/opt/tak/UserAuthenticationFile.xml` — does the resync flow ALWAYS add `<userRole role="ADMIN"/>` for webadmin? Verify in `_ensure_authentik_webadmin` / TAK Server reconcile.
+- TAK Server's `setadmin.sh` or admin-cert sync — does it run on every webadmin resync or only on first deploy?
+- Race between webadmin user creation in Authentik and admin-role apply in TAK Server (LDAP cache / sync delay).
+
+**Proposed:**
+- Add a final verifier to "Resync LDAP webadmin" that confirms webadmin appears in `UserAuthenticationFile.xml` with `role="ADMIN"` before reporting success.
+- If missing, automatically run the admin-role apply step (idempotent).
+- Add a console button "Verify webadmin admin role" that runs the check on demand.
+- Log the verifier result to `settings.json → webadmin_admin_role_check`.
+
 ---
 
 ## 3. v0.8.7 acceptance criteria
@@ -129,3 +177,11 @@ See docs/azure-nsg-infra-tak.json for the ARM template.
 - No LDAP incidents since v0.8.5. Spiral monitor heartbeating silently every 10 min on all three boxes.
 - v0.8.6 dev→main selective merge uses the pattern in `docs/COMMANDS.md`.
 - Rollback is the most immediately useful operator-safety feature. No need for complex Phase 2 to ship a useful v0.8.7.
+
+## 5. Apr 30 2026 — tak-10 field session findings
+
+Three issues surfaced during a tak-10 deep-dive after v0.8.6 was already shipped to main. None are v0.8.6 regressions; all are pre-existing or operational items now scoped into v0.8.7:
+
+1. **Authentik runtime state accumulation** (item 2e above) — `server+worker --force-recreate` cleared sustained 99%/93% CPU back to bursty pattern. Manual restart works; need automation.
+2. **Tablet Command flow not flowing data on Node-RED** (parked separately for triage outside v0.8.7) — likely related to flow restart behavior (item 2f) OR a TAK Server mission-channel mismatch. Will diagnose live; if it points to a code-fixable pattern, fold the fix into v0.8.7.
+3. **TAK Server webadmin redirected to WebTAK instead of Admin Console** (item 2g above) — fixed by running "Resync LDAP webadmin" a second time. Investigate why one resync wasn't sufficient and add a final-state verifier.

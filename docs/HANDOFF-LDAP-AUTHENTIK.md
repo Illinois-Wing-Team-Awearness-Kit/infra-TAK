@@ -15,9 +15,9 @@ CRITICAL INCIDENTS:
 - v0.8.4: REVERSED the v0.8.0 routing migration for boxes whose outpost was spiraling on http://authentik-server-1:9000. Through Caddy (https://<fqdn> + extra_hosts:host-gateway), HTTP/2 multiplexing and connection pooling shape the request flow and prevent parallel unbounded queries from exposing Authentik 2026.2.2's slow policybindingmodel evaluation. Tak-10 dropped from 200+ active Postgres queries to 1 the moment routing was reversed.
 - v0.8.5: HARDENING of v0.8.4. (a) PROACTIVE routing migration `_ensure_authentik_ldap_outpost_on_fqdn` — migrates boxes from internal direct routing to FQDN on Authentik deploy / TAK Server deploy / Update Now / every 10 min, gated on `/opt/tak` installed AND FQDN configured AND Caddy reachable. Catches the responder-class latent misroute that the reactive detector cannot see (cached SA session masks the spiral until first fresh bind). (b) Gunicorn worker timeout bump 30s→120s — `_ensure_authentik_gunicorn_timeout` appends `GUNICORN_CMD_ARGS=--timeout=120` to `~/authentik/.env` once and recreates only the server container. Closes the SIGABRT cascade observed on tak-10 (heavy LDAP load → Authentik 2026.2.2 flow planner exceeds 30s → gunicorn kills worker → in-flight TCP drops → Caddy 502 → outpost retry → stage recursion). Idempotent — never overwrites operator override; safe everywhere because timeout never fires on fast boxes. (c) Verifier hardening — `_test_ldap_bind_dn_verdict` returns tri-state `'ok' | 'fail' | 'inconclusive'`; `_ensure_authentik_webadmin` no longer does destructive DELETE+POST recreate on inconclusive verdicts and re-queries before POST on confirmed-fail (kills the responder `400 username must be unique` regression). (d) Dual-signal spiral detection with two-tier markers — outpost trips on ≥1 spiral-specific marker (`result code 50`, `nil pointer`, `exceeded stage recursion`, 502/503) OR Postgres idle-in-trans ≥30. General markers (`failed to execute flow`, `EOF`) tracked for forensics only — they appear on healthy boxes from typos and normal disconnects, false-positive trapped during tak-10 dev testing. (e) Periodic 10-min monitor thread (PID-locked, 6h rate limit) so spirals manifesting after Update Now self-heal. (f) Granular gate logging at every early-return. (g) Forensics persisted to settings.authentik_spiral_last_repair, settings.authentik_proactive_routing_migration, and settings.authentik_gunicorn_timeout_migration.
 - v0.8.6: AZURE / NAT DEPLOY RELIABILITY. Four field bugs found and fixed during first Azure deployment test (tak-test-3, D8as_v5, P10 64 GiB OS disk, ~145 MB/s sync write). (a) Authentik containers never started on slow-disk VMs — Step 7 (docker compose up -d) was nested inside `elif needs_pg_update:` which is always False on fresh deploys; un-indented 121 lines so bring-up is unconditional. (b) start.sh showed private IP on Azure/AWS NAT — added curl api.ipify.org (3s timeout) with graceful fallback; shows both public and private when they differ. (c) Dashboard disk I/O showed cached vmstat speed (998 MB/s) instead of real sync speed (145 MB/s) — Guard Dog diskio_history.csv read first when available; vmstat fallback now labeled "(vmstat, cached)" so source is visible; manual test switched to oflag=dsync. (d) LDAP SA bind check always reported failure even when LDAP was working — two bugs: ldapsearch searched dc=takldap base scope (Authentik returns LDAP error 32 there regardless of bind outcome, so exit code always non-zero); fixed by searching ou=users,dc=takldap one-level for cn=adm_ldapservice. Race: sleep(2) was too short on Azure (log entry written at same second as docker logs check); fixed: sleep(5), --since 90s, direct Docker log fallback ("authenticated from session") that bypasses ldapsearch entirely. Confirmed on tak-test-3: attempt 2 passed via Docker log fallback, full clean deploy in ~4 minutes.
-- v0.8.7: AUTHENTIK STABILITY — periodic auto-restart + ASGI loop self-heal. Apr 30 2026 tak-10 incident proved that identical hardware + identical config + identical workload boxes can drift to wildly different CPU profiles after several days of uptime — server p50 140%+ vs sibling box (responder) at p50 1.9%. Theories explored and ruled out: postgres bloat (manual VACUUM helped briefly but climbed back), aggressive autovacuum tuning (didn't move the needle), AUTHENTIK_WEB_WORKERS undersized (responder runs at 4 fine; tak-10 ran at 4 melting; env var IS NOT THE DIFFERENTIATOR). Confirmed cause: runtime state drift in the Authentik server process. ONLY durable fix: force-recreate of server+worker (140% → 3.3% durably, zero LDAP impact). Three pieces shipped: (a) `_authentik_periodic_restart_monitor` daemon thread — 24h cadence, fires at hour_local=04 by default, 12h min_interval floor, single-instance via PID lockfile, NEVER touches ldap. (b) `_detect_authentik_asgi_websocket_loop` — cheap log scan for `Expected ASGI message` errors >= 5 in 60s; reactive trigger inside the existing 10-min spiral monitor. (c) `_recreate_authentik_server_worker(plog, reason)` — single source of truth, runs `docker compose up -d --force-recreate --no-deps server worker`, persists outcome to settings.authentik_periodic_restart for visibility and rate-limiting (12h floor shared between scheduled and reactive triggers). NO UI changes (operator explicit: "I just want an update to work for now. No UI changes"). NO env var changes (today proved AUTHENTIK_WEB_WORKERS irrelevant; v0.8.2 logic stays as-is, harmless on 2026.x).
+- v0.8.7: AUTHENTIK STABILITY — env var name fix + official tunings + periodic auto-restart + ASGI loop self-heal + mission-critical safety gate. Apr 30 2026 SMOKING GUN on tak-10: `docker top authentik-server-1` showed only **2 gunicorn workers** despite `.env` containing `AUTHENTIK_WEB_WORKERS=4` since v0.8.2. Root cause: Authentik 2026.x requires DOUBLE underscore (`AUTHENTIK_WEB__WORKERS`) per official docs (https://docs.goauthentik.io/install-config/configuration/) — single underscore was silently ignored on every box in the fleet for 5 releases. `ak dump_config` also confirmed cache and log_level were all running at defaults (300s/300s/info) despite our intent. Five pieces shipped: (a) `_authentik_apply_official_tunings(plog)` — renames `AUTHENTIK_WEB_WORKERS` → `AUTHENTIK_WEB__WORKERS=4` (correct name, finally applies); adds `AUTHENTIK_CACHE__TIMEOUT_FLOWS=600`, `AUTHENTIK_CACHE__TIMEOUT_POLICIES=600`, `AUTHENTIK_LOG_LEVEL=warning` (only if missing — never overwrites operator-set values). (b) `_authentik_verify_runtime_config(plog)` — closes the audit loop: runs `ak dump_config`, parses JSON, counts gunicorn workers via `docker top`; persists pass/fail to settings.authentik_runtime_config_check so we can never have this silent-default scenario again. (c) `_authentik_periodic_restart_monitor` daemon thread — 24h cadence, fires at hour_local=04 by default, 12h min_interval floor, single-instance via PID lockfile, NEVER touches ldap. (d) `_detect_authentik_asgi_websocket_loop` — cheap log scan for `Expected ASGI message` errors >= 5 in 60s; reactive trigger inside the existing 10-min spiral monitor. (e) `_recreate_authentik_server_worker(plog, reason)` — single source of truth, runs `docker compose up -d --force-recreate --no-deps server worker`, persists outcome to settings.authentik_periodic_restart. (f) Mission-critical safety gate `_authentik_admin_api_recently_active(60)` — defers scheduled restart if any non-GET POST/PUT/PATCH/DELETE to /api/v3/ in last 60s (admin mid-form-submit at 04:00 won't lose work); reactive ASGI trigger bypasses gate. v0.8.2 migration block in `_post_update_auto_deploy` superseded — now delegates to `_authentik_apply_official_tunings`. Migration runs on every console startup via `_startup_migrations` (idempotent — only first run triggers recreate). NO UI changes (operator explicit).
 
-NEVER restart the LDAP outpost in a migration unless it is provably broken. NEVER use fewer than 4 Authentik web workers on an active install. NEVER set idle_in_transaction_session_timeout below 30s — Authentik startup will crash-loop. Caddy is a request shaper for the LDAP outpost — direct routing to authentik-server-1:9000 exposes the upstream Authentik 2026.2.2 LDAP-flow regression. RUNTIME STATE DRIFT IS REAL — even healthy boxes need a periodic recreate; v0.8.7 automates this on a 24h cadence.
+NEVER restart the LDAP outpost in a migration unless it is provably broken. NEVER use fewer than 4 Authentik web workers on an active install — and ALWAYS use the correct double-underscore env var name `AUTHENTIK_WEB__WORKERS` (single underscore is silently ignored per Authentik 2026.x docs). NEVER set idle_in_transaction_session_timeout below 30s — Authentik startup will crash-loop. Caddy is a request shaper for the LDAP outpost — direct routing to authentik-server-1:9000 exposes the upstream Authentik 2026.2.2 LDAP-flow regression. RUNTIME STATE DRIFT IS REAL — even healthy boxes need a periodic recreate; v0.8.7 automates this on a 24h cadence. ALWAYS verify env var changes via `docker exec authentik-worker-1 ak dump_config` — never trust .env alone (the v0.8.2 → v0.8.7 silent-ignore bug taught us why).
 
 VALIDATED in field on 2026-04-29 across tak-10 (heavy DataSync/Node-RED), ssdnodes (medium streaming), and responder (medium-light): all three on v0.8.5-alpha, all three on FQDN routing, all three with GUNICORN_CMD_ARGS=--timeout=120, all three at SIGABRT=0 / outpost recursion=0 / Postgres idle-in-trans=0 over 30+ min of real bind load (1.5–2.4 binds/sec sustained per box). Azure tak-test-3 validated on 2026-04-29: clean Authentik deploy in ~4 min, LDAP SA bind verified via Docker log fallback on attempt 2, all four v0.8.6 fixes confirmed working. Apr 30 2026 tak-10: confirmed that a single force-recreate of server+worker (LDAP untouched) drops a drifted-state box from p50 140% → 3.3% in 3 minutes with zero LDAP impact — this is the validation evidence behind v0.8.7.
 
@@ -419,6 +419,92 @@ sudo journalctl -u takwerx-console --since "15 min ago" | grep "spiral monitor"
 - **v0.8.6 confirmed working on Azure:** Standard_D8as_v5, P10 64 GiB OS disk, ~145 MB/s sync write. Clean Authentik deploy in ~4 minutes. LDAP SA bind verified on attempt 2. All four v0.8.6 fixes active. This is now the validated reference config for Azure single-server deployments.
 - **Azure OS disk throughput is ~145 MB/s sync write regardless of disk tier** (Azure caps OS disk I/O). This is acceptable for infra-TAK. The dashboard now correctly shows the real sync speed (from Guard Dog CSV) instead of the cached vmstat value. Don't mistake the cached vmstat speed (which can show 998 MB/s) for real disk performance.
 - **`hostname -I` returns the private IP on Azure.** `start.sh` (v0.8.6+) detects this and also shows the public IP. The console backdoor is at `https://<public-IP>:5001`.
+
+---
+
+## April 2026 — v0.8.7 SILENT-IGNORE env var name bug (the discovery that should have come first)
+
+### The smoking gun
+
+After hours of chasing "runtime state drift" theories on tak-10, an operator pushed back: "is there any info on the internet about optimizing authentik? I feel like we are doing all this half-ass shit when we should not have to." That question prompted reading the **official Authentik configuration docs** for the first time.
+
+The very first sentence of [docs.goauthentik.io/install-config/configuration/](https://docs.goauthentik.io/install-config/configuration/):
+
+> **The double-underscores are intentional**, as all these settings are translated to YAML internally, and a double-underscore indicates the next level (a subsetting).
+
+We've been writing **`AUTHENTIK_WEB_WORKERS=4`** (single underscore) to `~/authentik/.env` since the v0.8.2 release in late April 2026. The correct name is **`AUTHENTIK_WEB__WORKERS`** (double underscore). The single-underscore name has been silently ignored by Authentik 2026.x on every box in the fleet for five releases.
+
+Verification on tak-10 (Apr 30 2026):
+
+```bash
+$ grep AUTHENTIK_WEB ~/authentik/.env
+AUTHENTIK_WEB_WORKERS=4
+
+$ docker top authentik-server-1 -o pid,cmd | grep gunicorn
+gunicorn: master [authentik.root.asgi:application]
+gunicorn: worker [authentik.root.asgi:application]   ← worker 1
+gunicorn: worker [authentik.root.asgi:application]   ← worker 2
+                                                    ← TWO workers, not four
+```
+
+**Two gunicorn workers running, despite the `.env` saying 4.** The `ak dump_config` output also revealed every cache setting at defaults (300s/300s/300s) and `log_level: info` (default) — every official optimization the docs recommend was sitting unused.
+
+### Why we never noticed for five releases
+
+1. **No verification.** The v0.8.2 migration wrote to `.env` and restarted the server, then... assumed it worked. Never ran `ak dump_config` to confirm.
+2. **The fleet "worked" enough.** With 2 workers, responder coped fine because its workload was light. Tak-10 melted at p50 140%+ but we attributed it to "runtime state drift" — the truth was "2 workers can't service tak-10's bind storm."
+3. **Documentation wasn't read.** The official docs are the first place to look. We chased postgres bloat, autovacuum tuning, ASGI WebSocket loops, periodic recreates — band-aids on top of a config that wasn't even being applied.
+
+### What v0.8.7 fixes
+
+Three new functions in `app.py`:
+
+#### 1. `_authentik_apply_official_tunings(plog)`
+
+Idempotent migration that:
+
+- **Removes** `AUTHENTIK_WEB_WORKERS=N` lines from `.env` (single-underscore — was being ignored).
+- **Adds** `AUTHENTIK_WEB__WORKERS=4` (correct double-underscore name; doubles capacity from default 2).
+- **Adds** `AUTHENTIK_CACHE__TIMEOUT_FLOWS=600` (2x default 300s — flows rarely change; reduces DB pressure).
+- **Adds** `AUTHENTIK_CACHE__TIMEOUT_POLICIES=600` (2x default 300s — policies rarely change; reduces DB pressure).
+- **Adds** `AUTHENTIK_LOG_LEVEL=warning` (down from default `info` — reduces log overhead on busy boxes).
+
+Only adds keys that are missing. **Never overwrites operator-set values.** Records outcome to `settings.authentik_official_tunings`.
+
+#### 2. `_authentik_verify_runtime_config(plog)`
+
+Closes the audit loop. Runs `docker exec authentik-worker-1 ak dump_config`, parses the JSON output, and confirms:
+
+- `cache.timeout_flows == 600` (server-side YAML config)
+- `cache.timeout_policies == 600` (server-side YAML config)
+- `log_level == "warning"` (server-side YAML config)
+- `gunicorn worker count == 4` (via `docker top authentik-server-1` — `web.workers` is consumed by the launcher script and doesn't appear in `dump_config`)
+
+Persists pass/fail to `settings.authentik_runtime_config_check` for operator audit. Runs on every console startup.
+
+#### 3. Hooked into both startup and post-update paths
+
+- `_startup_migrations` calls `_authentik_apply_official_tunings` on every console startup. The function is self-gating (returns False if no changes needed), so the recreate only fires once per box.
+- `_post_update_auto_deploy` superseded the v0.8.2 migration block — now delegates to the same function for fresh deploys.
+
+### Operator gotcha (must add to runbook)
+
+- **NEVER trust `.env` to mean Authentik is using those settings.** Always verify with `docker exec authentik-worker-1 ak dump_config 2>/dev/null | python3 -c "import json,sys; out=sys.stdin.read(); print(json.loads(out[out.find('{'):]))"`.
+- **The double-underscore is intentional** in Authentik env var names. Single-underscore is silently ignored.
+- **The v0.8.2 migration code is preserved as `_authentik_apply_official_tunings`** — but renamed and corrected. Never re-add a `AUTHENTIK_WEB_WORKERS` (single-underscore) write path.
+
+### Field expectations after v0.8.7 lands
+
+On every existing box:
+
+1. Console restart triggers `_startup_migrations`.
+2. `_authentik_apply_official_tunings` runs once, writes the correct env vars, returns True.
+3. `_recreate_authentik_server_worker` fires (10-15s blip).
+4. Server comes back with **4 workers** (verifiable via `docker top authentik-server-1`).
+5. Cache TTLs at 600s. Log level warning.
+6. Verifier records pass to `settings.authentik_runtime_config_check`.
+
+Expected behavior change on tak-10: server CPU under bind load should drop further from the post-recreate baseline (3.3% → likely sub-5% steady-state with 2x worker capacity + cache TTL relief). Postgres CPU should drop similarly (less flow re-evaluation under load).
 
 ---
 

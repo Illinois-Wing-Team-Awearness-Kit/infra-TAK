@@ -1,18 +1,70 @@
 # v0.8.7-alpha Release Notes
 
-## Headline: Authentik stability — periodic auto-restart + ASGI loop self-heal
+## Headline: Authentik stability — fixing the v0.8.2 env-var-name silent-ignore bug + applying official tunings + periodic auto-restart
 
-The Apr 30 2026 tak-10 incident proved that **identical hardware + identical config + identical workload boxes can drift to wildly different CPU profiles after several days of uptime**. Sister boxes on the same Azure D8as_v5, both v0.8.6, both with the same `AUTHENTIK_WEB_WORKERS=4` history, both with similar bind volume — but tak-10 sustained server CPU p50 at 140%+ while responder sat at p50 1.9%.
+> **The bug we've been carrying for five releases:** Since v0.8.2 (late April 2026), every box in the fleet has been running with half the gunicorn workers we thought, because we wrote `AUTHENTIK_WEB_WORKERS=4` (single underscore) to `.env` and Authentik 2026.x silently ignored it. The correct name is `AUTHENTIK_WEB__WORKERS` (double underscore) per the [official Authentik docs](https://docs.goauthentik.io/install-config/configuration/) — "the double-underscores are intentional." Apr 30 2026 on tak-10: `docker top authentik-server-1` showed 2 gunicorn workers despite our config saying 4. `ak dump_config` confirmed cache and log_level were also at defaults, never tuned. v0.8.7 fixes all of this and adds a runtime-config verifier so we can never have this silent-default scenario again.
 
-After ruling out four reasonable theories (postgres bloat, autovacuum tuning, worker undersizing, worker oversizing), the only durable fix turned out to be a force-recreate of the Authentik server + worker containers. CPU dropped from p50 140% → 3.3% in 3 minutes with **zero LDAP impact** (outpost untouched, bind cache preserved).
+The Apr 30 2026 investigation started chasing CPU drift on tak-10 (server p50 140%+ vs sibling box at p50 1.9%, identical hardware and config). We tried postgres VACUUM, autovacuum tuning, worker bumps, worker reverts, ASGI WebSocket loop fixes, runtime state drift theories — band-aid after band-aid. The breakthrough came when an operator pushed back: "is there any info on the internet about optimizing authentik? I feel like we are doing all this half-ass shit." That sent us to the official docs for the first time, where the very first sentence explained why every config we'd been writing was being ignored.
 
-v0.8.7 automates this recreate on a 24h cadence, plus adds a reactive trigger for the ASGI WebSocket reconnect loop failure mode observed during the same investigation.
+v0.8.7 fixes the silent-ignore bug, applies the official optimization recommendations, ships a runtime-config verifier, and keeps the periodic auto-restart from the previous v0.8.7 design as belt-and-suspenders for the legitimate runtime-state-drift cases.
 
 ---
 
 ## Changes
 
-### 1. Periodic Authentik server + worker auto-restart
+### 1. Fix the v0.8.2 env-var-name silent-ignore bug + apply official tunings
+
+**The bug:** Since v0.8.2, the post-update migration in `_post_update_auto_deploy` wrote `AUTHENTIK_WEB_WORKERS=4` (single underscore) to `~/authentik/.env`. Authentik 2026.x reads `AUTHENTIK_WEB__WORKERS` (double underscore). The single-underscore form was silently ignored on every box for five releases.
+
+**The proof (tak-10, Apr 30 2026):**
+
+```bash
+$ grep AUTHENTIK_WEB ~/authentik/.env
+AUTHENTIK_WEB_WORKERS=4
+
+$ docker top authentik-server-1 -o pid,cmd | grep gunicorn
+gunicorn: master [authentik.root.asgi:application]
+gunicorn: worker [authentik.root.asgi:application]   ← worker 1
+gunicorn: worker [authentik.root.asgi:application]   ← worker 2
+                                                    ← TWO workers, not four
+
+$ docker exec authentik-worker-1 ak dump_config | python3 -c "import json,sys; o=sys.stdin.read(); cfg=json.loads(o[o.find('{'):]); print(cfg.get('cache'),cfg.get('log_level'))"
+{'timeout': 300, 'timeout_flows': 300, 'timeout_policies': 300} info
+```
+
+Every cache setting at defaults. `log_level=info` (default). Worker count 2 (default). Every official optimization, never applied.
+
+**New function: `_authentik_apply_official_tunings(plog)`** in `app.py`. Idempotent. Edits `~/authentik/.env`:
+
+- **Removes** `AUTHENTIK_WEB_WORKERS=N` lines (the single-underscore wrong name; was being ignored).
+- **Adds** `AUTHENTIK_WEB__WORKERS=4` (correct double-underscore name; finally honored — doubles capacity from default 2).
+- **Adds** `AUTHENTIK_CACHE__TIMEOUT_FLOWS=600` (2x default 300s — flows rarely change; reduces DB pressure).
+- **Adds** `AUTHENTIK_CACHE__TIMEOUT_POLICIES=600` (2x default 300s — policies rarely change; reduces DB pressure).
+- **Adds** `AUTHENTIK_LOG_LEVEL=warning` (down from default `info` — reduces log overhead on busy boxes).
+
+Only adds keys that are **missing**. Never overwrites operator-set values. Records outcome to `settings.authentik_official_tunings`.
+
+Hooked into both:
+- **`_startup_migrations`** — runs on every console startup. Function self-gates (returns False on subsequent runs when no changes needed), so the recreate only fires once per box.
+- **`_post_update_auto_deploy`** — superseded the v0.8.2 migration block. Fresh deploys get the correct config from the very first Update Now.
+
+After applying changes, `_recreate_authentik_server_worker(reason='official-tunings-migration')` fires automatically (10-15s blip; `ldap` untouched).
+
+### 2. Runtime config verifier (closes the audit loop)
+
+**New function: `_authentik_verify_runtime_config(plog)`** in `app.py`. The lesson from the silent-ignore bug: never trust `.env` to mean Authentik is using those settings.
+
+Two probes:
+
+1. **`docker exec authentik-worker-1 ak dump_config`** — parses JSON, checks:
+   - `cache.timeout_flows == 600`
+   - `cache.timeout_policies == 600`
+   - `log_level == "warning"`
+2. **`docker top authentik-server-1`** — counts actual gunicorn worker processes (because `web.workers` is consumed by the launcher script, not visible in `dump_config`).
+
+Persists pass/fail to `settings.authentik_runtime_config_check`. Runs on every console startup (after `_authentik_apply_official_tunings`). If any check fails, the operator gets a clear log line in journalctl.
+
+### 3. Periodic Authentik server + worker auto-restart
 
 **New function: `_authentik_periodic_restart_monitor()` daemon thread** (in `app.py`).
 

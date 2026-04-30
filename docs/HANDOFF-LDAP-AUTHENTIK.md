@@ -5,7 +5,7 @@
 ## Prompt for a new chat (copy and paste this)
 
 ```
-Read docs/HANDOFF-LDAP-AUTHENTIK.md — current release is v0.8.5-alpha.
+Read docs/HANDOFF-LDAP-AUTHENTIK.md — current release is v0.8.6-alpha.
 
 CRITICAL INCIDENTS:
 - v0.8.0: introduced AUTHENTIK_HOST internal-URL fix (correct for fresh installs) but the post-update migration unconditionally restarted the LDAP outpost, causing thundering herd (bind cache wipe → all clients re-auth simultaneously → worker/Postgres exhaustion) on active installs.
@@ -14,14 +14,15 @@ CRITICAL INCIDENTS:
 - v0.8.3: idle_in_transaction_session_timeout 120s → 30s with force-recreate to apply (10s was tried first and broke Authentik startup — migration lifecycle has idle gaps of 10-20s).
 - v0.8.4: REVERSED the v0.8.0 routing migration for boxes whose outpost was spiraling on http://authentik-server-1:9000. Through Caddy (https://<fqdn> + extra_hosts:host-gateway), HTTP/2 multiplexing and connection pooling shape the request flow and prevent parallel unbounded queries from exposing Authentik 2026.2.2's slow policybindingmodel evaluation. Tak-10 dropped from 200+ active Postgres queries to 1 the moment routing was reversed.
 - v0.8.5: HARDENING of v0.8.4. (a) PROACTIVE routing migration `_ensure_authentik_ldap_outpost_on_fqdn` — migrates boxes from internal direct routing to FQDN on Authentik deploy / TAK Server deploy / Update Now / every 10 min, gated on `/opt/tak` installed AND FQDN configured AND Caddy reachable. Catches the responder-class latent misroute that the reactive detector cannot see (cached SA session masks the spiral until first fresh bind). (b) Gunicorn worker timeout bump 30s→120s — `_ensure_authentik_gunicorn_timeout` appends `GUNICORN_CMD_ARGS=--timeout=120` to `~/authentik/.env` once and recreates only the server container. Closes the SIGABRT cascade observed on tak-10 (heavy LDAP load → Authentik 2026.2.2 flow planner exceeds 30s → gunicorn kills worker → in-flight TCP drops → Caddy 502 → outpost retry → stage recursion). Idempotent — never overwrites operator override; safe everywhere because timeout never fires on fast boxes. (c) Verifier hardening — `_test_ldap_bind_dn_verdict` returns tri-state `'ok' | 'fail' | 'inconclusive'`; `_ensure_authentik_webadmin` no longer does destructive DELETE+POST recreate on inconclusive verdicts and re-queries before POST on confirmed-fail (kills the responder `400 username must be unique` regression). (d) Dual-signal spiral detection with two-tier markers — outpost trips on ≥1 spiral-specific marker (`result code 50`, `nil pointer`, `exceeded stage recursion`, 502/503) OR Postgres idle-in-trans ≥30. General markers (`failed to execute flow`, `EOF`) tracked for forensics only — they appear on healthy boxes from typos and normal disconnects, false-positive trapped during tak-10 dev testing. (e) Periodic 10-min monitor thread (PID-locked, 6h rate limit) so spirals manifesting after Update Now self-heal. (f) Granular gate logging at every early-return. (g) Forensics persisted to settings.authentik_spiral_last_repair, settings.authentik_proactive_routing_migration, and settings.authentik_gunicorn_timeout_migration.
+- v0.8.6: AZURE / NAT DEPLOY RELIABILITY. Four field bugs found and fixed during first Azure deployment test (tak-test-3, D8as_v5, P10 64 GiB OS disk, ~145 MB/s sync write). (a) Authentik containers never started on slow-disk VMs — Step 7 (docker compose up -d) was nested inside `elif needs_pg_update:` which is always False on fresh deploys; un-indented 121 lines so bring-up is unconditional. (b) start.sh showed private IP on Azure/AWS NAT — added curl api.ipify.org (3s timeout) with graceful fallback; shows both public and private when they differ. (c) Dashboard disk I/O showed cached vmstat speed (998 MB/s) instead of real sync speed (145 MB/s) — Guard Dog diskio_history.csv read first when available; vmstat fallback now labeled "(vmstat, cached)" so source is visible; manual test switched to oflag=dsync. (d) LDAP SA bind check always reported failure even when LDAP was working — two bugs: ldapsearch searched dc=takldap base scope (Authentik returns LDAP error 32 there regardless of bind outcome, so exit code always non-zero); fixed by searching ou=users,dc=takldap one-level for cn=adm_ldapservice. Race: sleep(2) was too short on Azure (log entry written at same second as docker logs check); fixed: sleep(5), --since 90s, direct Docker log fallback ("authenticated from session") that bypasses ldapsearch entirely. Confirmed on tak-test-3: attempt 2 passed via Docker log fallback, full clean deploy in ~4 minutes.
 
 NEVER restart the LDAP outpost in a migration unless it is provably broken. NEVER use fewer than 4 Authentik web workers on an active install. NEVER set idle_in_transaction_session_timeout below 30s — Authentik startup will crash-loop. Caddy is a request shaper for the LDAP outpost — direct routing to authentik-server-1:9000 exposes the upstream Authentik 2026.2.2 LDAP-flow regression.
 
-VALIDATED in field on 2026-04-29 across tak-10 (heavy DataSync/Node-RED), ssdnodes (medium streaming), and responder (medium-light): all three on v0.8.5-alpha, all three on FQDN routing, all three with GUNICORN_CMD_ARGS=--timeout=120, all three at SIGABRT=0 / outpost recursion=0 / Postgres idle-in-trans=0 over 30+ min of real bind load (1.5–2.4 binds/sec sustained per box). Spiral monitor heartbeating every 10 min on each box, hitting "outpost already on FQDN — skipping (already correct)" gate as expected. v0.8.5 is the stable baseline.
+VALIDATED in field on 2026-04-29 across tak-10 (heavy DataSync/Node-RED), ssdnodes (medium streaming), and responder (medium-light): all three on v0.8.5-alpha, all three on FQDN routing, all three with GUNICORN_CMD_ARGS=--timeout=120, all three at SIGABRT=0 / outpost recursion=0 / Postgres idle-in-trans=0 over 30+ min of real bind load (1.5–2.4 binds/sec sustained per box). Azure tak-test-3 validated on 2026-04-29: clean Authentik deploy in ~4 min, LDAP SA bind verified via Docker log fallback on attempt 2, all four v0.8.6 fixes confirmed working.
 
 Bursty CPU on heavy-DataSync boxes is NORMAL, not a regression: tak-10 swings server CPU 100%+ → 7% → 1% over 60s windows because DataSync clients re-authenticate per HTTP request and Node-RED engine flows fire clock-aligned bind clusters. The `--timeout=120` gunicorn fix absorbs these bursts; SIGABRT count = 0 is the proof. Don't chase low CPU as a goal on Mission API / DataSync / Node-RED boxes.
 
-See "April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal", "April 2026 — v0.8.5 hardening", and "April 2026 — v0.8.5 fleet validation" sections for full incident details and rules.
+See "April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal", "April 2026 — v0.8.5 hardening", "April 2026 — v0.8.5 fleet validation", and "April 2026 — v0.8.6 Azure/NAT deploy reliability" sections for full incident details and rules.
 Use docs/HANDOFF-LDAP-AUTHENTIK.md as the single source of truth for what's done and what to do next.
 ```
 
@@ -289,9 +290,79 @@ sudo journalctl -u takwerx-console --since "1 hour ago" | grep -E "spiral monito
 
 ---
 
+## April 2026 — v0.8.6 Azure / NAT deploy reliability
+
+**Date:** 2026-04-29 (same day as v0.8.5 fleet validation — immediately post-release Azure test).
+
+**Test box:** tak-test-3 — Azure Standard_D8as_v5, Ubuntu 22.04, East US, P10 64 GiB OS disk, ~145 MB/s sync write (`dd oflag=dsync`), 8 vCPUs from AMD EPYC 7763. First Azure deployment attempted from scratch on v0.8.5-alpha. Four bugs surfaced.
+
+### Bug 1 — Authentik containers never started (`elif needs_pg_update:` scope bug)
+
+**Symptom:** Step 7 ("Pulling Images & Starting Containers") printed correctly, but Step 8 ("Waiting for Authentik API") ran for 900 seconds and timed out. `docker ps` showed no Authentik containers. Operator had to SSH in and run `docker compose up -d` manually; containers came up and the API responded immediately.
+
+**Root cause:** In `_authentik_deploy()`, the `docker compose up -d` call (Step 7), all subsequent container health waits, and the network patch were nested inside an `elif needs_pg_update:` block. On a fresh deploy `needs_pg_update` is always `False` (no existing PostgreSQL container to check). So the `elif` body was never entered; `docker compose up -d` was never called; the API poll started polling for containers that had never been launched.
+
+**Fix:** Un-indented 121 lines out of the `elif` guard so the compose bring-up, healthchecks, and network patch execute unconditionally on every deploy path.
+
+**Impact:** All fresh Authentik deploys on any disk speed now work. Deploy time on Azure: 900 s (broken) → ~4 minutes (fixed).
+
+**Rules added:**
+- The `elif needs_pg_update:` guard exists ONLY to re-pull images and apply PG config changes to an existing install. It MUST NOT contain any unconditional first-deploy logic (bring-up, network patch, container starts). Any code inside it is skipped on fresh installs.
+- When adding new steps to `_authentik_deploy()`: if the step must always run (fresh or update), place it at the top-level of the function, not inside any conditional.
+
+### Bug 2 — `start.sh` showed private IP on Azure / AWS NAT
+
+**Symptom:** Azure VMs have private IPs (10.0.x.x) from `hostname -I`. `start.sh` printed `Access: https://10.0.0.4:5001` — unreachable from the operator's browser.
+
+**Fix:** Added `curl -s --max-time 3 https://api.ipify.org` to detect public IP. When public ≠ private, both lines are displayed. Single-line output preserved on non-NAT VPS.
+
+### Bug 3 — Dashboard disk I/O showed cached speed (998 MB/s) instead of real sync speed (145 MB/s)
+
+**Symptom:** Azure console dashboard showed "998 MB/s write" while `start.sh` correctly reported "145 MB/s — potentially slow" and Guard Dog's CSV showed the same ~145 MB/s. Operators use the dashboard number to assess VPS health; the inflated cached number gave a false "all good" signal.
+
+**Root cause:** Dashboard used `vmstat` output. `vmstat`'s block I/O columns show Linux buffer/cache throughput (i.e. how fast Linux is moving data to/from the page cache in RAM), not the underlying disk. On a mostly-idle box with warm cache, this can read as 998 MB/s when the actual disk does 145 MB/s.
+
+**Fix:**
+- When Guard Dog is installed: read latest sync write speed from `/var/lib/takguard/diskio_history.csv` (Guard Dog already benchmarks with `oflag=dsync` every 15 min — no extra I/O, no performance impact).
+- When Guard Dog is not installed: fall back to vmstat but label it `"(vmstat, cached)"` so the source is explicit.
+- Manual disk speed test button: changed from `oflag=direct` to `oflag=dsync` to match `start.sh` and Guard Dog methodology.
+- vmstat-only line is now hidden entirely when source is cached (it's always 0.00 on idle boxes — noise with a scary label).
+
+### Bug 4 — LDAP SA bind check: always reported failure even when LDAP was working
+
+**Symptom:** After a successful Authentik deploy, "Final check: LDAP SA bind" ran all 24 attempts and reported failure. LDAP container logs showed `"authenticated from session"` for every attempt from #2 onward — the SA was authenticating correctly, the check just couldn't detect it.
+
+**Root cause — Bug A (wrong ldapsearch search base):**
+`_test_ldap_bind_dn_verdict` searched `dc=takldap` with base scope. Authentik does not publish a root object at the base DN. ldapsearch got LDAP error 32 ("no such object") on the search portion regardless of bind outcome, so its exit code was always non-zero. The `if lr.returncode == 0` fast-path never fired for 24 × 3 = 72 consecutive ldapsearch invocations.
+
+**Root cause — Bug B (timing race on Docker log check):**
+The inner loop slept 2 seconds after triggering the ldapsearch bind, then checked `docker logs --since 45s`. On Azure's ~145 MB/s disk, the log entry for the bind was written at the same second as our `docker logs` command. The entry was consistently either just-written-but-not-flushed or just-barely-within the 45s window boundary.
+
+**Fix — ldapsearch:** Search `ou=users,dc=takldap` with one-level scope for `cn=adm_ldapservice`. This returns an actual LDAP result when the bind works, making the exit-code check reliable.
+
+**Fix — timing:** `sleep(2)` → `sleep(5)`, `--since 45s` → `--since 90s`.
+
+**Fix — fallback:** `_authentik_deploy_final_verify_ldap_sa` now directly checks Docker logs for `"authenticated from session"` + `"adm_ldapservice"` as an independent fallback path that bypasses ldapsearch entirely. Confirmed on tak-test-3:
+```
+Final check: LDAP SA bind (1/24)...   ← attempt 1: flow ran, recursion on first bind (session cached)
+Final check: LDAP SA bind (2/24)...   ← attempt 2: fallback Docker log check fires
+✓ LDAP SA bind verified via Docker log (authenticated from session). Safe to proceed.
+✓ Deploy complete.
+```
+
+**Why the recursion on attempt 1 is expected:** The first bind attempt goes through the authentication flow; the flow errors on the login stage with "exceeded stage recursion depth" (the `password_stage` fix removes the recursion, but this is attempt 1 before that fix has been re-applied). The session is cached by the outpost before the flow error lands. Attempt 2 hits the cache → `"authenticated from session"` → success. This is the known-good behavior for all Authentik LDAP SA binds under the current flow configuration.
+
+**Rules added by v0.8.6:**
+- **Never search `dc=<base>` with base scope in ldapsearch against Authentik LDAP.** Authentik doesn't publish a root object there. Always search `ou=users,dc=<base>` or `ou=groups,dc=<base>` with an appropriate scope and filter.
+- **`sleep(2)` is a race on slow-disk VMs.** Any Docker log check that reads log entries written by a just-triggered action needs at least `sleep(5)` on 100-150 MB/s disk. Consider `sleep(5)` the default minimum for log-read-after-trigger patterns.
+- **Build Docker-log fallbacks for bind checks.** ldapsearch exit codes are unreliable against Authentik LDAP (LDAP error 32 on search, error 49 on some edge cases). The definitive ground truth is `docker logs authentik-ldap-1` — `"authenticated from session"` / `"bind failed"` are unambiguous. ldapsearch is a fast-path; Docker logs are the authoritative fallback.
+- **The first SA bind always produces a flow-recursion error; the second uses cached session.** This is expected behavior, not a bug. The check must survive one failure and verify the second attempt.
+
+---
+
 ## Fresh-deploy expectations (Azure / new boxes)
 
-For deploying v0.8.5-alpha onto a brand-new VPS (Azure, ssdnodes, etc.) the migrations fire automatically at the right points. Operator never has to call them manually.
+For deploying v0.8.6-alpha onto a brand-new VPS (Azure, ssdnodes, etc.) the migrations fire automatically at the right points. Operator never has to call them manually.
 
 **Recommended deploy order (matches what the migrations are gated on):**
 
@@ -339,11 +410,14 @@ sudo journalctl -u takwerx-console --since "15 min ago" | grep "spiral monitor"
 # Expected: at least one "[spiral monitor] PID <N> acquired monitor lock — starting" line
 ```
 
-**Azure-specific notes:**
+**Azure-specific notes (updated for v0.8.6):**
 
 - Azure VMs sometimes hit DNS propagation delays for new FQDNs. The proactive routing migration probes `https://<fqdn>/-/health/live/` from inside the LDAP container; if Caddy hasn't finished fetching its LE cert OR DNS isn't fully propagated, the probe fails and the migration logs "cannot reach https://<fqdn> from LDAP container — skipping (Caddy/DNS not ready; retry later)" and exits cleanly. The spiral monitor will retry every 10 min until preconditions are met. **No manual action needed; just wait for the next monitor tick after DNS+Caddy are confirmed working.**
 - Azure NSG / firewall must allow inbound 443 (Caddy LE), 8089 (TAK Server CoT TLS), 8443 (TAK Portal HTTPS), 8446 (TAK Server cert enrollment), 5001 (infra-TAK console — restrict to your IP), 389/636 (LDAP outpost — restrict to localhost / TAK-Server-only).
 - If you provisioned the VM with a small instance type, watch memory: Authentik server is ~700 MiB after warm-up, postgres ~200 MiB, LDAP outpost ~15 MiB, plus the rest of the stack. Below 4 GB total RAM, you may OOM under bind storms. 8 GB is comfortable, 16+ GB is generous.
+- **v0.8.6 confirmed working on Azure:** Standard_D8as_v5, P10 64 GiB OS disk, ~145 MB/s sync write. Clean Authentik deploy in ~4 minutes. LDAP SA bind verified on attempt 2. All four v0.8.6 fixes active. This is now the validated reference config for Azure single-server deployments.
+- **Azure OS disk throughput is ~145 MB/s sync write regardless of disk tier** (Azure caps OS disk I/O). This is acceptable for infra-TAK. The dashboard now correctly shows the real sync speed (from Guard Dog CSV) instead of the cached vmstat value. Don't mistake the cached vmstat speed (which can show 998 MB/s) for real disk performance.
+- **`hostname -I` returns the private IP on Azure.** `start.sh` (v0.8.6+) detects this and also shows the public IP. The console backdoor is at `https://<public-IP>:5001`.
 
 ---
 
@@ -1475,7 +1549,8 @@ When reading secrets from `.env`, always use `cut -d= -f2-` (not `-f2`). Several
 
 ### MEDIUM
 
-- LDAP `bind_mode: cached` and `search_mode: cached` -- cache behavior during outpost recreation poorly understood. Cache masks flow execution bugs until it expires.
+- **No rollback capability** — Update Now pulls latest and restarts; no way to return to the previous working version without SSH and manual git commands. Planned for v0.8.7 as the headline feature (see `docs/PLAN-v0.8.7.md`).
+- LDAP `bind_mode: cached` and `search_mode: cached` — cache behavior during outpost recreation poorly understood. Cache masks flow execution bugs until it expires.
 - Hardcoded LDAP base DN `DC=takldap` and group prefix `tak_`
 - Inline HTML/JS/CSS in Python strings
 - systemd service still named `takwerx-console`
@@ -1491,6 +1566,13 @@ When reading secrets from `.env`, always use `cut -d= -f2-` (not `-f2`). Several
 - **Update Now rebase conflicts** — Fixed in v0.2.6-alpha. Updater now uses deterministic `fetch + force-checkout`. Pre-release test protocol in `docs/TESTING-UPDATES.md`.
 - **MediaMTX External Sources UI corruption** — Fixed in v0.2.5-alpha. `mediamtx_recovery()` syncs overlay from repo.
 - **Guard Dog Updates monitor stays red** — Fixed in v0.2.5-alpha. `guarddog_update()` writes + enables systemd timer.
+
+### RESOLVED (previously HIGH) — v0.8.6
+
+- **Authentik deploy fails on slow-disk VMs (Azure)** — `elif needs_pg_update:` scope bug caused `docker compose up -d` to be skipped on fresh deploys; API poll timed out after 900 s. Fixed: un-indented 121 lines so bring-up is unconditional.
+- **LDAP SA bind check always reported failure** — Two bugs: ldapsearch searched wrong base DN (always LDAP error 32), and `sleep(2)` Docker log check was a timing race on slow disk. Fixed: correct search base, `sleep(5)`, `--since 90s`, Docker log fallback.
+- **Dashboard disk I/O showed cached speed instead of real sync speed** — `vmstat` reported buffer-cache throughput. Fixed: Guard Dog CSV read first; vmstat fallback labeled "(vmstat, cached)"; vmstat-only line hidden (always 0.00 on idle boxes).
+- **`start.sh` showed private IP on Azure/AWS NAT** — Fixed: `curl api.ipify.org` with graceful fallback, both IPs shown when they differ.
 
 ---
 

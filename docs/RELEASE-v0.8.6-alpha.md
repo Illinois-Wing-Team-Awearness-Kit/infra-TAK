@@ -95,19 +95,43 @@ All four changes are transparent on SSD Nodes, DigitalOcean, and other non-NAT f
 | `app.py` | New `_read_guarddog_latest_write_mbs()`: reads sync write speed from Guard Dog's CSV |
 | `app.py` | `_get_disk_io_local()`: prioritizes Guard Dog CSV over vmstat; returns 3-tuple `(read, write, source_label)` |
 | `app.py` | `_get_disk_io_remote()`: same — reads Guard Dog CSV over SSH first, falls back to vmstat |
-| `app.py` | `renderResourceBreakdown` JS: displays source label ("Disk I/O (sync, Guard Dog)" vs "(vmstat, cached)") |
+| `app.py` | `renderResourceBreakdown` JS: "Disk write speed (Guard Dog)" label; disk color thresholds corrected (absolute MB/s, higher = better); vCPU on own line |
 | `app.py` | `_test_ldap_bind_dn_verdict()`: search base `dc=takldap` → `ou=users,dc=takldap` one-level for SA; `sleep(2)` → `sleep(5)`; log window `--since 45s` → `--since 90s` |
 | `app.py` | `_authentik_deploy_final_verify_ldap_sa()`: added direct Docker log fallback for "authenticated from session" |
 | `app.py` | New LDAP healthcheck wait and `_ensure_ldap_flow_authentication_none()` re-call before final bind check |
 | `app.py` | VERSION bumped to `0.8.6-alpha` |
 | `start.sh` | Show public IP when it differs from `hostname -I` (Azure/AWS NAT) |
 
+---
+
+### 5. Dashboard: disk speed color logic corrected
+
+**Problem:** The `diskIoColor` function treated higher MB/s as *worse* (designed like a CPU utilization meter where high % = saturated). This meant 121 MB/s from Guard Dog showed red while 110 MB/s from the manual test showed cyan — backwards and contradictory.
+
+**Fix:** Replaced ratio logic with absolute thresholds: ≥ 200 MB/s → green (fast SSD/NVMe), ≥ 80 MB/s → yellow (acceptable — Azure managed disk territory), < 80 MB/s → red (slow, will affect deploy times). Both the Guard Dog line and the manual speed test line now use the same color function so they can't contradict each other.
+
+**Label fix:** "Disk I/O (sync, Guard Dog)" → "Disk write speed (Guard Dog)" — removed the misleading "I/O" label since Guard Dog only measures write speed (`dd oflag=dsync`). No read data is available from this method.
+
+---
+
+### 6. Dashboard: vCPU count on its own line
+
+The vCPU count is now displayed on a separate indented line below the processor model name:
+
+```
+Processor: AMD EPYC 7763 64-Core Processor
+           8 vCPUs
+```
+
+Previously it was appended inline with a `·` separator, which made the already-long processor model name harder to read.
+
+---
+
 ## What v0.8.6 does NOT change
 
 - No Authentik image tag change (still 2026.2.2).
 - No Guard Dog changes.
 - No CoreConfig changes.
-- No UI changes — pure backend and installer reliability.
 - All v0.8.5 self-healing (proactive routing migration, gunicorn timeout, spiral monitor, verifier hardening) preserved unchanged.
 
 ## Rollback

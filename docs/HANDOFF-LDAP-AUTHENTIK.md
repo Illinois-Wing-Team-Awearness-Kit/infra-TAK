@@ -474,8 +474,9 @@ Background thread, started at module load alongside `_authentik_spiral_monitor`.
 - `~/authentik/docker-compose.yml` exists
 - `datetime.now().hour == hour_local` (default 4 — 04:00 box-local time)
 - Time since `last_run_utc` >= `min_interval_hours` (default 12)
+- **Mission-critical safety gate:** `_authentik_admin_api_recently_active(60)` returns False (no recent non-GET POST/PUT/PATCH/DELETE to `/api/v3/` in the last 60s)
 
-When all pass, fires `_recreate_authentik_server_worker(reason='scheduled-24h')`.
+When all pass, fires `_recreate_authentik_server_worker(reason='scheduled-24h')`. If the safety gate detects active admin work, the cycle is deferred and re-checked in 5 min — once activity has been quiet for 60s, the restart fires.
 
 #### 2. `_detect_authentik_asgi_websocket_loop()` reactive trigger
 
@@ -507,6 +508,7 @@ Runs `cd ~/authentik && docker compose up -d --force-recreate --no-deps server w
 ### Operator rules (v0.8.7 additions)
 
 - **If Authentik CPU is sustained > 100% on a previously-healthy box** with no thundering herd / no ASGI loop / no spiral signature, the cause is runtime state drift. The cure is `cd ~/authentik && docker compose up -d --force-recreate --no-deps server worker`. v0.8.7 does this automatically every 24h at 04:00 box-local.
+- **The scheduled 04:00 restart will defer if you are actively making users.** The mission-critical safety gate scans the last 60s of `authentik-server-1` logs for any non-GET API request (`POST|PUT|PATCH|DELETE /api/v3/`). If found, the cycle is skipped and re-checked in 5 min. The gate fail-opens (proceeds with the restart) on detection error, so a `docker logs` glitch can't permanently block the restart. The reactive ASGI loop trigger explicitly bypasses this gate — if the server is in an ASGI loop, every request is already 502'ing, so deferring would only prolong the pain.
 - **NEVER hard-code `AUTHENTIK_WEB_WORKERS` for capacity reasons.** The Apr 30 2026 investigation proved it is not the differentiator between healthy and pinned boxes. Authentik 2026.x doesn't use Gunicorn the way prior versions did. The v0.8.2 migration that sets it to 4 stays in the codebase only because it's harmless; do not invest energy in worker-count tuning.
 - **The 12h `min_interval_hours` floor is shared between scheduled and reactive triggers.** Both the daily 04:00 restart and the ASGI loop self-heal share the same recreate function and the same rate limit. A box that just ran the scheduled restart will not double-fire even if an ASGI loop hits the 60s detector immediately afterward.
 - **Every recreate writes `last_run_utc` to `settings.authentik_periodic_restart`.** This is the operator's audit trail. If a restart was unexpected, check `last_reason` — `scheduled-24h` is normal, `asgi-loop-N-errors-60s` indicates the reactive trigger fired (worth investigating the original cause; see `docker logs authentik-server-1 --since 1h`).

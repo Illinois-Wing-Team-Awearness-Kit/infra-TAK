@@ -48,6 +48,8 @@ Note `--no-deps` — recreate ONLY `server` and `worker`. `ldap`, `postgresql`, 
 }
 ```
 
+**Mission-critical safety gate:** `_authentik_admin_api_recently_active(60)` — before firing, the periodic monitor scans the last 60s of `authentik-server-1` logs for any non-GET admin API request (`POST|PUT|PATCH|DELETE /api/v3/`). If found, the cycle is deferred and re-checked in 5 minutes. Means: if an operator is actively making users / editing providers when 04:00 hits, the restart waits until activity has been quiet for 60s. Worst case the 04:00 restart slips by 5-30 min on a genuinely busy night — acceptable. **The reactive ASGI loop trigger explicitly bypasses this gate** — if the server is in an ASGI loop, the box is already 502'ing every request, so deferring would only prolong the pain.
+
 ### 2. ASGI WebSocket reconnect loop reactive trigger
 
 **New function: `_detect_authentik_asgi_websocket_loop()`**.

@@ -91,7 +91,12 @@ Single source of truth for the recreate operation. Runs `cd ~/authentik && docke
   - `~/authentik/docker-compose.yml` exists
   - `datetime.now().hour == hour_local` (default 4 — 04:00 box-local time)
   - Time since `last_run_utc` >= `min_interval_hours` (default 12)
+  - **Mission-critical safety gate:** `_authentik_admin_api_recently_active(60)` returns False (no `POST/PUT/PATCH/DELETE /api/v3/` in last 60s of server logs). If active, deferred and re-checked in 5 min.
 - Idempotent: safe to call at module load on every gunicorn worker startup.
+
+### 2c-bis. `_authentik_admin_api_recently_active(seconds=60)`
+
+The safety gate. Cheap log scan: `docker logs authentik-server-1 --since 60s | grep -E "\"(POST|PUT|PATCH|DELETE) /api/v3/"`. Returns True on any match. Fail-opens (returns False) on error so a glitched `docker logs` can never permanently block the periodic restart. **Used only by the scheduled trigger** — the ASGI loop reactive trigger bypasses this gate intentionally because if the server is in an ASGI loop the box is already 502'ing every request.
 
 ### 2d. ASGI loop reactive trigger (in existing `_authentik_spiral_monitor`)
 

@@ -136,7 +136,7 @@ Confirmed root cause of v0.8.6's Azure issue was the `elif` scope bug, not poll 
 
 ## 5. Out of scope for v0.8.7 (moved to v0.8.8 or later)
 
-- **Rollback feature** (one-click revert from console). → **v0.8.8 headline.** See `docs/PLAN-v0.8.8.md`.
+- **Rollback feature** (one-click revert from console). Originally planned for v0.8.8; **parked to v0.9.0 or later** — the v0.8.x line is reserved for Authentik stabilization work until the fleet is provably stable across slow disks. See `docs/PLAN-v0.8.8.md`.
 - **Dashboard CPU per-core breakdown.** → v0.8.9 or later.
 - **NSG ARM template advisory in start.sh.** → v0.8.9 or later.
 

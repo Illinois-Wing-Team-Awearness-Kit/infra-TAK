@@ -5,7 +5,7 @@
 ## Prompt for a new chat (copy and paste this)
 
 ```
-Read docs/HANDOFF-LDAP-AUTHENTIK.md — current release is v0.8.7-alpha.
+Read docs/HANDOFF-LDAP-AUTHENTIK.md — current release is v0.8.8-alpha.
 
 CRITICAL INCIDENTS:
 - v0.8.0: introduced AUTHENTIK_HOST internal-URL fix (correct for fresh installs) but the post-update migration unconditionally restarted the LDAP outpost, causing thundering herd (bind cache wipe → all clients re-auth simultaneously → worker/Postgres exhaustion) on active installs.
@@ -16,14 +16,15 @@ CRITICAL INCIDENTS:
 - v0.8.5: HARDENING of v0.8.4. (a) PROACTIVE routing migration `_ensure_authentik_ldap_outpost_on_fqdn` — migrates boxes from internal direct routing to FQDN on Authentik deploy / TAK Server deploy / Update Now / every 10 min, gated on `/opt/tak` installed AND FQDN configured AND Caddy reachable. Catches the responder-class latent misroute that the reactive detector cannot see (cached SA session masks the spiral until first fresh bind). (b) Gunicorn worker timeout bump 30s→120s — `_ensure_authentik_gunicorn_timeout` appends `GUNICORN_CMD_ARGS=--timeout=120` to `~/authentik/.env` once and recreates only the server container. Closes the SIGABRT cascade observed on tak-10 (heavy LDAP load → Authentik 2026.2.2 flow planner exceeds 30s → gunicorn kills worker → in-flight TCP drops → Caddy 502 → outpost retry → stage recursion). Idempotent — never overwrites operator override; safe everywhere because timeout never fires on fast boxes. (c) Verifier hardening — `_test_ldap_bind_dn_verdict` returns tri-state `'ok' | 'fail' | 'inconclusive'`; `_ensure_authentik_webadmin` no longer does destructive DELETE+POST recreate on inconclusive verdicts and re-queries before POST on confirmed-fail (kills the responder `400 username must be unique` regression). (d) Dual-signal spiral detection with two-tier markers — outpost trips on ≥1 spiral-specific marker (`result code 50`, `nil pointer`, `exceeded stage recursion`, 502/503) OR Postgres idle-in-trans ≥30. General markers (`failed to execute flow`, `EOF`) tracked for forensics only — they appear on healthy boxes from typos and normal disconnects, false-positive trapped during tak-10 dev testing. (e) Periodic 10-min monitor thread (PID-locked, 6h rate limit) so spirals manifesting after Update Now self-heal. (f) Granular gate logging at every early-return. (g) Forensics persisted to settings.authentik_spiral_last_repair, settings.authentik_proactive_routing_migration, and settings.authentik_gunicorn_timeout_migration.
 - v0.8.6: AZURE / NAT DEPLOY RELIABILITY. Four field bugs found and fixed during first Azure deployment test (tak-test-3, D8as_v5, P10 64 GiB OS disk, ~145 MB/s sync write). (a) Authentik containers never started on slow-disk VMs — Step 7 (docker compose up -d) was nested inside `elif needs_pg_update:` which is always False on fresh deploys; un-indented 121 lines so bring-up is unconditional. (b) start.sh showed private IP on Azure/AWS NAT — added curl api.ipify.org (3s timeout) with graceful fallback; shows both public and private when they differ. (c) Dashboard disk I/O showed cached vmstat speed (998 MB/s) instead of real sync speed (145 MB/s) — Guard Dog diskio_history.csv read first when available; vmstat fallback now labeled "(vmstat, cached)" so source is visible; manual test switched to oflag=dsync. (d) LDAP SA bind check always reported failure even when LDAP was working — two bugs: ldapsearch searched dc=takldap base scope (Authentik returns LDAP error 32 there regardless of bind outcome, so exit code always non-zero); fixed by searching ou=users,dc=takldap one-level for cn=adm_ldapservice. Race: sleep(2) was too short on Azure (log entry written at same second as docker logs check); fixed: sleep(5), --since 90s, direct Docker log fallback ("authenticated from session") that bypasses ldapsearch entirely. Confirmed on tak-test-3: attempt 2 passed via Docker log fallback, full clean deploy in ~4 minutes.
 - v0.8.7: AUTHENTIK STABILITY — env var name fix + official tunings + runtime-config verifier. Apr 30 2026 SMOKING GUN on tak-10: `docker top authentik-server-1` showed only **2 gunicorn workers** despite `.env` containing `AUTHENTIK_WEB_WORKERS=4` since v0.8.2. Root cause: Authentik 2026.x requires DOUBLE underscore (`AUTHENTIK_WEB__WORKERS`) per official docs (https://docs.goauthentik.io/install-config/configuration/) — single underscore was silently ignored on every box in the fleet for 5 releases. `ak dump_config` also confirmed cache and log_level were all running at defaults (300s/300s/info) despite our intent. Three pieces shipped: (a) `_authentik_apply_official_tunings(plog)` — renames `AUTHENTIK_WEB_WORKERS` → `AUTHENTIK_WEB__WORKERS=4` (correct name, finally applies); adds `AUTHENTIK_CACHE__TIMEOUT_FLOWS=600`, `AUTHENTIK_CACHE__TIMEOUT_POLICIES=600`, `AUTHENTIK_LOG_LEVEL=warning` (only if missing — never overwrites operator-set values). (b) `_authentik_verify_runtime_config(plog)` — closes the audit loop: runs `ak dump_config`, parses JSON, counts gunicorn workers via `docker top`; persists pass/fail to settings.authentik_runtime_config_check so we can never have this silent-default scenario again. (c) `_recreate_authentik_server_worker(plog, reason)` — runs `docker compose up -d --force-recreate --no-deps server worker` (NEVER touches ldap), called only when env vars actually change. v0.8.2 migration block in `_post_update_auto_deploy` superseded — now delegates to `_authentik_apply_official_tunings`. Migration runs on every console startup via `_startup_migrations` (idempotent — only first run triggers recreate). Validated tak-10 with real 351-bind workload: server CPU p50 99% → **2.1%** (~47x reduction), Postgres p50 94% → **0.0%**, all 4 workers running per `docker top`, `ak dump_config` confirms cache/log_level applied. NO UI changes (operator explicit). **DELETED before ship**: daily 04:00 periodic restart, ASGI WebSocket loop reactive trigger, admin-API safety gate — all built on the wrong "state drift" theory; with the real fix in, none are needed. Lesson encoded as alwaysApply Cursor rule `.cursor/rules/consult-upstream-docs.mdc`.
+- v0.8.8: LDAP FLOW STAGE-BINDING RECURSION FIX — latent fleet-wide bug found because slow-disk boxes can't hide it. Apr 30 2026 SMOKING GUN on a slow-disk SSDNodes box (1795 random-write 4k IOPS, 31.7 MB/s sequential write): Postgres CPU pinned at 900-1500% sustained, 5 PG backends running 86-second `SELECT FROM authentik_policies_policybindingmodel` queries on a box doing 0.36 LDAP binds per second (essentially idle workload). Root cause: every stage binding on `ldap-authentication-flow` had **both** `evaluate_on_plan=true` AND `re_evaluate_policies=true`. That combo causes a cascading policy re-evaluation on every step of every authentication plan. Authentik 2025.10+ uses Postgres for cache/channels/tasks (no Redis), and `policybindingmodel` has only the PK as an index, so each cascading lookup is a sequential scan. Fast-disk boxes hide it (cascading queries complete in microseconds); slow-disk boxes explode under it. The fix: blueprint YAML + healing function changed to ship `evaluate_on_plan=false` (matching how `default-authentication-flow` is configured — that flow has zero recursion and works fine on every box). Three pieces shipped: (a) two blueprint YAML copies in app.py — six occurrences of `evaluate_on_plan: true` flipped to `false` on the three `ldap-authentication-flow` stage bindings. `re_evaluate_policies: true` preserved (matches default flow, not part of the recursion combo). (b) `_ensure_ldap_flow_authentication_none()` line ~24548 — same fix on the healing path so post-update healing doesn't re-introduce the bug. (c) NEW idempotent self-healing migration `_authentik_fix_ldap_flow_recursion(plog)` — counts bad bindings via SQL on every console startup AND post-update; if `count > 0`, runs idempotent UPDATE and restarts `authentik-server-1` ONLY (server alone, never `--no-deps server worker`, never ldap outpost) so the in-memory flow plan cache rebuilds. Persists outcome to `settings.authentik_ldap_flow_recursion_fix` (`fixed` / `idempotent-noop`). Validated on the SSDNodes box: Postgres CPU dropped 900%+ → **~7.8% in 60 seconds** (~115x reduction), zero long-running queries persisted, LDAP outpost StartedAt unchanged. NO UI changes (same scope discipline as v0.8.7).
 
-NEVER restart the LDAP outpost in a migration unless it is provably broken. ALWAYS use the correct double-underscore env var name `AUTHENTIK_WEB__WORKERS` (single underscore is silently ignored per Authentik 2026.x docs). NEVER set idle_in_transaction_session_timeout below 30s — Authentik startup will crash-loop. Caddy is a request shaper for the LDAP outpost — direct routing to authentik-server-1:9000 exposes the upstream Authentik 2026.2.2 LDAP-flow regression. ALWAYS verify env var changes via `docker exec authentik-worker-1 ak dump_config` and `docker top authentik-server-1` — never trust .env alone (the v0.8.2 → v0.8.7 silent-ignore bug taught us why). READ UPSTREAM DOCS FIRST before chasing CPU/perf symptoms — see `.cursor/rules/consult-upstream-docs.mdc`.
+NEVER restart the LDAP outpost in a migration unless it is provably broken. ALWAYS use the correct double-underscore env var name `AUTHENTIK_WEB__WORKERS` (single underscore is silently ignored per Authentik 2026.x docs). NEVER set idle_in_transaction_session_timeout below 30s — Authentik startup will crash-loop. Caddy is a request shaper for the LDAP outpost — direct routing to authentik-server-1:9000 exposes the upstream Authentik 2026.2.2 LDAP-flow regression. ALWAYS verify env var changes via `docker exec authentik-worker-1 ak dump_config` and `docker top authentik-server-1` — never trust .env alone (the v0.8.2 → v0.8.7 silent-ignore bug taught us why). NEVER ship `evaluate_on_plan=true` AND `re_evaluate_policies=true` on the same stage binding — that's the v0.8.8 recursion combo; use `evaluate_on_plan=false, re_evaluate_policies=true` (matches default-authentication-flow). READ UPSTREAM DOCS FIRST before chasing CPU/perf symptoms — see `.cursor/rules/consult-upstream-docs.mdc`.
 
 VALIDATED in field on 2026-04-29 across tak-10 (heavy DataSync/Node-RED), ssdnodes (medium streaming), and responder (medium-light): all three on v0.8.5-alpha, all three on FQDN routing, all three with GUNICORN_CMD_ARGS=--timeout=120, all three at SIGABRT=0 / outpost recursion=0 / Postgres idle-in-trans=0 over 30+ min of real bind load (1.5–2.4 binds/sec sustained per box). Azure tak-test-3 validated on 2026-04-29: clean Authentik deploy in ~4 min, LDAP SA bind verified via Docker log fallback on attempt 2, all four v0.8.6 fixes confirmed working. Apr 30 2026 tak-10 v0.8.7 validation: 4 gunicorn workers running (was 2), `ak dump_config` shows cache=600s + log_level=warning (were defaults), 3-min CPU soak with 351 real binds → server p50 2.1%, postgres p50 0.0% (was 99%/94% under same load on v0.8.6).
 
 Bursty CPU on heavy-DataSync boxes is NORMAL, not a regression: tak-10 swings server CPU 100%+ → 7% → 1% over 60s windows because DataSync clients re-authenticate per HTTP request and Node-RED engine flows fire clock-aligned bind clusters. The `--timeout=120` gunicorn fix absorbs these bursts; SIGABRT count = 0 is the proof. Don't chase low CPU as a goal on Mission API / DataSync / Node-RED boxes. If a previously-healthy box shows SUSTAINED high CPU (p50 > 50% for hours), check `docker top authentik-server-1 | grep -c 'gunicorn: worker'` and `ak dump_config` first — the v0.8.7 verifier should catch silent-ignore regressions, but always re-confirm.
 
-See "April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal", "April 2026 — v0.8.5 hardening", "April 2026 — v0.8.5 fleet validation", "April 2026 — v0.8.6 Azure/NAT deploy reliability", "April 2026 — v0.8.7 SILENT-IGNORE env var name bug", and "April 2026 — v0.8.7 band-aids that were built then DELETED before ship" sections for full incident details and rules.
+See "April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal", "April 2026 — v0.8.5 hardening", "April 2026 — v0.8.5 fleet validation", "April 2026 — v0.8.6 Azure/NAT deploy reliability", "April 2026 — v0.8.7 SILENT-IGNORE env var name bug", "April 2026 — v0.8.7 band-aids that were built then DELETED before ship", and "April 2026 — v0.8.8 LDAP FLOW STAGE-BINDING RECURSION FIX" sections for full incident details and rules.
 Use docs/HANDOFF-LDAP-AUTHENTIK.md as the single source of truth for what's done and what to do next.
 ```
 
@@ -527,6 +528,92 @@ All three were **removed** once the silent-ignore env var bug was identified as 
 The runtime verifier (`_authentik_verify_runtime_config`) initially used `docker top authentik-server-1 -o pid,cmd` to count gunicorn workers. The `-o pid,cmd` flag reformats the CMD column on some Linux distros and the grep for `'gunicorn: worker'` returned 0 even though 4 workers were live. Verified on tak-10 — `docker top authentik-server-1 | grep -c 'gunicorn: worker'` returns 4 (correct), the `-o pid,cmd` form returned 0 (false-negative). Fixed by dropping the `-o pid,cmd` flag and parsing the default output in Python.
 
 This is exactly the kind of ad-hoc shell pipeline issue the Cursor rule warns against. The verifier itself is the right idea (closes the audit loop on env var changes), but the pipeline was fragile.
+
+A second verifier hardening followed during the responder spot-check: on slower disks the verifier ran while the freshly-recreated server container was up but gunicorn hadn't yet forked its workers. `docker top` returned 0, so the verifier wrote `last_outcome=fail` even though the runtime stabilized seconds later. Fixed by adding a 6-attempt × 5s retry loop (max 30s) before declaring genuine failure. Validated on Alex's slow-disk Dell R3930 (the first box where the race was tight enough to fail without retry) and on a slow-disk SSDNodes box (whose v0.8.7 verifier had persisted a stale `fail` from before the retry landed; manual `_authentik_verify_runtime_config()` re-run with the current code wrote `pass`).
+
+---
+
+## April 2026 — v0.8.8 LDAP FLOW STAGE-BINDING RECURSION FIX
+
+**Incident summary:** Apr 30 2026, after v0.8.7-alpha shipped, a buddy's Dell-class box on SSDNodes pulled main and reported "Authentik still screaming." `runtime_config_check.last_outcome=pass` (4 workers, cache=600s, log_level=warning — all v0.8.7 fixes in). LDAP bind volume **0.36/sec** (essentially idle workload). Yet `docker stats` showed Postgres CPU **1297% / 1085% / 782% / 619% / 165% / 766%** — averaging ~900% sustained, with multiple 1000%+ spikes. Server CPU 200-350%. 119 idle-in-transaction Postgres connections (oldest 2s — churning, not stuck).
+
+**Disk and steal-time forensics:** `fio` random-write 4k IOPS = **1795** (between spinning rust and slow SATA SSD; NVMe is 50k-200k+). p99 write latency **105ms**, p99.5 168ms, p99.9 270ms. CPU steal time **0.00%** — host wasn't oversold on CPU; it was oversold on storage. So the box's underlying storage was bursty-throttled, but that alone doesn't explain CPU at 1000%+ — slow disk causes I/O wait, not pure CPU burn.
+
+**Smoking gun:** `pg_stat_activity` showed **5 backends running the same query for 86 seconds each**:
+
+```
+SELECT "authentik_policies_policybindingmodel"."pbm_uuid", ...
+```
+
+Five backends, same query, 86 seconds, on a box with 0.36 binds/sec. That is a recursive loop, not slow-disk noise.
+
+**Root cause:** All three stage bindings on `ldap-authentication-flow` had **both** `evaluate_on_plan=true` AND `re_evaluate_policies=true`:
+
+```
+ldap-authentication-flow | order=10 | evaluate_on_plan=t | re_evaluate_policies=t
+ldap-authentication-flow | order=15 | evaluate_on_plan=t | re_evaluate_policies=t
+ldap-authentication-flow | order=20 | evaluate_on_plan=t | re_evaluate_policies=t
+```
+
+That combo causes a cascading policy re-evaluation on every step of every authentication plan. Authentik 2025.10+ removed Redis and uses Postgres for cache + channels + tasks (no more separate cache backend). Combined with `policybindingmodel` having only the PK as an index, every cascading lookup is a sequential scan. On fast disks the entire cascade per bind completes in microseconds — invisible. On slow disks it explodes.
+
+`grep` of `app.py` revealed we ourselves had been shipping `evaluate_on_plan: true` and `re_evaluate_policies: true` in the LDAP blueprint since the LDAP feature shipped:
+
+- Two YAML copies (the initial deploy blueprint and the post-update healing reimport) — three bindings each
+- The healing function `_ensure_ldap_flow_authentication_none()` line ~24548
+
+Compare to `default-authentication-flow` which has `evaluate_on_plan=false, re_evaluate_policies=true` — that flow has zero recursion and works fine on every box. The fix is to match.
+
+**The proof:**
+
+```sql
+UPDATE authentik_flows_flowstagebinding SET evaluate_on_plan = false
+WHERE target_id IN (SELECT flow_uuid FROM authentik_flows_flow
+                    WHERE slug = 'ldap-authentication-flow');
+-- UPDATE 3
+```
+
+Then `docker restart authentik-server-1` (server only — cardinal rule, ldap outpost untouched). 60 seconds later:
+
+| Metric | Before | After |
+|---|---|---|
+| Postgres CPU samples | 1297, 1085, 782, 619, 165, 766 | 23, 0.7, 0.6, 0.8, 0.03, 32, 0.3, 4.4 |
+| Postgres CPU avg | ~900% | **~7.8%** (~115x reduction) |
+| Long-running policy queries (>5s) | 5 × 86s | **0** |
+| Server CPU | 200-350% sustained | 100-250% (normal) |
+| LDAP outpost StartedAt | (preserved) | (preserved — server-only restart honored cardinal rule) |
+
+### v0.8.8 fix (this release)
+
+Three pieces shipped:
+
+1. **Blueprint YAML — six occurrences of `evaluate_on_plan: true` flipped to `false`** on the three `ldap-authentication-flow` stage bindings, in both YAML copies (initial deploy + healing reimport). `re_evaluate_policies: true` preserved (matches default flow, not part of the recursion combo).
+
+2. **`_ensure_ldap_flow_authentication_none()` line ~24548** — same `evaluate_on_plan: True → False` fix on the healing path so post-update healing doesn't re-introduce the bug on already-fixed boxes.
+
+3. **NEW idempotent self-healing migration `_authentik_fix_ldap_flow_recursion(plog)`** in `app.py`. Hooked into `_startup_migrations` (every console start) and `_post_update_auto_deploy` (after every update). Behavior:
+   - Probes for `authentik-postgresql-1`. If not running, skip.
+   - Counts bindings on `ldap-authentication-flow` with `evaluate_on_plan=true` via SQL.
+   - If `count == 0`: persists `last_outcome='idempotent-noop'` and returns. (Cost on a healthy box: one COUNT query + one settings.json write.)
+   - If `count > 0`: idempotent UPDATE setting them to false; restarts `authentik-server-1` ONLY (server alone — `docker restart`, NOT `--no-deps server worker`, NOT touching LDAP outpost) so the in-memory flow plan cache rebuilds; persists `last_outcome='fixed'` + `last_bad_count=N`.
+
+Persists outcome to `settings.authentik_ldap_flow_recursion_fix` for operator audit.
+
+### Why `docker restart authentik-server-1` and not `_recreate_authentik_server_worker`
+
+The v0.8.7 `_recreate_authentik_server_worker` runs `docker compose up -d --force-recreate --no-deps server worker`. That recreates BOTH server and worker containers, takes 30-60s on slow disks, and is needed when env vars change (gunicorn re-reads `.env` only at process startup). For v0.8.8's flow recursion fix, we only need to clear the in-memory flow plan cache that the **server** holds. The worker doesn't cache flow plans. A simple `docker restart authentik-server-1` is faster (~5-10s on slow disks), gentler on Postgres connection state, and equally effective. The cardinal rule (LDAP outpost untouched) holds either way.
+
+### Validation across the fleet
+
+- **The slow-disk SSDNodes box (where bug surfaced):** Manually fixed via SQL during live debugging. Postgres CPU dropped 115x. After v0.8.8 lands the migration will be `idempotent-noop` (DB state already correct), validating the no-op path.
+- **tak-10 / responder / ssdnodes-validated / Alex's R3930:** Currently all on v0.8.7-alpha and **all** still have the latent recursion bug (fast-disk masking). After they pull v0.8.8, migration fires once: count=3, UPDATE, server restart (~5-10s), audit `last_outcome='fixed'`, `last_bad_count=3`. Their CPU samples should show measurable drops — less dramatic than ssdnodes (their disks were hiding more), but real.
+
+### Rules established by this incident
+
+- **NEVER ship `evaluate_on_plan=true` AND `re_evaluate_policies=true` on the same stage binding.** That's the recursion combo. Match the default-authentication-flow pattern: `evaluate_on_plan=false, re_evaluate_policies=true`. If you have a custom flow that genuinely needs eager evaluation (rare), set `evaluate_on_plan=true, re_evaluate_policies=false` so there's no recursion.
+- **Slow-disk boxes are the canary, not the outlier.** Fast-disk boxes hide policy bugs and cascading queries because each lookup completes in microseconds. Latent recursion bugs ALWAYS exist on every box with the bug; only the symptom presence depends on disk speed.
+- **`pg_stat_activity` with `now() - query_start > 60s` is the fastest forensic** for any "Authentik feels slow" report. If you see ≥2 backends on the same query for tens of seconds, you have a recursion or missing index, not a slow-disk problem. CPU steal time + `fio` IOPS are the next two checks.
+- **`fio` for random-write 4k IOPS** beats `dd` sequential for diagnosing Postgres-relevant disk speed. Postgres needs sub-millisecond fsync latency; `fio` p99 latency >10ms is a "your storage is too slow for production Postgres" signal.
 
 ---
 

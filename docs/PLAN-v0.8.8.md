@@ -1,145 +1,196 @@
 # v0.8.8-alpha — Work Plan
 
-**Headline (and primary) feature: Rollback**
+**Headline (and ONLY) feature: fix the LDAP flow stage-binding recursion bug.**
 
-The ability to revert to the previous working version of infra-TAK from the console, without SSH. Operator safety net. Originally planned for v0.8.7 but **deferred one release** so v0.8.7 could focus exclusively on Authentik stability (the more pressing field pain). Now that v0.8.7 has Authentik humming, rollback is the next-most-valuable operator feature.
-
-> **Prerequisite:** v0.8.7 (Authentik periodic auto-restart) shipped and validated on tak-10 + ssdnodes for at least one full week with zero LDAP incidents and confirmed before/after CPU evidence captured.
+> **Scope discipline note:** v0.8.8 was originally going to be the rollback feature. That work is pushed again. Operator stability comes first, and we just discovered another fleet-wide bug that's been latent since the LDAP feature shipped — caught only because it surfaced spectacularly on a slow-disk ssdnodes box (Postgres CPU pinned at 900-1500% sustained, with multiple PG backends running 86-second policy queries). Fix lands first, then we can finally tackle rollback in v0.8.9.
+>
+> **No UI changes in v0.8.8.** Same discipline as v0.8.7. All audit state lives in `~/.takwerx/settings.json` and is operator-readable; defaults are correct for every box.
 
 ---
 
-## 1. Rollback (the primary feature)
+## 1. The Apr 30 2026 ssdnodes investigation (root cause)
 
-### Problem
+A buddy's slow-disk SSDNodes VPS (Dell-class, 1795 random-write 4k IOPS — between spinning rust and slow SATA SSD; 31.7 MB/s sequential write via `dd`) had pulled v0.8.7-alpha cleanly: 4 gunicorn workers running, cache + log tunings applied, runtime config verifier passing. Yet:
 
-Today's Update Now is one-directional. It runs `git fetch && git checkout --force origin/main` and restarts the console. If the new version has a regression (bad Authentik deploy, broken UI, startup crash), the operator has no recovery path from the console — they must SSH in, find the previous commit hash, and manually `git checkout <hash>` + restart. Non-technical operators on production boxes cannot do this, and experienced operators shouldn't have to.
+- `authentik-postgresql-1` CPU: **1297% / 1085% / 782% / 619% / 165% / 766%** (avg ~900% sustained, multiple 1000%+ spikes) on a box with **0.36 LDAP binds/sec** (essentially idle workload)
+- `authentik-server-1` CPU: 200-350% sustained
+- 119 idle-in-transaction Postgres connections (oldest 2s — churning, not stuck)
+- `pg_stat_activity` showed **5 backends running the same query for 86 seconds each**:
 
-This was uncomfortable through v0.8.5/v0.8.6/v0.8.7. With v0.8.7's auto-restart in place, future regressions are statistically less likely to be Authentik-related — but they can still come from any other code path (UI, deploy scripts, dashboard, Node-RED build, etc.). Rollback is the universal safety net.
+  ```
+  SELECT "authentik_policies_policybindingmodel"."pbm_uuid", ...
+  ```
 
-### Design goals
+- `django_postgres_cache_cacheentry`: 92% dead tuples even immediately after autovacuum (cache-table churn faster than autovacuum can clean)
 
-1. **One-click rollback from the console** — clearly labeled "Rollback to v0.8.x-alpha" button that undoes the last update.
-2. **Before any update, snapshot the current state** — at minimum the current git commit hash, so rollback always knows where to go back to.
-3. **Safe and idempotent** — rollback runs the same start-up path as a normal install (no special teardown). Services end up in the same state as a clean install of the previous version.
-4. **Minimal footprint** — store the rollback snapshot in `settings.json` (already used for migration forensics). No new daemon, no new files.
+### The bug
 
-### Implementation
+Every stage binding on `ldap-authentication-flow` had **both** `evaluate_on_plan=true` AND `re_evaluate_policies=true`:
 
-#### Pre-update snapshot (in `_run_update_now()`)
+```
+ldap-authentication-flow | order=10 | evaluate_on_plan=t | re_evaluate_policies=t
+ldap-authentication-flow | order=15 | evaluate_on_plan=t | re_evaluate_policies=t
+ldap-authentication-flow | order=20 | evaluate_on_plan=t | re_evaluate_policies=t
+```
 
-Before `git fetch + force-checkout`, record the current state in `settings.json`:
+That combo causes a **cascading policy re-evaluation** on every step of every authentication plan: each step re-runs all policy lookups, which re-triggers plan generation, which re-evaluates policies, ad infinitum until the disk catches up. With Authentik 2025.10+ using Postgres for cache + channels + tasks (no Redis), and our `policybindingmodel` table having only the PK as an index, every cascading policy lookup was a full sequential scan.
+
+Compare to `default-authentication-flow` which has `evaluate_on_plan=false, re_evaluate_policies=true` — that flow has zero recursion and works fine on every box.
+
+### The proof
+
+```bash
+$ psql -c "UPDATE authentik_flows_flowstagebinding
+           SET evaluate_on_plan = false
+           WHERE target_id IN (SELECT flow_uuid FROM authentik_flows_flow
+                               WHERE slug = 'ldap-authentication-flow');"
+UPDATE 3
+
+$ docker restart authentik-server-1   # clears in-memory flow cache
+
+# 60 seconds later:
+docker stats:
+authentik-postgresql-1   23% / 0.7% / 0.6% / 0.8% / 0.03% / 32% / 0.3%   (avg ~7.8%)
+authentik-server-1       133% / 256% / 145% / 97% / 191%                  (normal)
+
+pg_stat_activity:
+0 long-running queries
+```
+
+**~115x reduction in Postgres CPU.** Same workload. LDAP outpost untouched.
+
+### Why it didn't surface earlier
+
+This bug has been latent on **every box that ever ran our LDAP blueprint** — that's every infra-TAK install since the LDAP feature shipped. Fast-disk boxes hide it because each cascading policy query completes in microseconds. Slow-disk boxes (Alex's Dell R3930 with spinning rust, ssdnodes with VPS storage throttling) explode under it. tak-10/responder/ssdnodes-validated/Alex's box all have this bug right now — it'll get auto-fixed on their next update.
+
+### Source of the bug
+
+Three places in `app.py` were creating these bindings with `evaluate_on_plan=True`:
+
+1. **First blueprint YAML copy** (~line 20384, 20396, 20408)
+2. **Second blueprint YAML copy** (~line 22278, 22290, 22302)
+3. **`_ensure_ldap_flow_authentication_none()` healing function** (~line 24548)
+
+All three now ship `False`. The default-authentication-flow code path (line 24604-24605, which copies attributes from the existing default flow) was already correct — the default flow has the right values.
+
+---
+
+## 2. What v0.8.8 ships
+
+### Changes to `app.py`
+
+#### a) Blueprint YAML — flip 6 occurrences of `evaluate_on_plan: true` → `false`
+
+Three bindings × two blueprint copies = six edits. `re_evaluate_policies: true` is preserved (matches default flow, not part of the recursion combo).
+
+#### b) `_ensure_ldap_flow_authentication_none()` — line 24548
+
+```python
+'evaluate_on_plan': True, 're_evaluate_policies': True,
+```
+becomes:
+```python
+'evaluate_on_plan': False, 're_evaluate_policies': True,
+```
+
+This function is called by both initial deploy and the post-update healing path. Without this fix, the healing path would re-introduce the bug after we fixed it.
+
+#### c) New idempotent self-healing migration: `_authentik_fix_ldap_flow_recursion(plog)`
+
+Lives next to `_authentik_apply_official_tunings` and `_authentik_verify_runtime_config`. Runs in both `_startup_migrations` (every console start) and `_post_update_auto_deploy` (after every update).
+
+Behavior:
+
+1. Probe: `docker ps -q --filter name=authentik-postgresql-1`. If not running, skip with `ldap flow recursion: authentik-postgresql-1 not running — skipping`.
+2. Count: `SELECT COUNT(*) FROM authentik_flows_flowstagebinding fsb JOIN authentik_flows_flow f ON f.flow_uuid = fsb.target_id WHERE f.slug='ldap-authentication-flow' AND fsb.evaluate_on_plan = true;`
+3. If `count == 0`: persist `last_outcome='idempotent-noop'`, return False (every startup after the first on already-fixed boxes).
+4. If `count > 0`: idempotent UPDATE setting them to false; persist `last_outcome='fixed'` + `last_bad_count=N`; **restart `authentik-server-1` only** (cardinal rule: ldap outpost untouched, no thundering herd) so the in-memory flow plan cache is rebuilt.
+5. All outcomes recorded to `settings.authentik_ldap_flow_recursion_fix` for operator audit.
+
+**Idempotent.** On a v0.8.8-clean box, every startup is a single COUNT query (~10ms) plus a settings write. The actual UPDATE + restart only fires on first startup after the upgrade lands.
+
+### Documentation
+
+- **`docs/PLAN-v0.8.8.md`** — this file.
+- **`docs/RELEASE-v0.8.8-alpha.md`** — operator-facing release notes with field evidence.
+- **`docs/HANDOFF-LDAP-AUTHENTIK.md`** — adds a "v0.8.8 — flow recursion fix" section.
+- **`README.md`** — bumps "Latest release" headline + adds changelog entry.
+
+---
+
+## 3. What v0.8.8 explicitly does NOT ship
+
+- ❌ **UI changes.** Same as v0.8.7.
+- ❌ **The rollback feature.** Pushed to v0.8.9.
+- ❌ **A check inside `_authentik_verify_runtime_config`.** Considered adding the recursion check there for one-stop status, but kept separation of concerns: the runtime verifier is for *runtime config* (what `ak dump_config` and `docker top` see). The flow recursion fix is *DB state* (what `psql` sees). They live in parallel keys (`authentik_runtime_config_check` vs `authentik_ldap_flow_recursion_fix`) and operators can audit each independently.
+- ❌ **Index on `policybindingmodel.target_id`.** Tempting on slow-disk boxes (would help worst-case sequential scans), but Authentik manages its own schema. We don't fork it. Removing the recursion is the correct fix; the index would be treating a symptom.
+- ❌ **Aggressive autovacuum on cache table.** Same reason — once recursion stops, cache churn drops to normal levels and default autovacuum is fine.
+
+---
+
+## 4. Cardinal rules upheld
+
+- **Server-only restart.** `docker restart authentik-server-1`. Never `--no-deps server worker` (we don't need the worker recreate; only server holds the in-memory flow plan cache). LDAP outpost (`authentik-ldap-1`) stays up the whole time. `authentik-postgresql-1` and `authentik-worker-1` stay up.
+- **Idempotent.** Running the migration twice is safe and cheap.
+- **Self-gating.** No-op on already-fixed boxes — the count query short-circuits the UPDATE and restart.
+- **Audit trail in `settings.json`.** Operators read `last_outcome` + `last_bad_count` to know what happened.
+- **Documented in upstream-style.** `consult-upstream-docs` Cursor rule applied during this investigation: we read [Authentik flows docs](https://docs.goauthentik.io/docs/flow/) on `re_evaluate_policies` and `evaluate_on_plan` semantics before deciding which flag to flip.
+
+---
+
+## 5. Validation plan
+
+### a) ssdnodes (the slow-disk box that surfaced the bug)
+
+Already manually fixed via SQL during the live debugging session. Postgres CPU dropped 115x. Box is currently green. After v0.8.8 lands, the migration will be idempotent-noop on first run (the SQL we ran by hand already set `evaluate_on_plan=false`). This validates the no-op path.
+
+### b) tak-10 / responder / ssdnodes-validated / Alex's R3930
+
+These boxes have v0.8.7-alpha and currently still have `evaluate_on_plan=true` on their LDAP flow bindings (latent bug, hidden by faster disks). After they pull v0.8.8 (either via Update Now or `git pull main`), the migration should:
+
+1. Detect 3 bindings with `evaluate_on_plan=true`.
+2. UPDATE them.
+3. Restart `authentik-server-1` (~5-10s blip, server only).
+4. Persist `last_outcome='fixed'`, `last_bad_count=3`.
+5. Their next CPU samples should show a noticeable drop (less dramatic than ssdnodes since their disks aren't as starved, but measurable).
+
+### c) New deploys
+
+After v0.8.8 ships, fresh installs run the corrected blueprint YAML on first import. The migration is then a no-op forever after.
+
+### d) Operator acceptance gate
+
+```bash
+sudo -u takwerx cat /root/infra-TAK/.config/settings.json | python3 -c \
+  "import json,sys; print(json.dumps(json.load(sys.stdin).get('authentik_ldap_flow_recursion_fix', {}), indent=2))"
+```
+
+Expected after first console restart on an upgraded box:
 
 ```json
 {
-  "rollback_snapshot": {
-    "ts": 1777500000,
-    "version": "0.8.7-alpha",
-    "git_commit": "abc1234",
-    "git_branch": "main"
-  }
+  "last_check_utc": "2026-04-30T...",
+  "last_outcome": "fixed",
+  "last_bad_count": 3
 }
 ```
 
-#### Rollback function (`_run_rollback()`)
+Subsequent restarts:
 
-1. Read `settings.json → rollback_snapshot`.
-2. If no snapshot or snapshot is the current commit → surface "No rollback available" message.
-3. Run `git checkout <git_commit> -- .` (checkout specific commit, not a branch).
-4. Restart the console service (same as Update Now finish).
-5. Clear the snapshot after rollback (avoid rollback-of-rollback confusion).
-
-#### Console UI
-
-- Under "Update Now" button: small secondary button **"Rollback to v0.8.7-alpha"** (only visible if a snapshot exists and differs from current version).
-- Confirmation modal: "This will revert infra-TAK to v0.8.7-alpha (commit abc1234). Continue?"
-- Progress feedback identical to Update Now.
-
-### Scope / boundaries
-
-- **Code rollback only.** No config backup/restore in v0.8.8 (that's a separate feature for a future release if needed).
-- Rollback does NOT re-run migrations or undeploy Authentik — it only reverts the `app.py` code. If the bad version touched `~/authentik/docker-compose.yml`, the operator may still need a manual fix. Document this limitation clearly in the UI.
-- No rollback chain (rollback of rollback). One level deep. Simple and safe.
-
-### Risks and mitigations
-
-| Risk | Mitigation |
-|------|-----------|
-| git detached-HEAD confusion | After rollback, branch is detached at the commit. "Update Now" re-attaches to `origin/main`. Document this. |
-| Snapshot gets stale (multiple updates without rollback use) | Overwrite snapshot on every update. Only one level of rollback supported. |
-| Console restart mid-rollback | Same risk as Update Now. systemd restarts the service automatically. Rollback is idempotent. |
-| Version banner shows wrong version in detached state | Read `VERSION` from `app.py` after checkout, not from git. Already how it works. |
-| Rollback past v0.8.7's auto-restart settings → back to v0.8.6 chronic pain | Document. Operators rolling back to pre-v0.8.7 should expect the heavy-box CPU drift to return. Suggested workflow: rollback only when actively recovering from a regression, then return to current main once fixed. |
-
----
-
-## 2. v0.8.8 acceptance criteria
-
-- [ ] "Rollback to v0.8.7-alpha" (or current previous version) button appears in console after an update is applied.
-- [ ] Clicking rollback returns `app.py` to the previous version (verified by `grep '^VERSION'`).
-- [ ] Confirmation modal shows previous version string and commit hash.
-- [ ] After rollback, Update Now works normally and returns to current main.
-- [ ] If no snapshot exists, the rollback button is hidden (not just greyed out).
-- [ ] Snapshot survives a console restart (stored in `settings.json`, not in-memory).
-- [ ] Tested on Azure (tak-test-3) — rollback from a dummy v0.8.8 bump back to v0.8.7.
-- [ ] Tested on tak-10 (production-like load) — rollback completes cleanly without disturbing Authentik or LDAP outpost.
-
----
-
-## 3. Smaller items that may ride along (only if zero risk)
-
-These are pre-existing minor items. Include only if they're trivial and don't slow down rollback shipping. **Anything that needs more than a 30-line diff defers to v0.8.9.**
-
-### 3a. Speed test: restore read MB/s display
-
-The manual disk speed test computes both read and write but the current display only shows write. Read was accidentally dropped in v0.8.6. Show both:
-
-```
-Disk speed test (256 MiB):  210 MB/s write  /  1331 MB/s read
+```json
+{
+  "last_check_utc": "2026-04-30T...",
+  "last_outcome": "idempotent-noop",
+  "last_bad_count": 0
+}
 ```
 
-~5 line change. Safe.
-
-### 3b. NSG ARM template — integrate into `start.sh` advisory
-
-`docs/azure-nsg-infra-tak.json` exists but is not linked from `start.sh` output. When `start.sh` detects an Azure environment (public IP ≠ private IP), print a one-line advisory:
-
-```
-Azure detected — ensure NSG allows: 443, 5001, 8089, 8443, 8446
-See docs/azure-nsg-infra-tak.json for the ARM template.
-```
-
-~10 line change. Safe.
-
 ---
 
-## 4. Out of scope for v0.8.8
+## 6. Release flow
 
-- **Config backup/restore** (Caddy / CoreConfig.xml / UserAuthenticationFile.xml snapshots). → v0.8.9 or v0.9.0 if there's enough demand. Until then, "Restart Authentik server now" + the existing manual restore paths cover most "bad save" scenarios.
-- **Dashboard CPU per-core breakdown.** → v0.8.9 or later.
-- **Authentik deploy: wait for all containers healthy before API poll.** → v0.8.9 or later (low risk, low priority).
-
----
-
-## 5. Why rollback shipped second instead of first
-
-The earlier draft of v0.8.7 had rollback as the headline. We moved it to v0.8.8 because:
-
-1. **Operator stability comes before operator safety nets.** Authentik-CPU-pinning was an everyday felt-pain on heavy-load boxes (tak-10). Rollback is a "when something goes wrong" feature. Fix the everyday pain first.
-
-2. **v0.8.7 (Authentik) was a smaller, more isolated change** with strong field validation already done (Apr 30 2026 on tak-10). Rollback touches the update path, the UI, and `settings.json` schema — bigger surface area, more validation needed. Better to ship the smaller, validated fix first.
-
-3. **v0.8.7 reduces the *need* for rollback.** Many of the "bad update" scenarios that rollback would protect against were Authentik-flavored (acute spiral, chronic CPU drift). v0.8.5/6/7 progressively close those holes. The remaining regression risk is non-Authentik (UI, deploy scripts, Node-RED) — still valuable to cover with rollback, just less acute.
-
-4. **One major feature per release.** Mixing rollback + Authentik auto-restart in a single release would dilute both. Each gets a clean release with focused validation.
-
----
-
-## 6. Notes from v0.8.7 post-release (placeholder)
-
-To be filled in after v0.8.7 ships and is validated on the production fleet. Expected entries:
-
-- Auto-restart fired N times across {tak-10, ssdnodes, responder} during the first week.
-- Average before/after CPU p50 drop measured at: server X% → Y%, postgres X% → Y%.
-- Zero LDAP incidents during/after restart windows.
-- Operator feedback on the dashboard "Last restart / Next scheduled" UX.
-- Any rough edges discovered → folded into v0.8.8 if low-risk, otherwise tracked as v0.8.9 hardening.
+1. Commit to `dev` (this PR).
+2. Pull `dev` onto tak-10 + responder for validation soak (operator request: validate before merging to main).
+3. Once green, selective merge to `main` (just like v0.8.7 — see `docs/COMMANDS.md`).
+4. Tag `v0.8.8-alpha`, push tag.
+5. ssdnodes-validated, Alex's box, and any other operator boxes pull main / hit Update Now to get the fix.

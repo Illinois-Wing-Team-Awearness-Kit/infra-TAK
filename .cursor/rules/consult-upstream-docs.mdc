@@ -1,0 +1,41 @@
+---
+description: Always read upstream/official docs before debugging third-party software. Verify config changes actually applied (don't trust .env or config files alone).
+alwaysApply: true
+---
+
+# Consult upstream documentation FIRST
+
+When debugging, optimizing, or configuring any third-party software (Authentik, Caddy, TAK Server, Node-RED, Postgres, Docker, etc.), **read the official documentation BEFORE chasing symptoms or building workarounds.** Symptom-level investigations (CPU graphs, log greps, recreate-and-pray) without checking the source docs lead to band-aids that mask real bugs.
+
+## Required workflow
+
+1. **Read upstream docs first.** Find the project's official site, configuration page, or GitHub repo. Search for the specific subsystem (workers, cache, scaling, performance, etc.). Most "weird" production behavior is documented as a known config or gotcha.
+2. **Find the project's verification command.** Most non-trivial software exposes a way to inspect runtime config (e.g., `ak dump_config` for Authentik, `caddy adapt` for Caddy, `nginx -T`, `docker inspect`, `psql -c "SHOW ALL"`, etc.). Use it.
+3. **Never trust the input config to mean the runtime is using it.** A `.env` file with `KEY=value` is not proof the process loaded `KEY`. Always confirm with the upstream's verification command, log line, or runtime introspection.
+4. **Cite the doc in commit messages and HANDOFF notes.** When a fix is grounded in upstream docs, link the URL. Future maintainers should see "this matches the official guidance" not "we tried random tunings."
+
+## Concrete cautionary tale (April 2026)
+
+infra-TAK's v0.8.2 → v0.8.6 silent-ignore bug:
+
+```bash
+# What we wrote to ~/authentik/.env (since v0.8.2):
+AUTHENTIK_WEB_WORKERS=4
+
+# What Authentik 2026.x actually reads (per official docs):
+AUTHENTIK_WEB__WORKERS=4    # DOUBLE underscore — "the double-underscores are intentional"
+
+# What docker top showed for 5 releases:
+gunicorn: master
+gunicorn: worker  ← worker 1
+gunicorn: worker  ← worker 2     (TWO workers, not four — env var was silently ignored)
+```
+
+Fix only landed because the operator pushed back: "is there any info on the internet about optimizing authentik?" One read of [docs.goauthentik.io/install-config/configuration/](https://docs.goauthentik.io/install-config/configuration/) revealed five releases of band-aids on top of a config that wasn't even being applied. **Always go to the source first.**
+
+## Anti-patterns to avoid
+
+- ❌ Building a recreate/restart workaround before checking upstream config docs.
+- ❌ Setting an env var and assuming it works because the process started.
+- ❌ Tuning postgres/cache/anything without verifying the upstream config was actually loaded.
+- ❌ Citing GitHub issues / blog posts as the only source when the project has official docs.

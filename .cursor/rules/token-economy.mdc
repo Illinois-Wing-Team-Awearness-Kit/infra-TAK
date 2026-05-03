@@ -1,0 +1,31 @@
+---
+description: Token hygiene — keep Claude context lean to reduce API costs
+alwaysApply: true
+---
+
+# Token Economy
+
+## One task per chat — hard rule
+Every distinct task gets its own chat. Never carry a bug investigation into a new feature in the same session. Long chats compound: every turn re-sends the full conversation history.
+
+## NEVER load app.py whole
+`app.py` is 31,466 lines (~120k tokens). Loading it whole costs ~$0.50+ per read in Claude Sonnet.
+
+**Always:**
+- Grep or SemanticSearch first to find the exact function/route
+- Read only the 50–200 line range you need
+- Tell the agent the target before it starts: "In `app.py` around `deploy_nodered()` near line ~4200, fix X"
+
+## Cap chat length at ~15 turns
+After ~15 back-and-forths, write a HANDOFF note (see `session-handoff.mdc`) and start a fresh chat. Context window compounds — turn 20 costs 4× more than turn 5.
+
+## Use Plan mode to explore, Agent mode to execute
+- **Plan mode** (read-only) = cheap exploration, architectural thinking
+- **Agent mode** = only when you know exactly what to change
+
+Switching to Plan for "figure out the approach" and back to Agent for "do it" is 2–3x cheaper than doing both in Agent mode.
+
+## Give the agent a line number or function name to anchor on
+A vague question = broad search = many file reads = high cost.
+- ❌ "Something is broken with Node-RED deploy, find it"
+- ✅ "In `deploy_nodered()` around line 4200 of `app.py`, the context backup is not running before stop"

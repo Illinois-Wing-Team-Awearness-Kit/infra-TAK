@@ -79,7 +79,69 @@ Documented at length in [RELEASE-v0.3.9-alpha.md](RELEASE-v0.3.9-alpha.md) and s
 
 ---
 
-## 5. Reference map
+## 5. On-prem fresh install — enrollment SSL failures (May 2026)
+
+Both failures were seen on a fresh install on an on-prem server (home lab, dynamic IP, Ubuntu Desktop 22.04). The server had a valid FQDN and Caddy issued a Let's Encrypt cert. The install completed without obvious error but ATAK failed at two sequential stages.
+
+---
+
+### Failure A — "TAK server's identity could not be verified" (enrollment, port 8446)
+
+**Symptom:** ATAK shows **"TAK server's identity could not be verified"** when scanning the enrollment QR code. Every device, every user. `openssl s_client -connect <fqdn>:8446` returns the **self-signed TAK PKI cert** instead of a Let's Encrypt cert.
+
+**Root cause:** `install_le_cert_on_8446()` runs during the initial TAK Server deploy, but it is gated on the LE cert files already existing in Caddy's storage. On a fresh install Caddy may not have completed the ACME challenge yet — the function logs "Skipping 8446 cert install — DNS may not be propagated yet" and exits early. TAK Server therefore stays on its self-signed PKI cert on 8446. ATAK cannot verify a self-signed cert during enrollment → identity error.
+
+**Diagnostic:**
+```bash
+openssl s_client -connect <fqdn>:8446 -servername <fqdn> </dev/null 2>&1 | grep -E "subject|issuer"
+# BAD:  issuer=..., CN = INTERMEDIATE_CA_01   (self-signed TAK PKI)
+# GOOD: issuer=C = US, O = Let's Encrypt, CN = E7
+```
+
+**Fix:** Click **"Patch CoreConfig"** on the TAK Server page in the console. This calls `install_le_cert_on_8446(wait_for_cert=False)` — by this point Caddy has the LE cert, the function converts it to a JKS and patches `CoreConfig.xml`, then restarts TAK Server. Wait ~2 minutes and re-verify with `openssl s_client` before re-testing enrollment.
+
+**Why this doesn't happen on VPS installs:** VPS installs typically have DNS propagated before deploy runs; Caddy gets the cert quickly and `wait_for_cert=True` succeeds in its 120-second polling loop. Home lab / dynamic DNS installs can lag.
+
+---
+
+### Failure B — SSL error on ATAK after enrollment "succeeded" (CoT, port 8089)
+
+**Symptom:** ATAK reports enrollment success and downloads a client cert, but then immediately shows an **SSL error** when trying to connect for CoT traffic. TAK Server messaging log (`/opt/tak/logs/takserver-messaging.log`) shows repeated:
+```
+SSLHandshakeException: General OpenSslEngine problem ... Certificate error: peer not verified
+```
+from the ATAK device's IP, hitting port 8089, every ~16 seconds (ATAK retry loop).
+
+**What rules it out (confirmed via diagnostics):**
+- CRL is empty (`No Revoked Certificates`) — cert is not revoked
+- Truststore (`truststore-INTERMEDIATE_CA_01.jks`) has correct entries: `mykey` = INTERMEDIATE_CA_01, `root-ca` = ROOT_CA_01
+- On-disk `INTERMEDIATE_CA_01.pem` fingerprint matches the truststore's `mykey` entry exactly
+- `CoreConfig.xml` `<tls>` block points at the correct truststore file
+- Downloaded client cert issuer = INTERMEDIATE_CA_01 (correct CA, issued today)
+- Ubuntu Desktop vs Server OpenSSL: identical, not the cause
+
+**Root cause:** Residual PKI state corruption from the rough first deploy (8446 served self-signed during first enrollment attempt). The JKS files are internally inconsistent in a way that SHA-256 fingerprint comparisons do not surface — OpenSSL reports "OK" but Java's JSSE/Netty rejects the chain during mutual TLS.
+
+**Fix:** Use the **CA Rotation tool** in the TAK Server page of the console ("Rotate Intermediate CA"). The tool (lines ~27590–27836 in `app.py`) automatically:
+1. Generates a new intermediate CA
+2. Re-signs the server cert and all existing client certs
+3. Rebuilds the truststore (new + old CA for transition)
+4. Patches `CoreConfig.xml`
+5. Syncs admin.p12 + CA chain to TAK Portal and restarts it
+6. Restarts TAK Server
+
+After rotation completes, verify 8446 is still on LE cert:
+```bash
+openssl s_client -connect <fqdn>:8446 -servername <fqdn> </dev/null 2>&1 | grep issuer
+# Must show: issuer=..., O = Let's Encrypt
+```
+If it reverted to the TAK PKI cert, click "Patch CoreConfig" again to reinstall the LE cert on 8446.
+
+Then: fully remove the server entry from ATAK (Settings → Network Connections → Remove + clear Device Certificate + Force Stop ATAK), generate a fresh QR code, and re-enroll.
+
+**Why CA rotation fixes it:** rebuilds every JKS from scratch using the current OpenSSL binary and `_patch_openssl_string_mask()` settings, eliminating any encoding inconsistency baked in during the problematic first deploy.
+
+---
 
 | Topic | Doc / location |
 |--------|----------------|

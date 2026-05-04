@@ -2,7 +2,7 @@
 
 ## What ships
 
-Five features shipped in one build.
+Six features shipped in one build.
 
 ---
 
@@ -98,6 +98,33 @@ Before every "Update Now", the console records the current version and git tag. 
 
 **API routes**:
 - `POST /api/console/rollback`
+
+---
+
+### Feature F — TAK Server Plugins
+
+New collapsible "TAK Server Plugins" section on the TAK Server page (visible when TAK is installed). Based on the official TAK Server Plugin SDK (tak.gov) and reference plugins including TAK CAD Server Plugin (RTX/BBN).
+
+**Plugin mechanics (from SDK):**
+- Plugin JARs live at `/opt/tak/lib/` — loaded by the plugin manager on startup
+- Plugin configs auto-generated at `/opt/tak/conf/plugins/<fully.qualified.ClassName>.yaml` on first run
+- Restart required after any JAR or config change
+
+**What the section does:**
+
+- **Installed plugins list**: on section open, scans `/opt/tak/lib/*.jar` and `/opt/tak/conf/plugins/*.yaml` and renders a table — plugin name, config status, Edit config button, Remove button
+- **Install**: single upload area accepts `.jar` (copied to `/opt/tak/lib/`) or `.yaml` (copied to `/opt/tak/conf/plugins/`) — portal routes by extension. After any file placement, a "Restart TAK Server to apply changes" banner appears with a Restart button
+- **Edit config**: inline expand per plugin — reads YAML, shows in monospace textarea, save writes it back. If no YAML yet: "Config will be generated on first run after restart"
+- **Remove**: deletes JAR from `/opt/tak/lib/` + matching YAML from `/opt/tak/conf/plugins/` if present, then prompts restart
+
+**API routes:**
+- `GET /api/takserver/plugins/list`
+- `POST /api/upload/takserver-plugin`
+- `POST /api/takserver/plugins/install-jar`
+- `POST /api/takserver/plugins/install-yaml`
+- `GET /api/takserver/plugins/config/<classname>`
+- `POST /api/takserver/plugins/config/<classname>`
+- `POST /api/takserver/plugins/remove/<jarname>`
 
 ---
 

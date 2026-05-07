@@ -25,7 +25,7 @@ On **Authentik deploy** or **Update config & reconnect** (local) — and on **re
 
 `~/authentik/media/public/infra-tak-defaults/tak-gov-brand.svg`
 
-(on the host that runs Authentik’s `docker compose`; same tree users see as `/root/authentik/...` when deployed as root).
+(on the host that runs Authentik’s `docker compose`; same tree users see as `${HOME:-/home/takwerx}/authentik/...` when deployed as root).
 
 You still **assign** it in **System → Brands** (upload from your machine, or copy that path off the server and upload). Authentik does not auto-wire brand images from disk. Details: **[static/authentik-branding/README.md](../static/authentik-branding/README.md)**.
 

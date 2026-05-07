@@ -213,7 +213,7 @@ grep AUTHENTIK_HOST ~/authentik/docker-compose.yml | grep -A0 "ldap" -B0
 
 # 4. Check the proactive routing migration outcome (if any was needed)
 jq '.authentik_proactive_routing_migration' ~/.config/settings.json 2>/dev/null \
-  || jq '.authentik_proactive_routing_migration' /root/infra-TAK/.config/settings.json 2>/dev/null
+  || jq '.authentik_proactive_routing_migration' /home/takwerx/infra-TAK/.config/settings.json 2>/dev/null
 # → null (no migration needed) OR { ts, outcome: "success", fqdn: "..." }
 
 # 5. Confirm the gunicorn timeout bump applied (the tak-10 fix)
@@ -222,7 +222,7 @@ docker exec authentik-server-1 printenv GUNICORN_CMD_ARGS
 grep GUNICORN_CMD_ARGS ~/authentik/.env
 # → GUNICORN_CMD_ARGS=--timeout=120
 jq '.authentik_gunicorn_timeout_migration' ~/.config/settings.json 2>/dev/null \
-  || jq '.authentik_gunicorn_timeout_migration' /root/infra-TAK/.config/settings.json 2>/dev/null
+  || jq '.authentik_gunicorn_timeout_migration' /home/takwerx/infra-TAK/.config/settings.json 2>/dev/null
 # → { ts, outcome: "success", value: 120 }
 
 # 6. After applying, confirm SIGABRT cascade has stopped on heavy-load boxes

@@ -65,7 +65,7 @@ After `Update Now` or `git pull origin main` + console restart, from Alex's box 
 
 ```bash
 # 1. Audit check
-sudo cat /root/infra-TAK/.config/settings.json | python3 -c "
+sudo cat /home/takwerx/infra-TAK/.config/settings.json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 print('Trusted proxy:', json.dumps(d.get('authentik_trusted_proxy_cidrs_fix', {}), indent=2))

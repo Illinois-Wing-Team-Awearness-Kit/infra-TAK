@@ -401,7 +401,7 @@ docker logs authentik-ldap-1 --since 10m 2>&1 | grep -cE "exceeded stage recursi
 # 5. Migrations recorded
 python3 -c "
 import json
-s = json.load(open('/root/infra-TAK/.config/settings.json'))
+s = json.load(open('/home/takwerx/infra-TAK/.config/settings.json'))
 for k in ['authentik_proactive_routing_migration', 'authentik_gunicorn_timeout_migration']:
     print(f'{k}: {s.get(k) or \"(not recorded)\"}')"
 # Expected on a fresh TAK-installed deploy:
@@ -1070,7 +1070,7 @@ cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.servic
 - **Web editor service:** `mediamtx-webeditor.service` is created and enabled/started **only when** `/opt/mediamtx-webeditor/mediamtx_config_editor.py` exists. If clone fails and no local fallback, we skip creating the service (no restart loop). Pip deps and enable/start for webeditor are also gated on that file.
 
 **TAK Server packages:**
-- Deploy and upgrade use `<install_path>/uploads/` (e.g. `/root/infra-TAK/uploads/`). You can rsync or scp the .deb there before running deploy or upgrade.
+- Deploy and upgrade use `<install_path>/uploads/` (e.g. `/home/takwerx/infra-TAK/uploads/`). You can rsync or scp the .deb there before running deploy or upgrade.
 
 **COMMANDS.md:**
 - **Pull then restart (two steps):** Separate code blocks for `git fetch/checkout/pull` and `sudo systemctl restart takwerx-console`.

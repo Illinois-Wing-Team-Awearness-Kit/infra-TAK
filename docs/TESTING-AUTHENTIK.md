@@ -94,7 +94,7 @@ sudo journalctl -u takwerx-console --since "35 min ago" | grep "spiral monitor"
 After any Update Now or fresh deploy, check that the three key migrations fired:
 
 ```bash
-SETTINGS=$(cat /root/infra-TAK/.config/settings.json 2>/dev/null || cat ~/.config/settings.json 2>/dev/null)
+SETTINGS=$(cat /home/takwerx/infra-TAK/.config/settings.json 2>/dev/null || cat ~/.config/settings.json 2>/dev/null)
 
 # Gunicorn timeout migration — should show value:120
 echo "$SETTINGS" | python3 -c "import json,sys; s=json.load(sys.stdin); print('gunicorn_timeout:', s.get('authentik_gunicorn_timeout_migration','NOT RECORDED'))"
@@ -191,7 +191,7 @@ docker logs authentik-ldap-1 --since 10m 2>&1 | grep -cE "exceeded stage recursi
 # 5. Migration records
 python3 -c "
 import json
-s = json.load(open('/root/infra-TAK/.config/settings.json'))
+s = json.load(open('/home/takwerx/infra-TAK/.config/settings.json'))
 for k in ['authentik_proactive_routing_migration', 'authentik_gunicorn_timeout_migration']:
     print(f'{k}: {s.get(k) or \"(not recorded)\"}')"
 

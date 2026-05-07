@@ -192,7 +192,7 @@ Open **Fail2ban** in the sidebar, scroll to the bottom, click **Uninstall Fail2b
 # After saving banner settings, verify config is stored
 python3 -c "
 import json
-d = json.load(open('/root/infra-TAK/.config/settings.json'))
+d = json.load(open('/home/takwerx/infra-TAK/.config/settings.json'))
 print(json.dumps(d.get('customization', {}), indent=2))
 "
 ```

@@ -1,5 +1,26 @@
 # Release Notes — v0.9.2-alpha
 
+## Action required — kernel patch (CVE-2026-31431 / Copy Fail)
+
+A Linux kernel vulnerability published April 29 2026 ([CVE-2026-31431](https://nvd.nist.gov/vuln/detail/CVE-2026-31431), "Copy Fail") allows an unprivileged user with code execution inside a container to escalate to a root shell. **This is a kernel bug — the only real fix is patching the kernel.**
+
+```bash
+apt update && apt full-upgrade
+reboot
+```
+
+The reboot triggers Guard Dog's boot sequencer, which restarts all containers in the correct order automatically. No other operator action is required.
+
+**What v0.9.2 adds on top of the kernel patch** (applied automatically on next "Update Now"):
+
+- Removes `/var/run/docker.sock` from the Authentik worker container. This socket was present because the upstream Authentik quickstart includes it for Docker-managed outposts; infra-TAK uses the embedded outpost and a standalone LDAP container, so the socket was never needed. With it mounted, a compromised Authentik worker was equivalent to host root — that path is now closed.
+- Adds `cap_drop: ALL` and `no-new-privileges: true` to Authentik (server, worker, ldap), TAK Portal, and CloudTAK (api, events, media). With `cap_drop: ALL`, even if Copy Fail achieves container root the privilege escalation step fails because no Linux capabilities are available.
+- **Node-RED hardening lands alongside this release**: image pin (`nodered/node-red:4.0` — was `:latest`), `cap_drop: ALL` + `no-new-privileges: true`, `user: 1000:1000`, `mem_limit: 2g`, `restart: unless-stopped`, `env_file: .env` for optional adminAuth. Local deploy also switches to scoped per-file cert mounts (`/opt/tak/certs/files/<name>:/certs/<name>:ro`) instead of mounting the whole `/opt/tak/certs/files` tree. Remote deploy port binding fixed from `0.0.0.0:1880` → `127.0.0.1:1880` (was inconsistent with local). All applied via `_auto_nodered` post-update patcher — operators see `Post-update: Node-RED ...` log lines.
+
+These mitigations are applied automatically to existing running deployments during the post-update migration — no reinstall of Authentik, TAK Portal, or Node-RED is needed. The console log will show `Post-update: Authentik compose hardened`, `Post-update: TAK Portal compose hardened`, and `Post-update: Node-RED compose — adding hardening flags` confirming each change was applied.
+
+---
+
 ## What ships
 
 Six features shipped in one build.
@@ -46,9 +67,12 @@ Automated and on-demand snapshots of the full TAK Server state:
 |------|-----|-----------|
 | Installed TAK version | `dpkg -l takserver` | snapshot metadata |
 | `CoreConfig.xml` | file copy | `/opt/tak/snapshots/<label>/CoreConfig.xml` |
+| `UserAuthenticationFile.xml` | file copy | `/opt/tak/snapshots/<label>/UserAuthenticationFile.xml` |
 | JVM heap settings | file copy | `/opt/tak/snapshots/<label>/takserver.default` |
 | PostgreSQL cot dump | `pg_dump -Fc` via `docker exec takserver-db` | `/opt/tak/snapshots/<label>/cot.pgdump` |
 | Certificates | directory copy | `/opt/tak/snapshots/<label>/certs/` |
+
+`UserAuthenticationFile.xml` capture closes a gap that would otherwise lose flat-file users (admin, webadmin, optional Phase 1A `nodered`) on rollback even though their cert files in `certs/` survived. Snapshot + rollback are now consistent — restoring takes you to a fully working TAK Server state including who can authenticate.
 
 **Pre-upgrade snapshot**: automatically taken at the start of every `run_takserver_upgrade()`. If the snapshot fails the upgrade is **aborted** — current data is protected.
 
@@ -75,9 +99,11 @@ One-click restore from any snapshot:
 
 1. Validates snapshot has a `cot.pgdump`
 2. Stops `takserver`
-3. Restores `CoreConfig.xml`, `takserver.default`, `certs/`
+3. Restores `CoreConfig.xml`, `UserAuthenticationFile.xml`, `takserver.default`, `certs/`
 4. Runs `pg_restore --clean -d cot` inside the `takserver-db` container
 5. Starts `takserver`
+
+Older snapshots (taken before v0.9.2) won't have a `UserAuthenticationFile.xml` in them — the rollback logs `snapshot has no UserAuthenticationFile.xml — leaving current file in place` and skips that one step. Take a fresh snapshot post-update to fully use the new behavior.
 
 **UI card** on TAK Server page: snapshot table, Restore / Download / Delete buttons, scheduled snapshot config.
 
@@ -125,6 +151,24 @@ New collapsible "TAK Server Plugins" section on the TAK Server page (visible whe
 - `GET /api/takserver/plugins/config/<classname>`
 - `POST /api/takserver/plugins/config/<classname>`
 - `POST /api/takserver/plugins/remove/<jarname>`
+
+---
+
+---
+
+### Bug fix — Guard Dog socket leak (console hang after ~3 days)
+
+**Symptom:** After ~3 days of uptime, the infra-TAK console becomes completely unresponsive. Port 5001 stops accepting connections (TLS handshake never completes). The root process (gunicorn PID) accumulates 140+ open file descriptors — all leaked sockets — and one background thread stalls in `select()` waiting on all of them simultaneously.
+
+**Root cause:** Five calls to `urllib.request.urlopen()` in the Guard Dog health check functions (`_guarddog_health_check` and `_monitor_health_check`) stored the response in a variable but never called `resp.close()`. The response object holds the underlying TCP socket open. Python's garbage collector eventually reclaims most, but not all — so over 3 days at one poll per 25 seconds, ~135 sockets survive and accumulate in the process.
+
+The five affected checks: `authentik` service check, `nodered` service check, `remotedb` monitor, `authentik_http` monitor, `nodered_http` monitor.
+
+Every other `urlopen` call in the file already used `with urllib.request.urlopen(...) as resp:`. These five were missed.
+
+**Fix:** Wrap all five with the context manager (`with ... as resp:`), which calls `resp.close()` on exit. No logic change — identical behavior, sockets released immediately after each check.
+
+**Diagnosed live** on responder (ssdnodes) after 3 days of uptime: 144 FDs on PID, `wchan=do_select`, thread CPU time 6× higher than peers, `curl https://127.0.0.1:5001/` timing out at 20s. Console restored immediately after `systemctl restart takwerx-console`. Other boxes not yet affected (shorter uptime).
 
 ---
 

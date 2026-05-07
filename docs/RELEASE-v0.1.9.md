@@ -58,7 +58,7 @@ Release Date: 2026-03-04
 
 - **Pull then restart (two steps):** Separate copy-paste blocks for pull and for `sudo systemctl restart takwerx-console`.
 - **Server impact and memory:** New section with `free -h`, `docker stats --no-stream`, and `top -o %MEM` / `top -o %CPU` for quick resource snapshots, plus a note on typical heavy users (TAK Server Java, PostgreSQL, Docker stack).
-- **TAK Server packages:** Deploy and upgrade use `<install_path>/uploads/` (e.g. `/root/infra-TAK/uploads/`); you can rsync or scp the .deb there before deploy or upgrade.
+- **TAK Server packages:** Deploy and upgrade use `<install_path>/uploads/` (e.g. `/home/takwerx/infra-TAK/uploads/`); you can rsync or scp the .deb there before deploy or upgrade.
 - **Other:** Disk full / container logs, CloudTAK 502 and backend readiness, TAK client "No channels found" and new-groups sync delay (60s refresh; client reconnect after 1–2 min).
 
 ---

@@ -274,7 +274,7 @@ After v0.8.8 ships, fresh installs run the corrected blueprint YAML on first imp
 
 **Bug #1:**
 ```bash
-sudo -u takwerx cat /root/infra-TAK/.config/settings.json | python3 -c \
+sudo -u takwerx cat /home/takwerx/infra-TAK/.config/settings.json | python3 -c \
   "import json,sys; print(json.dumps(json.load(sys.stdin).get('authentik_ldap_flow_recursion_fix', {}), indent=2))"
 ```
 
@@ -289,7 +289,7 @@ Subsequent restarts:
 
 **Bug #2:**
 ```bash
-sudo -u takwerx cat /root/infra-TAK/.config/settings.json | python3 -c \
+sudo -u takwerx cat /home/takwerx/infra-TAK/.config/settings.json | python3 -c \
   "import json,sys; print(json.dumps(json.load(sys.stdin).get('authentik_pg_idle_timeout_fix', {}), indent=2))"
 ```
 

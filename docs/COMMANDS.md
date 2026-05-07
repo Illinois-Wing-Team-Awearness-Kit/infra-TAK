@@ -49,14 +49,14 @@ After a VPS reboot, everything that’s **enabled** starts automatically. You do
 
 - SSH in (or use the provider’s web console). Go to your infra-TAK install directory, then run:
   ```bash
-  cd /root/infra-TAK   # or wherever you cloned (e.g. /opt/infra-TAK)
+  cd /home/takwerx/infra-TAK   # or wherever you cloned (e.g. /opt/infra-TAK)
   sudo ./fix-console-after-pull.sh
   ```
   That pins the config path and then runs the password reset script. Enter a new password twice. Then use **`https://<server-IP>:5001`** with the new password.
 
 - If you only need to reset the password (config path is already correct):
   ```bash
-  cd /root/infra-TAK
+  cd /home/takwerx/infra-TAK
   sudo ./reset-console-password.sh
   ```
 

@@ -40,7 +40,7 @@ After the fix, Authentik reads `X-Forwarded-For` from Caddy and records the real
 After `Update Now` or console restart on a v0.8.8 box:
 
 ```bash
-sudo cat /root/infra-TAK/.config/settings.json | python3 -c "
+sudo cat /home/takwerx/infra-TAK/.config/settings.json | python3 -c "
 import json, sys
 d = json.load(sys.stdin)
 print('Trusted proxy fix:', json.dumps(d.get('authentik_trusted_proxy_cidrs_fix', {}), indent=2))

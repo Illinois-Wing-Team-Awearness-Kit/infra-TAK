@@ -9,7 +9,7 @@
 
 ## VPS
 - Host: `172.93.50.47` (tak-10)
-- Repo path: `/root/infra-TAK`
+- Repo path: `/home/takwerx/infra-TAK`
 - Container: `nodered`
 - Configurator: `http://172.93.50.47:1880/configurator`
 - Node-RED editor: `http://172.93.50.47:1880`

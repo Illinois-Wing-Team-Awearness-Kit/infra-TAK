@@ -441,7 +441,7 @@ The `http_action` node (Mission API PUT/DELETE) MUST have `paytoqs: 'body'`. Thi
 
 On the server:
 ```bash
-cd /root/infra-TAK && git pull
+cd /home/takwerx/infra-TAK && git pull
 docker cp nodered/flows.json nodered:/data/flows.json
 # Deploy with passphrase injection (see command above)
 ```
@@ -485,7 +485,7 @@ Changed from 5s to 30s. With large feeds (55+ polygon CoTs, many over 10KB), 5 s
 
 Proven working — run on the server:
 ```bash
-cd /root/infra-TAK && git pull && docker cp nodered/flows.json nodered:/data/flows.json && docker exec nodered node -e "
+cd /home/takwerx/infra-TAK && git pull && docker cp nodered/flows.json nodered:/data/flows.json && docker exec nodered node -e "
 var http = require('http');
 var fs = require('fs');
 var flows = JSON.parse(fs.readFileSync('/data/flows.json','utf8'));

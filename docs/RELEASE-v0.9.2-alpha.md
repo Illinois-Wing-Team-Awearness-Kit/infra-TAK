@@ -189,29 +189,9 @@ Every other `urlopen` call in the file already used `with urllib.request.urlopen
 
 ---
 
-### Security — Console service runs as `takwerx` (non-root)
+### Security — Console non-root user migration (deferred to v0.9.3)
 
-The infra-TAK console (gunicorn/`app.py`) now runs as a dedicated `takwerx` system user (UID != 0) instead of root. The migration is two-phase:
-
-**Phase 1 — automatic, on first "Update Now" after v0.9.2:**
-- `_auto_provision_takwerx()` creates the `takwerx` user, adds it to `sudo` and `docker` groups, writes `/etc/sudoers.d/takwerx` with `NOPASSWD: ALL`. No CLI required.
-- This is the safe part — it does NOT relocate the install dir, modify the service unit, or restart anything. The console keeps running as root.
-
-**Phase 2 — one-time CLI step (existing operators only):**
-- For installs that live under `/root/infra-TAK/` (the historical default), the console will display a blue migration banner: *"Takwerx user provisioned — finish migration to non-root service. SSH in and run `sudo bash start.sh`."*
-- The operator SSHes in once, runs `sudo bash start.sh`, and `start.sh` does the heavy lifting:
-  - Stops the console service
-  - Moves `/root/infra-TAK/` → `/home/takwerx/infra-TAK/` (and module dirs `~/authentik`, `~/CloudTAK`, `~/node-red`, `~/TAK-Portal`)
-  - Deletes and rebuilds the Python venv at the new location (Python venvs hardcode absolute paths in shebangs and **cannot** be safely relocated — must be rebuilt)
-  - Rewrites the systemd unit with `User=takwerx`, the new `WorkingDirectory`, and the new `ExecStart` paths
-  - Restarts the service
-- After restart, `ps aux | grep gunicorn` shows `takwerx` instead of `root`. The blue banner clears automatically (it's runtime-derived from `os.getuid() != 0`).
-
-**Why the two phases?** A Python process cannot safely relocate the venv it's running from — every script in `.venv/bin/` has an absolute-path shebang to the old `python3`. Bash (`start.sh`), running outside the service, can stop the service first, then move/rebuild safely. The post-update migration in `app.py` is therefore deliberately limited to the operations it can perform without sawing off the branch it's sitting on.
-
-**Fresh installs (no /root/ history):** Single command — `sudo ./start.sh` runs Phase 1 + Phase 2 together, no banner ever appears, console runs as `takwerx` from boot zero.
-
-**Security posture:** `takwerx` has `NOPASSWD: ALL` sudo and is in the `docker` group (equivalent to root for container access), so this is not a strong isolation boundary. The gain is: UID != 0 satisfies common compliance audit tools, and a compromise of the console process does not directly yield a root shell or access to root's SSH keys, history, or authorized_keys.
+Running the console as a dedicated non-root system user is planned for **v0.9.3**. The console continues to run as root in v0.9.2. The `_sudo_wrap`/`_write_priv`/`_read_priv` helper infrastructure introduced in this release will remain in place as scaffolding for the v0.9.3 migration.
 
 ---
 

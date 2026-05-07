@@ -282,6 +282,23 @@ Keep `admin.pem`. The runtime hardening (Phase 2) still applies — that's cert-
 
 ---
 
+## Authentik — disable gunicorn worker recycling (v0.9.2)
+
+Authentik defaults `AUTHENTIK_WEB__MAX_REQUESTS=1000` (with `JITTER=50`), causing gunicorn workers to recycle after every ~1000 requests. On active installations this fires every 30–60 minutes, and each recycle drops the LDAP outpost's websocket connection (`websocket: close 1012 — Service Restart`). The LDAP container reconnects automatically so there is no user-visible login impact, but the periodic drops generate log noise and indicate unnecessary churn.
+
+For single-VPS deployments there is no memory-leak benefit to worker recycling that justifies the disruption. v0.9.2 sets:
+
+```
+AUTHENTIK_WEB__MAX_REQUESTS=0
+AUTHENTIK_WEB__MAX_REQUESTS_JITTER=0
+```
+
+This is applied automatically via the `_authentik_apply_official_tunings` patcher on next "Update Now" — the same patcher that fixed the `AUTHENTIK_WEB__WORKERS` double-underscore bug in v0.8.7. After the patcher writes the `.env`, Authentik server and worker are recreated to apply the change. Operators can override by setting either key to a non-zero value before updating (the patcher preserves existing operator-set values).
+
+Reference: [docs.goauthentik.io — AUTHENTIK_WEB__MAX_REQUESTS](https://docs.goauthentik.io/install-config/configuration/)
+
+---
+
 ## Scope discipline — what is NOT in v0.9.2
 
 - Two-server TAK rollback (complex, lower demand)

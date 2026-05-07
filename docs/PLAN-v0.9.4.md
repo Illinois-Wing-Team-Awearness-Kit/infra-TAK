@@ -22,6 +22,27 @@ Currently, `_tak_snapshot()` runs `sudo -u postgres pg_dump -Fc cot` locally on 
 
 ---
 
+## TAK Server Snapshots — Upload & Restore
+
+The **Download** button (added v0.9.2) lets operators save a snapshot `.tar.gz` off-box. There is currently no way to push that archive back and restore from it — making off-box backups useful only as archival copies, not as a real disaster-recovery path.
+
+**Use cases:**
+- VPS is destroyed / unrecoverable — spin up a new host, upload last good snapshot, restore
+- Migrating TAK Server to a different VPS
+- Restoring a snapshot that has already been pruned from the server by the retention policy
+
+**Plan:**
+
+- Add an **Upload Snapshot** button in the Snapshots & Recovery section (file input, accepts `.tar.gz`)
+- Backend endpoint `POST /api/takserver/snapshot/upload`:
+  - Validates the archive contains the expected structure (`cot.pgdump`, `CoreConfig.xml`, `certs/` etc.)
+  - Extracts to `/opt/tak/snapshots/<label>/` (label derived from archive name, de-duped if needed)
+  - Returns the new snapshot label on success
+- Once extracted, the snapshot appears in the table like any locally-created one and the existing **Rollback** button works without any changes
+- No streaming write concern — uploads are operator-initiated, infrequent, and bounded by snapshot size
+
+---
+
 ## Reminder — v0.9.3 scope
 
 v0.9.3 is dedicated to the non-root console migration (`takwerx` sudo user). Split-server snapshot support is explicitly deferred to v0.9.4 to keep v0.9.3 focused.

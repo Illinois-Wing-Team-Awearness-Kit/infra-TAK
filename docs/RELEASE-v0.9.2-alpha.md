@@ -299,6 +299,34 @@ Reference: [docs.goauthentik.io — AUTHENTIK_WEB__MAX_REQUESTS](https://docs.go
 
 ---
 
+## Bug fixes (post-alpha stabilisation — May 2026)
+
+### TAK Portal update no longer conflicts with local docker-compose patches
+
+**Symptom:** "Update Now" for TAK Portal rebuilt the existing image rather than pulling a new version. The version shown in the UI remained at the pre-update tag even after the rebuild step succeeded.
+
+**Root cause:** The network-attachment and hardening patches written during `_patch_takportal_compose_network()` modified `~/TAK-Portal/docker-compose.yml` directly — a git-tracked file. On the next update, `git pull --rebase --autostash` stashed those local changes, then the rebase failed to reapply them cleanly, aborting the pull. Subsequent builds compiled the old source tree.
+
+**Fix:** Network and hardening settings now live in `~/TAK-Portal/docker-compose.override.yml` (not tracked by TAK Portal's git repo). The update flow first runs `git checkout -- .` to drop any stale tracked-file dirt (the override survives untouched), then `git pull --rebase` (no `--autostash` needed), then rewrites the override file to ensure it stays consistent with the current console version.
+
+---
+
+### `git safe.directory` now set system-wide — all git-backed components update reliably
+
+**Symptom:** TAK Portal and CloudTAK update buttons failed with `fatal: detected dubious ownership in repository`. The console service runs under a different HOME than the user who cloned the repos (e.g. root console vs takwerx-owned repos), so `git config --global` wrote to `/root/.gitconfig` — which git never read when `HOME=/home/takwerx`.
+
+**Fix:** "Update Now" now calls `git config --system --replace-all safe.directory '*'`, writing to `/etc/gitconfig`. This applies to every user on the machine — the correct behaviour for a single-tenant server where the console, TAK Portal, and CloudTAK may be owned by different system accounts.
+
+---
+
+### TAK Server rollback now restarts Node-RED
+
+**Symptom:** After rolling back a TAK Server snapshot, Node-RED continued trying to manage (delete/update) DataSync missions that were wiped by the restore. These stale requests triggered `NullPointerException` crashes in TAK Server's `doCreateMissionAllowDupe` handler.
+
+**Fix:** `_tak_rollback()` now restarts the `nodered` container after TAK Server starts back up. Node-RED re-reads mission state from the clean database, eliminating the stale-mission reconciliation loop.
+
+---
+
 ## Scope discipline — what is NOT in v0.9.2
 
 - Two-server TAK rollback (complex, lower demand)

@@ -1,16 +1,14 @@
-# Release Notes — v0.9.4-alpha
+# v0.9.4 — Feature Plan
 
-> **Status: planned** — not yet implemented.
+> Not yet implemented. This is a planning document.
 
 ---
 
-## Planned features
-
-### TAK Server Snapshots — split / two-server support
+## TAK Server Snapshots — split / two-server support
 
 Currently, `_tak_snapshot()` runs `sudo -u postgres pg_dump -Fc cot` locally on the console host. In a standard single-server deployment this is correct — postgres is co-located with the TAK Server application. In a **split (two-server) deployment**, the PostgreSQL database lives on Server One while the infra-TAK console runs on Server Two. The local pg_dump either fails (no local postgres) or captures nothing useful.
 
-**What v0.9.4 will add:**
+**Plan:**
 
 - `_tak_snapshot()` checks `settings.tak_two_server` — if true, uses the existing `server_one` SSH key/host config to stream the pg_dump from Server One:
   ```bash
@@ -24,6 +22,6 @@ Currently, `_tak_snapshot()` runs `sudo -u postgres pg_dump -Fc cot` locally on 
 
 ---
 
-## v0.9.3 reminder
+## Reminder — v0.9.3 scope
 
-v0.9.3 is dedicated to the non-root console migration (`takwerx` sudo user). Snapshot/rollback split-server support is explicitly deferred to keep v0.9.3 focused.
+v0.9.3 is dedicated to the non-root console migration (`takwerx` sudo user). Split-server snapshot support is explicitly deferred to v0.9.4 to keep v0.9.3 focused.

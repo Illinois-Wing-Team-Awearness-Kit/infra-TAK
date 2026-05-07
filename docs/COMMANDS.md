@@ -49,14 +49,14 @@ After a VPS reboot, everything that’s **enabled** starts automatically. You do
 
 - SSH in (or use the provider’s web console). Go to your infra-TAK install directory, then run:
   ```bash
-  cd /root/infra-TAK   # or wherever you cloned (e.g. /opt/infra-TAK)
+  cd /home/takwerx/infra-TAK   # or wherever you cloned (e.g. /opt/infra-TAK)
   sudo ./fix-console-after-pull.sh
   ```
   That pins the config path and then runs the password reset script. Enter a new password twice. Then use **`https://<server-IP>:5001`** with the new password.
 
 - If you only need to reset the password (config path is already correct):
   ```bash
-  cd /root/infra-TAK
+  cd /home/takwerx/infra-TAK
   sudo ./reset-console-password.sh
   ```
 
@@ -753,7 +753,7 @@ git checkout dev -- \
   scripts/guarddog/ \
   README.md \
   docs/COMMANDS.md \
-  docs/RELEASE-v0.8.9-alpha.md \
+  docs/RELEASE-v0.9.2-alpha.md \
   docs/EXTERNAL-DEPS.md \
   docs/TESTING-UPDATES.md \
   docs/GUARDDOG.md \
@@ -767,13 +767,16 @@ git checkout dev -- \
   docs/AUTHENTIK-LOGIN-BRANDING.md \
   docs/FED-HUB.md \
   docs/FEDHUB-LOGIN-RUNBOOK.md \
+  docs/NODERED-DEPLOY.md \
+  docs/NODERED-EGRESS.md \
+  docs/NODERED-OPERATIONS.md \
   docs/email-template-user-created-without-password.html \
   docs/TAK_Server_OpenAPI_v0.json \
   docs/EXTERNAL-DB-SETUP.md
 git add -A && git status
 python3 - <<'PY'
 import re, sys
-tag = "v0.8.9-alpha"  # change each release
+tag = "v0.9.2-alpha"  # change each release
 want = tag.lstrip("v")
 app = open("app.py", encoding="utf-8").read()
 m = re.search(r'^VERSION\s*=\s*"([^"]+)"', app, re.M)
@@ -786,9 +789,9 @@ if got != want:
     sys.exit(1)
 print(f"OK: app.py VERSION matches tag ({tag})")
 PY
-git commit -m "v0.8.9-alpha"
+git commit -m "v0.9.2-alpha"
 git push origin main
-git tag v0.8.9-alpha && git push origin v0.8.9-alpha
+git tag v0.9.2-alpha && git push origin v0.9.2-alpha
 git checkout dev
 ```
 

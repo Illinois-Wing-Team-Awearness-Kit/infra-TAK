@@ -6,7 +6,7 @@ Run each command separately (one line at a time). Do not combine commands.
 
 ## Find the correct directory first
 
-The service might not run from `/root/infra-TAK`. **Always check first:**
+The service might not run from `/home/takwerx/infra-TAK`. **Always check first:**
 
 ```bash
 grep WorkingDirectory /etc/systemd/system/takwerx-console.service
@@ -14,7 +14,7 @@ grep WorkingDirectory /etc/systemd/system/takwerx-console.service
 
 Use whatever path that returns. Example output:
 ```
-WorkingDirectory=/root/infra-TAK/infra-TAK
+WorkingDirectory=/home/takwerx/infra-TAK/infra-TAK
 ```
 
 ## Pull latest dev and restart

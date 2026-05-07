@@ -17,7 +17,24 @@ The reboot triggers Guard Dog's boot sequencer, which restarts all containers in
 - Adds `cap_drop: ALL` and `no-new-privileges: true` to Authentik (server, worker, ldap), TAK Portal, and CloudTAK (api, events, media). With `cap_drop: ALL`, even if Copy Fail achieves container root the privilege escalation step fails because no Linux capabilities are available.
 - **Node-RED hardening lands alongside this release**: image pin (`nodered/node-red:4.0` — was `:latest`), `cap_drop: ALL` + `no-new-privileges: true`, `user: 1000:1000`, `mem_limit: 2g`, `restart: unless-stopped`, `env_file: .env` for optional adminAuth. Local deploy also switches to scoped per-file cert mounts (`/opt/tak/certs/files/<name>:/certs/<name>:ro`) instead of mounting the whole `/opt/tak/certs/files` tree. Remote deploy port binding fixed from `0.0.0.0:1880` → `127.0.0.1:1880` (was inconsistent with local). All applied via `_auto_nodered` post-update patcher — operators see `Post-update: Node-RED ...` log lines.
 
-These mitigations are applied automatically to existing running deployments during the post-update migration — no reinstall of Authentik, TAK Portal, or Node-RED is needed. The console log will show `Post-update: Authentik compose hardened`, `Post-update: TAK Portal compose hardened`, and `Post-update: Node-RED compose — adding hardening flags` confirming each change was applied.
+These mitigations are applied automatically to existing running deployments on next "Update Now" — no reinstall of Authentik, TAK Portal, or Node-RED is needed. The console log will show:
+
+```
+Post-update: Authentik — removed docker.sock from worker
+Post-update: Authentik compose hardened — recreating worker/server/ldap
+Post-update: TAK Portal compose hardened — recreating container
+```
+
+To verify after updating:
+
+```bash
+# Must return empty — docker.sock is gone
+docker inspect authentik-worker-1 | grep docker.sock
+
+# Must show CapDrop set on each service
+docker inspect authentik-worker-1 | grep -A5 CapDrop
+docker inspect tak-portal         | grep -A5 CapDrop
+```
 
 ---
 
@@ -172,11 +189,117 @@ Every other `urlopen` call in the file already used `with urllib.request.urlopen
 
 ---
 
+### Security — Console service runs as `takwerx` (non-root)
+
+The infra-TAK console (gunicorn/`app.py`) now runs as a dedicated `takwerx` system user (UID != 0) instead of root. Applied automatically when `sudo ./start.sh` is re-run during update.
+
+**What changes for operators:**
+- `start.sh` creates the `takwerx` user on first run, adds it to `sudo` and `docker` groups, writes `/etc/sudoers.d/takwerx` with `NOPASSWD: ALL`
+- Existing module data (`~/authentik`, `~/CloudTAK`, `~/node-red`, `~/TAK-Portal`) is migrated from `/root/` to `/home/takwerx/` automatically if found
+- `ps aux` will show gunicorn workers owned by `takwerx` instead of `root`
+- The generated systemd units for MediaMTX, mediamtx-webeditor, and the TAK snapshot timer also set `User=takwerx`
+- All operator commands are unchanged — `sudo ./start.sh` still does everything
+
+**Security posture:** `takwerx` has `NOPASSWD: ALL` sudo and is in the `docker` group (equivalent to root for container access), so this is not a strong isolation boundary. The gain is: UID != 0 satisfies common compliance audit tools, and a compromise of the console process does not directly yield a root shell or access to root's SSH keys, history, or authorized_keys.
+
+---
+
+---
+
+## Node-RED hardening + flat-file `nodered` user migration (v0.9.2)
+
+This is a multi-phase project running in parallel with the v0.9.2 feature set. The runtime hardening (Phase 2) ships now and is applied automatically. The cert-identity migration (Phase 1A) is gated on a validation spike the operator runs on the live VPS.
+
+### Background — why admin.pem and why that's a problem
+
+Node-RED uses `/certs/admin.pem` to authenticate to TAK Server's Mission API. This is the same pattern TAK Portal (the official TAK component) uses — TAK Portal also authenticates with the admin cert. The cert works for DataSync because admin is always a mission owner.
+
+The problem isn't the pattern — it's the blast radius. If Node-RED's runtime is compromised (malicious npm contrib, supply-chain attack, attacker through the editor), they get full TAK admin authority over every mission on the server. Before this release there were no egress controls, so a compromised flow could also read the cert off the container filesystem and POST it to an external host.
+
+**Why a scoped cert couldn't just replace admin:** In April 2026, a scoped cert (`nodered-global-datasyncfeed`) was tested and failed. TAK Server 5.x has an unfixed bug — x509 certs that resolve their groups via LDAP get **OUT-only** direction on every group, even when the base group says BOTH. The Mission API write path requires IN direction and returns 403 without it. That bug blocked every previous attempt to use a non-admin cert for DataSync.
+
+### The unlock — flat-file users bypass the LDAP group bug
+
+The `admin` user is defined in `/opt/tak/UserAuthenticationFile.xml` — it's a **flat-file** user, not an LDAP user. Flat-file users declare their groups directly in XML. They never touch the LDAP resolution path that has the bug.
+
+**Hypothesis:** create a flat-file `nodered` user with `ROLE_USER` (not ROLE_ADMIN), generate its cert, and have Node-RED create DataSync missions itself via `PUT /Marti/api/missions/{name}?creatorUid=nodered`. The creator is automatically the owner — no admin involvement, no role-elevation hack.
+
+Whether this works is gated on the **Phase 0 spike** (see below and `docs/SPIKE-flatfile-nodered.md`).
+
+### What ships in v0.9.2 (applies to all installs, no spike needed)
+
+**Container hardening (auto-applied via `_auto_nodered` on next update):**
+- Image pinned: `nodered/node-red:4.0` (was `:latest` — no more uncontrolled updates)
+- `user: 1000:1000` — non-root inside container
+- `cap_drop: [ALL]` + `no-new-privileges:true` — no capability inheritance even if a flow gets container root
+- `mem_limit: 2g` — caps memory against runaway flows
+- `restart: unless-stopped`
+- `env_file: .env` — scaffolds `~/node-red/.env` with commented-out adminAuth vars (opt-in defense-in-depth on top of Caddy+Authentik)
+- Local deploy: scoped per-file cert mounts (only the cert files Node-RED actually uses — not the whole `/opt/tak/certs/files` tree)
+- Remote deploy: port binding fixed to `127.0.0.1:1880` (was `0.0.0.0:1880`)
+
+**Cert preference in `nodered/deploy.sh`:**
+If `/opt/tak/certs/files/nodered.pem` exists on the host, the deploy script now auto-fills `tls_tak` with it instead of `admin.pem`. Falls back to admin otherwise. Existing installs continue working unchanged.
+
+**CoT-level attribution (`nodered/build-flows.js`):**
+Every CoT event Node-RED streams now includes `<__nodered flow="<feedName>"/>` inside `<detail>`. Invisible to ATAK field users (TAK Server parser ignores unknown tags), but lets centralized log collection tie each CoT to a specific Configurator feed even when all feeds share a cert identity.
+
+**New scripts:**
+- `scripts/nodered-egress-firewall.sh` — opt-in iptables egress allowlist. Apply it and a compromised Node-RED container cannot ship a stolen cert off-host. See `docs/NODERED-EGRESS.md`.
+- `scripts/bootstrap-nodered-flatfile.sh` — Phase 1A bootstrap (run only after spike confirms the approach works). Generates cert, edits UserAuthenticationFile.xml safely via Python XML parser, restarts TAK Server, verifies.
+
+**New docs:**
+- `docs/SPIKE-flatfile-nodered.md` — step-by-step Phase 0 test plan
+- `docs/NODERED-EGRESS.md` — egress allowlist guide (iptables and Squid sidecar)
+- `docs/NODERED-DEPLOY.md` — updated with cert priority, Phase 1A migration runbook, adminAuth enable instructions
+- `docs/NODERED-OPERATIONS.md` — Phase 3 runbook: Project mode, package pinning, docker.sock check, logging
+
+### Phase 0 — Validation spike (operator runs this on VPS)
+
+**Before running any of the cert-migration steps**, follow `docs/SPIKE-flatfile-nodered.md`. Six curl tests against the live TAK Server:
+
+| Test | Gate |
+|---|---|
+| T1: `GET /Marti/api/groups/all` with `nodered.pem` | **Critical: must show BOTH IN and OUT for DATASYNC-FEEDS** |
+| T3: stream CoT + `PUT /missions/spike-test/contents` | **Critical: must return 200** |
+| T2, T4, T5, T6 | Confirming tests |
+
+- T1 + T3 pass → **Phase 1A** (migrate to flat-file nodered cert)
+- Either fails → **Phase 1B** (admin cert stays, hardening-only path)
+
+### Phase 1A — Flat-file migration (only if spike passes)
+
+After Phase 0 confirms the approach works:
+
+```bash
+# 1. Generate cert + add nodered to UserAuthenticationFile.xml + restart TAK
+sudo bash scripts/bootstrap-nodered-flatfile.sh apply
+
+# 2. Re-deploy Node-RED — deploys deploy.sh auto-detects nodered.pem and switches tls_tak
+cd ~/infra-TAK && bash nodered/deploy.sh
+
+# 3. In Node-RED editor: TAK Mission API TLS → confirm /certs/nodered.pem → passphrase atakatak → Deploy
+
+# 4. In Configurator: open each feed → set group (DATASYNC-FEEDS) → "Create / verify in TAK"
+#    New missions: nodered becomes owner, no elevation hack needed
+#    Existing admin-owned missions: continue working via elevation hack (which now uses nodered.pem)
+```
+
+**What this achieves:** Node-RED runs on `ROLE_USER` cert, not admin. Missions nodered creates, nodered owns. TAK Server logs show `creatorUid=nodered` instead of `admin`. Blast radius drops from "full TAK admin authority" to "DataSync feeds in the configured group."
+
+### Phase 1B — Fallback if spike fails
+
+Keep `admin.pem`. The runtime hardening (Phase 2) still applies — that's cert-agnostic. The CoT `<__nodered flow="...">` attribution is also in place for log correlation. `docs/SECURITY-AUDIT-v0.2.0-alpha.md` documents why admin is unavoidable on this install, with a link to the spike results.
+
+---
+
 ## Scope discipline — what is NOT in v0.9.2
 
 - Two-server TAK rollback (complex, lower demand)
 - Rolling back TAK Portal or Authentik integrations
 - Rolling back infra-TAK more than one version back
+- Node-RED cert/passphrase rotation runbook (operator decides schedule)
+- Per-feed-group certs (`nodered-fire`, `nodered-weather`, etc.) — single flat-file user is sufficient
 
 ## Version
 

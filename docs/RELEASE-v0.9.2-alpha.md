@@ -191,14 +191,14 @@ Every other `urlopen` call in the file already used `with urllib.request.urlopen
 
 ### Security — Console service runs as `takwerx` (non-root)
 
-The infra-TAK console (gunicorn/`app.py`) now runs as a dedicated `takwerx` system user (UID != 0) instead of root. Applied automatically when `sudo ./start.sh` is re-run during update.
+The infra-TAK console (gunicorn/`app.py`) now runs as a dedicated `takwerx` system user (UID != 0) instead of root. **Applied automatically on "Update Now"** — no SSH or manual `start.sh` re-run required. The post-update migration (`_auto_provision_takwerx`) creates the user, migrates data, updates the service unit, and restarts the console as `takwerx` in one step.
 
 **What changes for operators:**
-- `start.sh` creates the `takwerx` user on first run, adds it to `sudo` and `docker` groups, writes `/etc/sudoers.d/takwerx` with `NOPASSWD: ALL`
+- `takwerx` user is created automatically on first "Update Now" after v0.9.2
 - Existing module data (`~/authentik`, `~/CloudTAK`, `~/node-red`, `~/TAK-Portal`) is migrated from `/root/` to `/home/takwerx/` automatically if found
-- `ps aux` will show gunicorn workers owned by `takwerx` instead of `root`
+- `ps aux` will show gunicorn workers owned by `takwerx` instead of `root` after the restart
 - The generated systemd units for MediaMTX, mediamtx-webeditor, and the TAK snapshot timer also set `User=takwerx`
-- All operator commands are unchanged — `sudo ./start.sh` still does everything
+- All operator commands are unchanged — `sudo ./start.sh` still works and is also idempotent
 
 **Security posture:** `takwerx` has `NOPASSWD: ALL` sudo and is in the `docker` group (equivalent to root for container access), so this is not a strong isolation boundary. The gain is: UID != 0 satisfies common compliance audit tools, and a compromise of the console process does not directly yield a root shell or access to root's SSH keys, history, or authorized_keys.
 

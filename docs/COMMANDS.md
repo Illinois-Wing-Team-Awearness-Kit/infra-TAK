@@ -767,7 +767,6 @@ git checkout dev -- \
   docs/AUTHENTIK-LOGIN-BRANDING.md \
   docs/FED-HUB.md \
   docs/FEDHUB-LOGIN-RUNBOOK.md \
-  docs/NODERED.md \
   docs/email-template-user-created-without-password.html \
   docs/TAK_Server_OpenAPI_v0.json \
   docs/EXTERNAL-DB-SETUP.md

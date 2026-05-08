@@ -211,21 +211,61 @@ docker inspect authentik-ldap-1   | grep -A3 CapDrop
 
 ---
 
-## CloudTAK `about:blank` Debug (pre-test)
+## CloudTAK `about:blank` — Live Debug Session (May 7, 2026)
 
-Before running the CloudTAK reset test, confirm the UI is actually reachable:
+### What was confirmed working
 
-```bash
-# From the server — does Caddy serve the CloudTAK frontend?
-curl -si --connect-timeout 5 http://localhost:5000/ | head -5
-# Should return HTTP 200 with HTML
+```
+# Port 5000 IS listening — docker-proxy bound correctly
+LISTEN 0  4096  0.0.0.0:5000  0.0.0.0:*  users:(("docker-proxy",pid=4001368,fd=8))
+LISTEN 0  4096     [::]:5000     [::]:*   users:(("docker-proxy",pid=4001375,fd=8))
 
-# Does Caddy route to it externally?
-curl -si --connect-timeout 5 https://map.test12.taktical.net/ | head -5
-# If this hangs/times out → Caddy is not routing to CloudTAK
-
-# Check Caddy config has a block for map.<fqdn>
-grep -A5 "map\." /etc/caddy/Caddyfile
+# cloudtak-api-1 is up
+3794eb1f0005  cloudtak-api  Up 7 minutes  80/tcp, 0.0.0.0:5000->5000/tcp
 ```
 
-If Caddy has no block for `map.test12.taktical.net`, the CloudTAK page was never reachable externally — the reset test passed (SQL was fixed), but the UI issue is a separate Caddy config bug.
+Caddy block for `map.test12.taktical.net` IS present and correct:
+```
+map.test12.taktical.net {
+    reverse_proxy 127.0.0.1:5000 {
+        flush_interval -1
+        transport http {
+            read_timeout 120s
+            write_timeout 120s
+```
+
+### What is broken
+
+`curl -si --connect-timeout 5 http://localhost:5000/ | head -5` — **returned nothing / timed out**
+
+The container is bound on port 5000, Caddy is configured correctly, but `http://localhost:5000/` returns no response. CloudTAK API is listening at the network layer but not serving HTTP — likely the Node.js process inside the container is hung or crashed without the container exiting.
+
+`curl -si https://map.test12.taktical.net/ 2>&1` — **timed out** (same root cause — Caddy can't get a response from the upstream)
+
+### What the browser sees
+
+`about:blank` + black spinner — Caddy connects but the upstream never responds, so the browser gets nothing to render.
+
+### Diagnosis steps for tomorrow
+
+```bash
+# Is the Node process actually running inside the container?
+docker exec cloudtak-api-1 ps aux
+
+# Full API logs — look for crash / unhandled exception after the auth reset
+docker logs cloudtak-api-1 --tail 100 2>&1
+
+# Does the API respond at all on its internal port?
+docker exec cloudtak-api-1 curl -si http://localhost:5000/ | head -10
+
+# Try a hard restart of just the API container
+cd ~/cloudtak && docker compose restart api
+# Then immediately test:
+curl -si --connect-timeout 5 http://localhost:5000/ | head -5
+```
+
+### Hypothesis
+
+The auth reset (`UPDATE server SET auth = '{}'::jsonb`) ran at the DB layer. The API container was restarted (`Up 7 minutes` vs `8 hours` for other containers). It's possible the CloudTAK API process started, loaded routes (all `ok - loaded routes/...` lines were present in earlier log output), but then hung or errored when it tried to initialize its TAK Server connection against empty auth — and the hang is inside the HTTP server setup, so port 5000 is bound (docker-proxy) but the Node HTTP listener never started.
+
+The SQL fix itself is confirmed correct. This is a CloudTAK application behavior issue on empty auth — may need the bootstrap wizard to be hit to unblock it, or the API may need the `server` row to have a valid URL even with empty auth.

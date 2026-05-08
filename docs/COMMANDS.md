@@ -212,6 +212,60 @@ TAK Portal is left unbound so all authenticated users see it. No manual steps re
 
 ---
 
+## Caddy — adding custom vhosts / rules
+
+The Caddyfile is regenerated automatically on every domain change, “Update Now”, and deploy. To add custom rules that **survive regeneration**, place them **below** the preservation marker line at the bottom of the file:
+
+```
+# --- User-added blocks (do not remove) ---
+```
+
+Everything below this line is preserved automatically. Do not remove the marker itself.
+
+**Example — health-check vhost for Uptime Robot:**
+
+```caddyfile
+# --- User-added blocks (do not remove) ---
+
+# Plain HTTPS reverse proxy — no auth, no forward_auth
+health.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+**How to edit:** SSH into the server and edit `/etc/caddy/Caddyfile` directly, then reload:
+
+```bash
+sudo nano /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+The marker line is injected automatically by `generate_caddyfile()` if it is not present, so adding it once is enough.
+
+---
+
+## TAK Portal — integration cert download fails (Permission denied)
+
+**Symptom:** TAK Portal → Integrations → Download Certs returns HTTP 400. The TAK Server log shows:
+
+```
+./makeCert.sh: line 6: cert-metadata.sh: Permission denied
+mkdir: cannot create directory '': No such file or directory
+```
+
+**Cause:** `/opt/tak/certs/cert-metadata.sh` is owned by `root:root 600`. `makeCert.sh` runs as user `tak` and cannot read it, so `$DIR` is never set.
+
+**Fix (one-time on affected hosts):**
+
+```bash
+sudo chown tak:tak /opt/tak/certs/cert-metadata.sh
+sudo chmod 600 /opt/tak/certs/cert-metadata.sh
+# verify:
+sudo -u tak bash -c 'cd /opt/tak/certs && . ./cert-metadata.sh && test -n "$DIR" && echo OK'
+```
+
+As of v0.9.3, “Update Now” automatically corrects ownership and mode and runs the source-test, so this is self-healing going forward.
+
 ## Authentik — configurable “home” subdomain
 
 The “home” is the hostname where you open Authentik and see the application tiles (infra-TAK, TAK Portal, Node-RED, MediaMTX, etc.). You can also go directly to e.g. `nodered.<fqdn>` or `stream.<fqdn>` and sign in there; the tiles are just one place to start. **Defaults:** Authentik home = `tak.<fqdn>`, TAK Server WebGUI = `takserver.<fqdn>`. Other service URLs (stream, map, takportal, nodered, etc.) are unchanged.

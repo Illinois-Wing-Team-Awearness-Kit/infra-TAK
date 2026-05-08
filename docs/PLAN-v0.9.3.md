@@ -212,6 +212,60 @@ Note that `generate_caddyfile()` is called on every domain change, deploy, and "
 
 ---
 
+## Bug fix — `cert-metadata.sh` wrong ownership breaks TAK Portal integration cert download
+
+**Source:** Production incident (field report). TAK Portal → Integrations → Download Certs returns **HTTP 400**. On the TAK Server, `makeCert.sh` (invoked as user `tak` via SSH from Portal) fails with:
+
+```
+./makeCert.sh: line 6: cert-metadata.sh: Permission denied
+mkdir: cannot create directory '': No such file or directory
+```
+
+The empty `mkdir` failure is a follow-on: `makeCert.sh` sources `cert-metadata.sh` on line 6 to populate variables including `DIR`. If that source fails because `tak` cannot read the file, `DIR` is never set and `mkdir -p "$DIR"` collapses to an empty path.
+
+**Root cause:** `cert-metadata.sh` ends up owned by `root:root` with mode `600` after infra-TAK (or an operator) edits or replaces it as root (e.g. a deploy script, `sudo nano`, or file copy). The surrounding files (`makeCert.sh`, `config.cfg`) stay `tak:tak`, so only `cert-metadata.sh` is broken. `tak` cannot read it; cert issuance fails entirely.
+
+**Operational one-liner (affected hosts):**
+```bash
+sudo chown tak:tak /opt/tak/certs/cert-metadata.sh
+sudo chmod u=rw,go= /opt/tak/certs/cert-metadata.sh
+# verify:
+sudo -u tak bash -c 'cd /opt/tak/certs && . ./cert-metadata.sh && test -n "$DIR" && echo OK'
+```
+
+### What needs to happen
+
+**1. Idempotent postcondition in any path that writes `cert-metadata.sh`**
+
+Any function in `app.py` that creates, templates, or overwrites `/opt/tak/certs/cert-metadata.sh` must finish with:
+```bash
+chown tak:tak /opt/tak/certs/cert-metadata.sh && chmod 600 /opt/tak/certs/cert-metadata.sh
+```
+This applies to initial provisioning, domain change, TAK update, and any other code path that touches that file.
+
+**2. Post-update validation task — `_validate_cert_metadata_permissions()`**
+
+Add a validation step (called from `_run_post_update()`) that:
+- Checks ownership and mode of `/opt/tak/certs/cert-metadata.sh`
+- If wrong: corrects it and logs a warning
+- Runs the non-destructive source test as `tak` (`sudo -u tak bash -c 'cd /opt/tak/certs && . ./cert-metadata.sh && test -n "$DIR"'`) and surfaces a UI alert if it still fails
+
+**3. Fleet remediation**
+
+Any box running a prior version may have the stale ownership. The v0.9.3 "Update Now" post-update hook must detect and fix it automatically — operators who never noticed the breakage (e.g. not using TAK Portal integration certs) should have it silently corrected.
+
+**4. COMMANDS.md — document the symptom**
+
+Add a troubleshooting entry:
+> **Symptom:** TAK Portal → Integrations → Download Certs returns 400. TAK Server log shows `cert-metadata.sh: Permission denied` or `mkdir: cannot create directory ''`.  
+> **Cause:** `/opt/tak/certs/cert-metadata.sh` is owned by `root:root 600`. `makeCert.sh` runs as user `tak` and cannot read it.  
+> **Fix:** `sudo chown tak:tak /opt/tak/certs/cert-metadata.sh && sudo chmod 600 /opt/tak/certs/cert-metadata.sh`, then re-test from Portal.
+
+### What this does NOT cover
+- TAK Portal API error surfacing (optional UX improvement tracked separately in TAK-Portal repo — map SSH stderr patterns to a short actionable message rather than a generic 400)
+
+---
+
 ## Out of scope for v0.9.3
 - Split-server snapshot/rollback (→ v0.9.4)
 - Per-feed Node-RED certs (→ future)

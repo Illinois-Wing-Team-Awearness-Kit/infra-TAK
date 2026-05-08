@@ -218,9 +218,7 @@ Every CoT event Node-RED streams now includes `<__nodered flow="<feedName>"/>` i
 - `scripts/nodered-egress-firewall.sh` — opt-in iptables egress allowlist. See `docs/NODERED-EGRESS.md`.
 
 **New docs:**
-- `docs/NODERED-EGRESS.md` — egress allowlist guide (iptables and Squid sidecar)
-- `docs/NODERED-DEPLOY.md` — cert priority, adminAuth enable instructions
-- `docs/NODERED-OPERATIONS.md` — Project mode, package pinning, docker.sock check, logging
+- `docs/NODERED.md` — full operations reference: deploy, container hardening, ongoing ops, egress filtering
 
 ---
 

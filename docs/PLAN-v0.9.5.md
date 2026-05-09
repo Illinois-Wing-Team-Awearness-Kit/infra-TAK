@@ -40,3 +40,16 @@ The **Download** button (added v0.9.2) lets operators save a snapshot `.tar.gz` 
   - Returns the new snapshot label on success
 - Once extracted, the snapshot appears in the table like any locally-created one and the existing **Rollback** button works without any changes
 - No streaming write concern — uploads are operator-initiated, infrequent, and bounded by snapshot size
+
+---
+
+## Console Rollback — move banner to Guard Dog page
+
+The yellow console rollback banner currently lives on the Console (home) page. It clutters the most-visited page and is better suited to Guard Dog, which is already the home for health, recovery, and maintenance actions.
+
+**Plan:**
+
+- Remove the rollback banner from the Console page entirely
+- Add a **Console Rollback** section to the Guard Dog page: shows the previous version (if any), the "Roll back to vX.X.X" button, and the same logic that currently drives the banner
+- The rollback action itself (`POST /api/console/rollback`) is unchanged — only the UI surface moves
+- If no previous version is recorded (fresh install or settings cleared), the section shows a greyed-out "No previous version available" state rather than hiding completely

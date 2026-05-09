@@ -2,91 +2,107 @@
 
 ## What happened
 
-Authentik's background task system (LDAP sync, policy evaluation, etc.) writes a record to `authentik_tasks_task` and `authentik_tasks_tasklog` on every task run. At the default 5-minute LDAP sync interval, one month of operation generates hundreds of thousands of rows. These tables had grown to:
+Authentik's background task system writes a record to `authentik_tasks_task` and `authentik_tasks_tasklog` on every task run. These tables are never automatically purged. After a month of normal operation they can grow to 500–900 MB (88%+ of the Authentik DB), causing checkpoint and background writer CPU spikes that peg the machine.
 
-| Table | Size | Rows |
-|---|---|---|
-| `authentik_tasks_tasklog` | 492 MB | 1,806,861 |
-| `authentik_tasks_task` | 391 MB | 538,780 |
-
-Combined: **883 MB — 88% of the entire Authentik database.** The `authentik_tasks_tasklog` table had never been vacuumed. The constant heavy writes caused checkpoint and background writer pressure that pegged the machine.
-
-The Authentik container restart temporarily relieved the pressure. These steps clear the backlog so it doesn't come back.
+Additionally, Docker's default `/dev/shm` for containers is 64 MB. PostgreSQL 16 needs slightly more than that to run `VACUUM ANALYZE`, so you must increase the container's shm size first.
 
 ---
 
-## Fix — run these four commands in order
+## Fix — run these steps in order
 
-### Step 1 — VACUUM to clear dirty pages from the restart
+### Step 1 — Increase the container shm size
 
-```bash
-docker exec -it authentik-postgresql-1 psql -U authentik -c 'VACUUM ANALYZE;'
+Find the Authentik compose file:
+
+```
+find /root -name "docker-compose.yml" 2>/dev/null
 ```
 
-Takes a few minutes. You can watch CPU settle in a second terminal:
+Open it and add `shm_size: 256m` to the `postgresql` service:
 
-```bash
-watch -n2 "ps aux | sort -rk3 | grep postgres | head -5"
+```
+services:
+  postgresql:
+    image: docker.io/library/postgres:16-alpine
+    shm_size: 256m
+    ...
+```
+
+Recreate the container to apply it:
+
+```
+cd ~/authentik
+docker compose up -d --force-recreate postgresql
+```
+
+Wait for it to come back healthy:
+
+```
+docker ps | grep postgres
 ```
 
 ---
 
 ### Step 2 — Delete task records older than 30 days
 
-```bash
-docker exec -it authentik-postgresql-1 psql -U authentik -c "
+Use a heredoc to avoid quote issues:
+
+```
+docker exec -i authentik-postgresql-1 psql -U authentik << 'EOF'
 DELETE FROM authentik_tasks_tasklog
 WHERE task_id IN (
   SELECT pk FROM authentik_tasks_task
   WHERE finish_timestamp < NOW() - INTERVAL '30 days'
 );
 DELETE FROM authentik_tasks_task
-WHERE finish_timestamp < NOW() - INTERVAL '30 days';"
+WHERE finish_timestamp < NOW() - INTERVAL '30 days';
+EOF
 ```
 
-This will delete the bulk of the 1.8M tasklog rows and 538K task rows. Safe to run live — no Authentik functionality depends on historical task records.
+This deletes the bulk of the bloated rows. Safe to run live — no Authentik functionality depends on historical task records.
 
 ---
 
-### Step 3 — VACUUM again after the deletes
+### Step 3 — VACUUM ANALYZE
 
-```bash
-docker exec -it authentik-postgresql-1 psql -U authentik -c 'VACUUM ANALYZE;'
+```
+docker exec -i authentik-postgresql-1 psql -U authentik << 'EOF'
+VACUUM ANALYZE;
+EOF
 ```
 
-This reclaims the disk space freed by Step 2. The Authentik DB should drop from ~1 GB to well under 100 MB.
+Takes a few minutes. Watch CPU settle in a second terminal:
+
+```
+watch -n2 "ps aux | sort -rk3 | grep postgres | head -5"
+```
 
 ---
 
 ### Step 4 — Verify
 
-```bash
-docker exec -it authentik-postgresql-1 psql -U authentik -c "
+```
+docker exec -i authentik-postgresql-1 psql -U authentik << 'EOF'
 SELECT relname,
        pg_size_pretty(pg_total_relation_size(relid)) AS total_size,
        n_live_tup, n_dead_tup,
        last_autovacuum
 FROM pg_stat_user_tables
 ORDER BY pg_total_relation_size(relid) DESC
-LIMIT 5;"
+LIMIT 5;
+EOF
 ```
 
-`authentik_tasks_tasklog` and `authentik_tasks_task` should now show sizes in the low MB range.
+`authentik_tasks_tasklog` and `authentik_tasks_task` should now show sizes in the low MB range and the Authentik DB should be well under 200 MB total.
 
 ---
 
 ## Why this happened
 
-Authentik creates task records on every LDAP sync cycle. At the default 5-minute sync interval, a single month of operation generates:
+Authentik runs background tasks continuously (certificate checks, outpost health, policy evaluation, session cleanup, etc.). Each task run writes records to both tables. With no automatic cleanup, these accumulate over weeks until the constant write volume causes heavy checkpoint pressure and background writer CPU spikes.
 
-- 30 days × 24h × 12 syncs/hour = ~8,600 sync cycles
-- Multiple task + tasklog records per cycle (user sync, group sync, membership resolution)
-- No automatic cleanup of old completed task records
-
-The `authentik_tasks_tasklog` table triggers autovacuum when dead tuples exceed 20% of its row count — at 1.8M rows that threshold is 360K dead tuples, which it hadn't reached yet. So autovacuum never ran on it, and the write pressure from continuous inserts caused the background writer to spike.
+The `authentik_tasks_tasklog` table had never been autovacuumed because Postgres autovacuum only triggers when dead tuples exceed 20% of live row count — at 1.8M rows that threshold is 360K dead tuples, which it hadn't hit yet. So autovacuum never fired on it despite the table dominating the database.
 
 ## Will this come back?
 
-It will grow again slowly — that is normal. Authentik tasks are supposed to accumulate and Postgres handles it fine at a moderate volume. As long as VACUUM ANALYZE runs periodically (autovacuum handles this automatically once the table is at a normal size), it won't spike like this again.
-
-If you want to be proactive, set a cron or systemd timer to run the Step 2 DELETE monthly. The Guard Dog auto-vacuum timer (`tak-auto-vacuum.sh`) handles the TAK Server cot database — a similar approach for the Authentik DB is worth adding if this recurs.
+A weekly cleanup timer is planned for v0.9.5 that will run this automatically. Until that ships, you can re-run Steps 2 and 3 manually any time the task tables grow large again.

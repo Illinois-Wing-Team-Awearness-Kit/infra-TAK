@@ -18,11 +18,13 @@
 
    **Fix (shipped):** `_cloudtak_fix_nginx_user()` helper patches `user nginx;` → `user root;` in the generated nginx.conf and reloads workers. Called after every API container start/restart in: `cloudtak_reset_server_config`, `run_cloudtak_redeploy`, `run_cloudtak_update`, `cloudtak_control` (start/restart).
 
-### Feature A — CPU/RAM Refresh button JS SyntaxError
+### Feature A — CPU/RAM Refresh button JS SyntaxError (two-stage fix)
 
-`font-family:\'JetBrains Mono\',monospace` inside a single-quoted JavaScript string produced `SyntaxError: Unexpected string` at parse time, leaving `toggleResourceBreakdown` and `refreshResourceBreakdown` undefined — "What's using CPU/RAM?" did nothing.
+**Bug 1 (first attempt):** `font-family:\'JetBrains Mono\',monospace` inside a JavaScript string was believed to be the cause.
 
-**Fix (shipped):** Removed the redundant `font-family` from the refresh button style (inherits from parent div).
+**Bug 2 (root cause):** `refreshBtn` was built with `\'` escape sequences inside Python's triple-quoted `CONSOLE_TEMPLATE`. Python resolves `\'` → `'` before rendering, turning `'...(\''+hostId+'\'')"...'` into adjacent string literals `'...(''` with no `+` operator — `SyntaxError: Unexpected string`. Both `toggleResourceBreakdown` and `refreshResourceBreakdown` were undefined.
+
+**Fix (shipped):** Switched `refreshBtn` to a JavaScript template literal (backtick string) so `${hostId}` handles the variable substitution with no quote escaping needed.
 
 ---
 
@@ -37,6 +39,16 @@ The following items from `docs/TEST-v0.9.3-alpha.md` were not reached before v0.
 - Feature D — Authentik Domain Migration audit panel + pre-flight confirm dialog
 - Feature E — Caddy Custom Blocks hint (UI + COMMANDS.md section)
 - Feature F — Container hardening audit (CapDrop verification in logs)
+
+---
+
+### Feature B — MediaMTX RTSP Jail UI gaps (found during testing 2026-05-09)
+
+1. **"Currently Watching" stat has no expand panel** — shows a count (e.g. 10) but there's no onclick/caret to reveal which IPs fail2ban is watching. TAK Server jail has `toggleWatchingPanel()` for its equivalent stat; MediaMTX jail never received this.
+
+2. **"Currently Banned" caret hidden at 0** — `caret.textContent` is set to `''` when `ips.length === 0`, making the stat card look non-interactive even though clicking it does open the (empty) ban panel.
+
+**Fix needed:** Add a watching panel + `toggleMtxWatchingPanel()` to the MediaMTX jail section; keep the `▼ details` caret visible at all counts (show count in parentheses or just always show it).
 
 ---
 

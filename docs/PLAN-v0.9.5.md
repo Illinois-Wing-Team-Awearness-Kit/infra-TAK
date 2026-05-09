@@ -74,7 +74,7 @@ WHERE finish_timestamp < NOW() - INTERVAL '30 days';
 VACUUM ANALYZE;
 ```
 
-Timer should run once a month at a low-traffic time (e.g. 03:00 on the 1st). Console UI shows last-run timestamp on the Guard Dog page alongside the existing CoT DB auto-vacuum entry.
+Timer should run weekly at a low-traffic time (e.g. Sunday 03:00). Console UI shows last-run timestamp on the Guard Dog page alongside the existing CoT DB auto-vacuum entry.
 
 ---
 

@@ -2,54 +2,41 @@
 
 > Not yet implemented. This is a planning document.
 
-Non-root console migration was originally scoped for v0.9.3 but pulled to keep that release focused on MediaMTX Fail2ban, container hardening fixes, and the kernel patch banner.
+---
+
+## TAK Server Snapshots — split / two-server support
+
+Currently, `_tak_snapshot()` runs `sudo -u postgres pg_dump -Fc cot` locally on the console host. In a standard single-server deployment this is correct — postgres is co-located with the TAK Server application. In a **split (two-server) deployment**, the PostgreSQL database lives on Server One while the infra-TAK console runs on Server Two. The local pg_dump either fails (no local postgres) or captures nothing useful.
+
+**Plan:**
+
+- `_tak_snapshot()` checks `settings.tak_two_server` — if true, uses the existing `server_one` SSH key/host config to stream the pg_dump from Server One:
+  ```bash
+  ssh server_one "sudo -u postgres pg_dump -Fc cot" > /opt/tak/snapshots/<label>/cot.pgdump
+  ```
+- `_tak_rollback()` checks the same flag — if true, streams the `.pgdump` back to Server One via SSH and runs `pg_restore` there instead of locally.
+- Config files (CoreConfig.xml, UserAuthenticationFile.xml, /etc/default/takserver, certs/) already live on Server Two — those snapshot/restore steps are unchanged.
+- The two-server SSH infrastructure (`server_one` config, `_ssh_probe()`, key management) is already in place and will be reused.
+
+**Current behavior on split deployments (v0.9.2–v0.9.4):** snapshot captures config files and certs correctly but skips the database dump, making rollback fail with `has no cot.pgdump`. Operators on split deployments should use manual `pg_dump` on Server One until v0.9.5 ships.
 
 ---
 
-## Non-root console migration (`takwerx` sudo user)
+## TAK Server Snapshots — Upload & Restore
 
-Move the infra-TAK console off root. The scaffolding is already in `app.py` from v0.9.2 (`_sudo_wrap`, `_write_priv`, `_read_priv` helpers), but the actual provisioning and service migration was pulled from v0.9.2 to keep that release stable.
+The **Download** button (added v0.9.2) lets operators save a snapshot `.tar.gz` off-box. There is currently no way to push that archive back and restore from it — making off-box backups useful only as archival copies, not as a real disaster-recovery path.
 
-### What needs to happen
+**Use cases:**
+- VPS is destroyed / unrecoverable — spin up a new host, upload last good snapshot, restore
+- Migrating TAK Server to a different VPS
+- Restoring a snapshot that has already been pruned from the server by the retention policy
 
-**1. User provisioning (`provision_takwerx`)**
-- Create system user `takwerx` with a home directory
-- Add to `sudo` group with a targeted `NOPASSWD` sudoers entry covering only the commands the console needs (e.g. `systemctl`, `docker`, `pg_dump`, `apt`)
-- Generate SSH key for the user if needed
+**Plan:**
 
-**2. Service migration**
-- Update the systemd unit (`/etc/systemd/system/takwerx-console.service`) to run as `User=takwerx`
-- Set correct `WorkingDirectory` and `ExecStart` paths under `/home/takwerx/`
-- Fix the Python venv shebang paths so they work under the new user
-
-**3. File ownership / directory move**
-- Move (or symlink) the infra-TAK install directory from `/root/infra-TAK` to `/home/takwerx/infra-TAK`
-- Move all module directories (`/root/CloudTAK`, `/root/TAK-Portal`, etc.) or update settings to point to new paths
-- Ensure Guard Dog scripts (`tak-post-start.sh`, `tak-boot-sequencer.sh`, etc.) have no hardcoded `/root/` paths — already cleaned in v0.9.2
-
-**4. `start.sh` automation**
-- `start.sh` should detect if running as root and automatically provision `takwerx`, migrate dirs, rewrite the service unit, and restart as the new user — all in one pass
-- Must be idempotent — safe to re-run
-
-**5. Update path**
-- Existing operators on root need a clean migration path via "Update Now" or a one-time migration script
-- The console should show a banner if still running as root post-v0.9.5, prompting the operator to run the migration
-
-### Scaffolding already in place (v0.9.2)
-- `_sudo_wrap(cmd)` — wraps a shell command with `sudo` when console is not root
-- `_write_priv(path, content)` — writes to privileged paths via sudo
-- `_read_priv(path)` — reads privileged paths via sudo
-- `_find_settings()` — path-agnostic settings file discovery (works from any user's home)
-
-### Key lessons from the failed v0.9.2 attempt
-- The venv shebang (`/root/infra-TAK/venv/bin/python`) is hardcoded and breaks under a different user — must be rebuilt or symlinked
-- `WorkingDirectory` in the systemd unit must match the actual install path exactly
-- `cap_drop` on the Docker socket is irrelevant here — the issue was purely path and permission
-- Do not `chown` the entire repo tree mid-process while the console is running from it
-- Test the new service unit manually (`systemd-run --uid=takwerx ...`) before committing the unit file
-
----
-
-## Out of scope for v0.9.5
-- Split-server snapshot/rollback (→ v0.9.4)
-- Per-feed Node-RED certs (→ future)
+- Add an **Upload Snapshot** button in the Snapshots & Recovery section (file input, accepts `.tar.gz`)
+- Backend endpoint `POST /api/takserver/snapshot/upload`:
+  - Validates the archive contains the expected structure (`cot.pgdump`, `CoreConfig.xml`, `certs/` etc.)
+  - Extracts to `/opt/tak/snapshots/<label>/` (label derived from archive name, de-duped if needed)
+  - Returns the new snapshot label on success
+- Once extracted, the snapshot appears in the table like any locally-created one and the existing **Rollback** button works without any changes
+- No streaming write concern — uploads are operator-initiated, infrequent, and bounded by snapshot size

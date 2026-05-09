@@ -1,48 +1,47 @@
-# v0.9.4 — Feature Plan
+# v0.9.4 — Hotfix Plan
 
-> Not yet implemented. This is a planning document.
-
----
-
-## TAK Server Snapshots — split / two-server support
-
-Currently, `_tak_snapshot()` runs `sudo -u postgres pg_dump -Fc cot` locally on the console host. In a standard single-server deployment this is correct — postgres is co-located with the TAK Server application. In a **split (two-server) deployment**, the PostgreSQL database lives on Server One while the infra-TAK console runs on Server Two. The local pg_dump either fails (no local postgres) or captures nothing useful.
-
-**Plan:**
-
-- `_tak_snapshot()` checks `settings.tak_two_server` — if true, uses the existing `server_one` SSH key/host config to stream the pg_dump from Server One:
-  ```bash
-  ssh server_one "sudo -u postgres pg_dump -Fc cot" > /opt/tak/snapshots/<label>/cot.pgdump
-  ```
-- `_tak_rollback()` checks the same flag — if true, streams the `.pgdump` back to Server One via SSH and runs `pg_restore` there instead of locally.
-- Config files (CoreConfig.xml, UserAuthenticationFile.xml, /etc/default/takserver, certs/) already live on Server Two — those snapshot/restore steps are unchanged.
-- The two-server SSH infrastructure (`server_one` config, `_ssh_probe()`, key management) is already in place and will be reused.
-
-**Current behavior on split deployments (v0.9.2–v0.9.3):** snapshot captures config files and certs correctly but skips the database dump, making rollback fail with `has no cot.pgdump`. Operators on split deployments should use manual `pg_dump` on Server One until v0.9.4 ships.
+> v0.9.3 shipped to main before testing was complete. v0.9.4 closes the bugs found during post-release testing and completes the remaining v0.9.3 test checklist items.
 
 ---
 
-## TAK Server Snapshots — Upload & Restore
+## Bug fixes carried over from v0.9.3 testing
 
-The **Download** button (added v0.9.2) lets operators save a snapshot `.tar.gz` off-box. There is currently no way to push that archive back and restore from it — making off-box backups useful only as archival copies, not as a real disaster-recovery path.
+### CloudTAK Reset Config — full connection reset + nginx worker fix
 
-**Use cases:**
-- VPS is destroyed / unrecoverable — spin up a new host, upload last good snapshot, restore
-- Migrating TAK Server to a different VPS
-- Restoring a snapshot that has already been pruned from the server by the retention policy
+**Bugs found during tak-10 testing (2026-05-09):**
 
-**Plan:**
+1. **SQL only cleared `auth`, not the connection URL** — Reset config only ran `UPDATE server SET auth = '{}'::jsonb`. With `url`, `api`, and `webtak` still populated, the CloudTAK API attempted a TAK Server connection on restart with no credentials. The Node.js event loop blocked on the failed SSL connection, making every HTTP request hang indefinitely (`map.<fqdn>` → `about:blank`).
 
-- Add an **Upload Snapshot** button in the Snapshots & Recovery section (file input, accepts `.tar.gz`)
-- Backend endpoint `POST /api/takserver/snapshot/upload`:
-  - Validates the archive contains the expected structure (`cot.pgdump`, `CoreConfig.xml`, `certs/` etc.)
-  - Extracts to `/opt/tak/snapshots/<label>/` (label derived from archive name, de-duped if needed)
-  - Returns the new snapshot label on success
-- Once extracted, the snapshot appears in the table like any locally-created one and the existing **Rollback** button works without any changes
-- No streaming write concern — uploads are operator-initiated, infrequent, and bounded by snapshot size
+   **Fix (shipped):** Reset SQL now clears all four fields: `UPDATE server SET auth = '{}'::jsonb, url = '', api = '', webtak = '' WHERE id = 1;`
+
+2. **nginx workers crash on every container start (exit code 2)** — The CloudTAK container image's `nginx.conf.js` generates `user nginx;`. Workers immediately fail to write to `/dev/stdout`/`/dev/stderr` after dropping root privileges and die. The nginx master stays alive with zero workers — port 5000 accepts TCP connections but never serves a response (`about:blank` in browser).
+
+   **Fix (shipped):** `_cloudtak_fix_nginx_user()` helper patches `user nginx;` → `user root;` in the generated nginx.conf and reloads workers. Called after every API container start/restart in: `cloudtak_reset_server_config`, `run_cloudtak_redeploy`, `run_cloudtak_update`, `cloudtak_control` (start/restart).
+
+### Feature A — CPU/RAM Refresh button JS SyntaxError
+
+`font-family:\'JetBrains Mono\',monospace` inside a single-quoted JavaScript string produced `SyntaxError: Unexpected string` at parse time, leaving `toggleResourceBreakdown` and `refreshResourceBreakdown` undefined — "What's using CPU/RAM?" did nothing.
+
+**Fix (shipped):** Removed the redundant `font-family` from the refresh button style (inherits from parent div).
 
 ---
 
-## Reminder — v0.9.3 scope
+## Remaining v0.9.3 test items to complete in v0.9.4
 
-v0.9.3 is dedicated to the non-root console migration (`takwerx` sudo user). Split-server snapshot support is explicitly deferred to v0.9.4 to keep v0.9.3 focused.
+The following items from `docs/TEST-v0.9.3-alpha.md` were not reached before v0.9.3 shipped:
+
+- Bug Fix 2 — `cert-metadata.sh` ownership auto-fix
+- Feature A — CPU/RAM Refresh button (JS fix shipped; needs live re-test)
+- Feature B — MediaMTX RTSP Fail2ban jail (enable/disable, thresholds, post-update auto-install)
+- Feature C — Kernel Patch Banner (API + dismiss behavior)
+- Feature D — Authentik Domain Migration audit panel + pre-flight confirm dialog
+- Feature E — Caddy Custom Blocks hint (UI + COMMANDS.md section)
+- Feature F — Container hardening audit (CapDrop verification in logs)
+
+---
+
+## Scope discipline — what is NOT in v0.9.4
+- Split-server snapshot/rollback (→ v0.9.5)
+- Non-root console migration (→ v0.9.6)
+- RTSPS (port 8322) MediaMTX jail (→ future)
+- Per-feed Node-RED certs (→ future)

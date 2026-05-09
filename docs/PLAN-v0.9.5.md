@@ -4,6 +4,31 @@
 
 ---
 
+## Bug Fix — CloudTAK initial deploy hangs at "Waiting for CloudTAK API"
+
+**Problem:** Fresh CloudTAK installs get stuck at Step 6/7 for up to 15 minutes then fail. Diagnostic shows `RemoteDisconnected: Remote end closed connection without response`. The `docker-compose.override.yml` we write for hardening includes `cap_drop: ALL` on the `api` service. The CloudTAK container image generates `user nginx;` in `nginx.conf` at startup — nginx workers immediately fail to open `/dev/stdout`/`/dev/stderr` after dropping privileges and die with exit code 2. The nginx master stays alive but cannot serve requests, so the health check never gets a 200/401/403/404.
+
+**Root cause:** `_cloudtak_fix_nginx_user()` was already patching `user nginx;` → `user root;` and reloading workers, but was only called in the update and manual-restart paths — not in `run_cloudtak_deploy()` after the initial `docker compose up -d`.
+
+**Fix (already applied to `app.py`):** Added `_cloudtak_fix_nginx_user()` call with a 5-second settle delay immediately after `docker compose up -d --force-recreate` succeeds in `run_cloudtak_deploy()`:
+
+```python
+plog("✓ Containers started")
+plog("✓ Restart complete.")
+# Patch nginx user directive so workers can write to /dev/stdout with cap_drop: ALL
+time.sleep(5)
+_cloudtak_fix_nginx_user()
+plog("  Nginx user directive patched, workers reloaded")
+```
+
+**To unblock a currently-hanging install** (run on the server while step 6 is waiting):
+```bash
+docker exec cloudtak-api-1 sed -i "s/^user nginx;/user root;/" /etc/nginx/nginx.conf \
+  && docker exec cloudtak-api-1 nginx -s reload
+```
+
+---
+
 ## TAK Server Snapshots — split / two-server support
 
 Currently, `_tak_snapshot()` runs `sudo -u postgres pg_dump -Fc cot` locally on the console host. In a standard single-server deployment this is correct — postgres is co-located with the TAK Server application. In a **split (two-server) deployment**, the PostgreSQL database lives on Server One while the infra-TAK console runs on Server Two. The local pg_dump either fails (no local postgres) or captures nothing useful.

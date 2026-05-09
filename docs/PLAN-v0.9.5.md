@@ -43,6 +43,41 @@ The **Download** button (added v0.9.2) lets operators save a snapshot `.tar.gz` 
 
 ---
 
+## Authentik Postgres — `shm_size` and task log retention
+
+Two related hardening items surfaced from a field operator hitting Postgres pegged-CPU on v0.9.4.
+
+### 1. Add `shm_size` to the Authentik compose template
+
+Docker's default `/dev/shm` for containers is 64 MB. PostgreSQL 16 (`postgres:16-alpine`) needs slightly more than 64 MB for `VACUUM ANALYZE` with parallel workers, causing:
+
+```
+ERROR: could not resize shared memory segment to 67145504 bytes: No space left on device
+```
+
+**Fix:** add `shm_size: 256m` to the `postgresql` service in the generated Authentik `docker-compose.yml` (both the template in `app.py` and the `_auto_harden_containers()` patcher that runs on "Update Now" for existing installs).
+
+### 2. Monthly Authentik task log cleanup — Guard Dog timer
+
+Authentik writes a record to `authentik_tasks_task` and `authentik_tasks_tasklog` on every background task run. These tables are never automatically purged. After ~1 month of normal operation they can grow to 500–900 MB (88%+ of the Authentik DB), causing autovacuum lag and background writer CPU spikes.
+
+**Fix:** add a Guard Dog systemd timer (monthly, similar to `tak-auto-vacuum.sh`) that runs inside the Authentik postgres container:
+
+```sql
+DELETE FROM authentik_tasks_tasklog
+WHERE task_id IN (
+  SELECT pk FROM authentik_tasks_task
+  WHERE finish_timestamp < NOW() - INTERVAL '30 days'
+);
+DELETE FROM authentik_tasks_task
+WHERE finish_timestamp < NOW() - INTERVAL '30 days';
+VACUUM ANALYZE;
+```
+
+Timer should run once a month at a low-traffic time (e.g. 03:00 on the 1st). Console UI shows last-run timestamp on the Guard Dog page alongside the existing CoT DB auto-vacuum entry.
+
+---
+
 ## Console Rollback — move banner to Guard Dog page
 
 The yellow console rollback banner currently lives on the Console (home) page. It clutters the most-visited page and is better suited to Guard Dog, which is already the home for health, recovery, and maintenance actions.

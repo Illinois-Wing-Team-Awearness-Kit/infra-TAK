@@ -107,7 +107,7 @@ The list lives in `start.sh` (apt + pip) — no `requirements.txt` is committed 
 
 ## Versioning
 
-- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.5-alpha` on `main` and `dev`).
+- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.6-alpha` on `main` and `dev`).
 - Sidebar shows the running version. Mismatch with the "Latest release" line in the README's top-of-file pointer indicates the customer is behind.
 - Tags are pushed to GitHub when a release is shipped (`v0.9.4-alpha`). Pushing the tag is what triggers the in-product "Update Available" banner on customer installs (the customer's console polls GitHub releases).
 - Update flow: customer clicks "Update Now" → console does `git fetch && git reset --hard origin/main` (or `dev` for testers) → restarts → `_run_post_update()` runs the migration ladder.
@@ -139,6 +139,18 @@ The rule: before adding `cap_drop` to any service, verify the container doesn't 
 ## Fail2ban / Scheduler toggle pattern
 
 The `*-toggle-track` spans must NOT have `onclick` — they are already inside a `<label>` that natively toggles the checkbox on click. Adding `onclick=".click()"` causes double-fire (onchange fires twice per click), making disable impossible. As of v0.9.5, all 7 track spans have no onclick.
+
+## Authentik Postgres — two-cluster setup and known maintenance issues
+
+There are **two completely separate Postgres clusters** on every infra-TAK install with Authentik:
+
+1. **TAK Server Postgres** — runs on the host as the `postgres` OS user, holds the `cot` database. Guard Dog auto-vacuum and the POSTGRES-DIAGNOSTICS.md runbook target this cluster. Generally healthy.
+
+2. **Authentik Postgres** — runs inside `authentik-postgresql-1` Docker container (UID 70, `postgres:16-alpine`). Separate DB, separate process, separate config. All Authentik psql commands must go through `docker exec authentik-postgresql-1 psql -U authentik`.
+
+**Known recurring issue — task log bloat:** `authentik_tasks_task` and `authentik_tasks_tasklog` grow unbounded (~500–900 MB after 1 month). The `takauthentiktasklogpurge.timer` (v0.9.5+) handles weekly cleanup. `_authentik_tasklog_cleanup()` (v0.9.6+) also runs the DELETE + VACUUM on "Update Now" if either table exceeds 100 MB — clears the one-time backlog on first update.
+
+**`shm_size: 256m` required on `postgresql` service** — Docker's 64 MB default `/dev/shm` is too small for `VACUUM ANALYZE` with parallel workers in postgres:16-alpine. `_auto_harden_containers()` (v0.9.5) added this to the compose file but had a bug (v0.9.5 regression): it only ran `--force-recreate worker server ldap`, never `postgresql`. Fixed in v0.9.6: runtime check via `docker inspect HostConfig.ShmSize` — if still 67108864 (64 MB), recreates `postgresql` first then `worker server ldap`.
 
 ## Things that are NOT in scope (yet)
 

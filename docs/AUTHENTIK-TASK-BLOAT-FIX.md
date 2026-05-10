@@ -51,13 +51,15 @@ Use a heredoc to avoid quote issues:
 docker exec -i authentik-postgresql-1 psql -U authentik << 'EOF'
 DELETE FROM authentik_tasks_tasklog
 WHERE task_id IN (
-  SELECT pk FROM authentik_tasks_task
-  WHERE finish_timestamp < NOW() - INTERVAL '30 days'
+  SELECT message_id FROM authentik_tasks_task
+  WHERE mtime < NOW() - INTERVAL '30 days'
 );
 DELETE FROM authentik_tasks_task
-WHERE finish_timestamp < NOW() - INTERVAL '30 days';
+WHERE mtime < NOW() - INTERVAL '30 days';
 EOF
 ```
+
+> **Schema note (Authentik 2026.x):** The task table PK is `message_id` (not `pk`) and the timestamp column is `mtime` (not `finish_timestamp`). The tasklog FK `task_id` references `authentik_tasks_task(message_id)`.
 
 This deletes the bulk of the bloated rows. Safe to run live — no Authentik functionality depends on historical task records.
 
@@ -67,7 +69,7 @@ This deletes the bulk of the bloated rows. Safe to run live — no Authentik fun
 
 ```
 docker exec -i authentik-postgresql-1 psql -U authentik << 'EOF'
-VACUUM ANALYZE;
+VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;
 EOF
 ```
 
@@ -93,7 +95,7 @@ LIMIT 5;
 EOF
 ```
 
-`authentik_tasks_tasklog` and `authentik_tasks_task` should now show sizes in the low MB range and the Authentik DB should be well under 200 MB total.
+`authentik_tasks_tasklog` and `authentik_tasks_task` should now show sizes in the low MB range. The total size depends on how far back records go — if all records are within 30 days the DELETE is a no-op and the table size won't change (the weekly timer will maintain it going forward).
 
 ---
 

@@ -107,7 +107,7 @@ The list lives in `start.sh` (apt + pip) — no `requirements.txt` is committed 
 
 ## Versioning
 
-- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.6-alpha` on `main` and `dev`).
+- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.7-alpha` on `main` and `dev`).
 - Sidebar shows the running version. Mismatch with the "Latest release" line in the README's top-of-file pointer indicates the customer is behind.
 - Tags are pushed to GitHub when a release is shipped (`v0.9.4-alpha`). Pushing the tag is what triggers the in-product "Update Available" banner on customer installs (the customer's console polls GitHub releases).
 - Update flow: customer clicks "Update Now" → console does `git fetch && git reset --hard origin/main` (or `dev` for testers) → restarts → `_run_post_update()` runs the migration ladder.
@@ -150,7 +150,12 @@ There are **two completely separate Postgres clusters** on every infra-TAK insta
 
 **Known recurring issue — task log bloat:** `authentik_tasks_task` and `authentik_tasks_tasklog` grow unbounded (~500–900 MB after 1 month). The `takauthentiktasklogpurge.timer` (v0.9.5+) handles weekly cleanup. `_authentik_tasklog_cleanup()` (v0.9.6+) also runs the DELETE + VACUUM on "Update Now" if either table exceeds 100 MB — clears the one-time backlog on first update.
 
-**`shm_size: 256m` required on `postgresql` service** — Docker's 64 MB default `/dev/shm` is too small for `VACUUM ANALYZE` with parallel workers in postgres:16-alpine. `_auto_harden_containers()` (v0.9.5) added this to the compose file but had a bug (v0.9.5 regression): it only ran `--force-recreate worker server ldap`, never `postgresql`. Fixed in v0.9.6: runtime check via `docker inspect HostConfig.ShmSize` — if still 67108864 (64 MB), recreates `postgresql` first then `worker server ldap`.
+**`shm_size: 256m` required on `postgresql` service** — Docker's 64 MB default `/dev/shm` is too small for `VACUUM ANALYZE` with parallel workers in postgres:16-alpine. Multiple bugs across v0.9.5/v0.9.6/v0.9.7:
+- v0.9.5: regex to add shm_size matched wrong field order (looked for `restart` then `command`, but compose has them reversed); also `--force-recreate` never included `postgresql`
+- v0.9.6: whole-file `'shm_size:' not in file` check false-positives when server/worker services have their own `shm_size` values; docker inspect check only ran when `'shm_size: 256m' in file`
+- v0.9.7 (fixed): anchor detection on postgres image line, scan only the postgresql service block; docker inspect check is unconditional — always compares `HostConfig.ShmSize` against `268435456`
+
+**Authentik 2026.x task table schema** — `authentik_tasks_task` PK is `message_id` (uuid), timestamp is `mtime`. The old assumed column names (`pk`, `finish_timestamp`) do not exist. `authentik_tasks_tasklog.task_id` → `authentik_tasks_task(message_id)`. Correct DELETE: `WHERE message_id IN (SELECT message_id ... WHERE mtime < NOW() - INTERVAL '30 days')`.
 
 ## Things that are NOT in scope (yet)
 

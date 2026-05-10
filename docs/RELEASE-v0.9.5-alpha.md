@@ -90,6 +90,34 @@ VACUUM ANALYZE authentik_tasks_task, authentik_tasks_tasklog;
 
 ---
 
+---
+
+### Bug fixes (discovered during v0.9.5 testing)
+
+**CloudTAK deploy hangs → "failed to deploy" (regression introduced by v0.9.5 work):**
+Three overlapping issues were fixed:
+- `cap_drop: ALL` in the CloudTAK docker-compose override silently broke nginx workers inside the `api` container (`/dev/stdout` write fails → exit 2 → 502 forever). Fix: removed `cap_drop` / `no-new-privileges` from the CloudTAK override entirely (same lesson learned on Authentik worker and TAK Portal). This is documented inline in `_cloudtak_build_override_yml`.
+- Step 7 (Caddy re-confirm) was not wrapped in `try/except`, so any Caddy exception marked the entire deploy `error: True`. Fix: wrapped in `try/except`, bumped reload timeout 15 s → 30 s.
+- The JS polling loop stopped permanently after 10 consecutive fetch failures, so users saw "failed to deploy" if Flask was briefly busy. Fix: removed `clearInterval` on failure; loop keeps going with a "still trying" note after 30 consecutive misses.
+
+**TAK Portal fresh deploy still injected `cap_drop: ALL` (regression):**
+`run_takportal_deploy` was stripping `cap_drop` on update but not on fresh installs. `cap_drop: ALL` removes `CAP_DAC_OVERRIDE`, preventing Node.js from reading the `tak-client.p12` cert (dashboard shows `--` for all stats). Fix: strip any existing `cap_drop` block on fresh deploy as well.
+
+**CloudTAK Reset Config — "Key (username)=(…) already exists":**
+`cloudtak_reset_server_config` cleared the `server` table but left the `profile` table intact. CloudTAK's PATCH `/server` configure wizard calls `profileControl.generate()` which does a plain `INSERT` — not an upsert — so reconfiguring with the same admin username hit a unique constraint violation. Fix: `TRUNCATE profile CASCADE` (not `DELETE WHERE system_admin=true`) — the `profile_overlays` and other tables have FK references to `profile.username` that block a plain DELETE. Cascading truncate clears all profiles, which is correct: they're all bound to the old TAK Server's user accounts.
+Also fixed: the error detection was checking for the string `ERROR` in the psql output, which false-positived on `NOTICE:` messages from `TRUNCATE CASCADE`. Now relies on exit code only (psql returns 0 on success regardless of NOTICEs).
+
+**Fail2ban / Scheduler toggles double-fire — impossible to disable (issue #21):**
+All 7 `*-toggle-track` spans had an explicit `onclick` calling `.click()` on the checkbox, while also being wrapped in a `<label>` that natively toggles the checkbox on click. Every user click fired `onchange` twice — once per mechanism — sending back-to-back enable/disable POSTs 1–2 ms apart, making disable effectively impossible. Fix: removed the redundant `onclick` from `recidive-toggle-track`, `auth-toggle-track`, `ssh-toggle-track`, `mediamtx-toggle-track`, `tak-toggle-track`, `rep-toggle-track`, and `sched-toggle-track`. The `<label>` wrapper handles the toggle correctly on its own.
+
+**Snapshot upload shows `?` for TAK Server version:**
+Uploaded snapshots and two-server snapshots were recorded with `tak_version: "?"` because the version-detection logic (dpkg/rpm) only ran in `_tak_snapshot()` — not in the upload endpoint or the two-server SSH path. Fix: added the same `dpkg -s` / `rpm -q` multi-package detection to both the upload endpoint and the two-server path.
+
+**TAK Server page — all cards unable to expand (JS syntax error):**
+`render_template_string` in `uploadSnapshot` rendered `font-family:\'JetBrains Mono\'` as a bare single-quoted string inside JavaScript, producing `Uncaught SyntaxError: Unexpected identifier 'JetBrains'`. Fix: changed to `font-family:JetBrains Mono,monospace` (no quotes needed in CSS shorthand).
+
+---
+
 ### Operator notes
 
 - No manual steps required — all changes apply on "Update Now."

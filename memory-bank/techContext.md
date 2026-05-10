@@ -107,7 +107,7 @@ The list lives in `start.sh` (apt + pip) — no `requirements.txt` is committed 
 
 ## Versioning
 
-- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.7-alpha` on `main` and `dev`).
+- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.9-alpha` on `main` and `dev`).
 - Sidebar shows the running version. Mismatch with the "Latest release" line in the README's top-of-file pointer indicates the customer is behind.
 - Tags are pushed to GitHub when a release is shipped (`v0.9.4-alpha`). Pushing the tag is what triggers the in-product "Update Available" banner on customer installs (the customer's console polls GitHub releases).
 - Update flow: customer clicks "Update Now" → console does `git fetch && git reset --hard origin/main` (or `dev` for testers) → restarts → `_run_post_update()` runs the migration ladder.
@@ -154,6 +154,10 @@ There are **two completely separate Postgres clusters** on every infra-TAK insta
 - v0.9.5: regex to add shm_size matched wrong field order (looked for `restart` then `command`, but compose has them reversed); also `--force-recreate` never included `postgresql`
 - v0.9.6: whole-file `'shm_size:' not in file` check false-positives when server/worker services have their own `shm_size` values; docker inspect check only ran when `'shm_size: 256m' in file`
 - v0.9.7 (fixed): anchor detection on postgres image line, scan only the postgresql service block; docker inspect check is unconditional — always compares `HostConfig.ShmSize` against `268435456`
+- v0.9.7 (new bug): `docker compose up -d --force-recreate` default 10s stop timeout too short for loaded postgres — process survives container stop as orphan at 1100%+ CPU
+- v0.9.8 (fixed): `docker stop -t 30` gives postgres 30s to checkpoint; cgroup-based orphan check runs unconditionally on every update — reads `/proc/<pid>/cgroup` for all UID-70 postgres processes, kills any not belonging to current container ID
+- v0.9.8 (new bug, verified on responder): orphan check runs at end of `_auto_harden_containers()`, but `_auto_authentik()` runs LATER and recreates containers again — fresh orphans were not caught by the first check
+- v0.9.9 (fixed): second cgroup-based orphan kill right before `auto-deploy complete`, after `_auto_authentik()` finishes its reconfigure-time recreate
 
 **Authentik 2026.x task table schema** — `authentik_tasks_task` PK is `message_id` (uuid), timestamp is `mtime`. The old assumed column names (`pk`, `finish_timestamp`) do not exist. `authentik_tasks_tasklog.task_id` → `authentik_tasks_task(message_id)`. Correct DELETE: `WHERE message_id IN (SELECT message_id ... WHERE mtime < NOW() - INTERVAL '30 days')`.
 

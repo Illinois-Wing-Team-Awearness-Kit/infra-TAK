@@ -107,7 +107,7 @@ The list lives in `start.sh` (apt + pip) — no `requirements.txt` is committed 
 
 ## Versioning
 
-- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.9-alpha` on `main` and `dev`).
+- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.10-alpha` on `main` and `dev`).
 - Sidebar shows the running version. Mismatch with the "Latest release" line in the README's top-of-file pointer indicates the customer is behind.
 - Tags are pushed to GitHub when a release is shipped (`v0.9.4-alpha`). Pushing the tag is what triggers the in-product "Update Available" banner on customer installs (the customer's console polls GitHub releases).
 - Update flow: customer clicks "Update Now" → console does `git fetch && git reset --hard origin/main` (or `dev` for testers) → restarts → `_run_post_update()` runs the migration ladder.
@@ -158,6 +158,10 @@ There are **two completely separate Postgres clusters** on every infra-TAK insta
 - v0.9.8 (fixed): `docker stop -t 30` gives postgres 30s to checkpoint; cgroup-based orphan check runs unconditionally on every update — reads `/proc/<pid>/cgroup` for all UID-70 postgres processes, kills any not belonging to current container ID
 - v0.9.8 (new bug, verified on responder): orphan check runs at end of `_auto_harden_containers()`, but `_auto_authentik()` runs LATER and recreates containers again — fresh orphans were not caught by the first check
 - v0.9.9 (fixed): second cgroup-based orphan kill right before `auto-deploy complete`, after `_auto_authentik()` finishes its reconfigure-time recreate
+- v0.9.8/v0.9.9 (new bug, friendly fire): the cgroup check used `kill if cgroup does not contain authentik-postgresql-1 ID` — this also killed UID-70 postgres processes inside `cloudtak-postgis-1` (CloudTAK's PostGIS spatial DB), which restart-loop on every update and spike CPU to 800–1100% catching up. Verified on responder and tak-10
+- v0.9.10 (fixed): check against ALL running Docker container IDs (`docker ps -q --no-trunc`), kill only when cgroup matches NO running container; preserves legitimate processes in any postgres container regardless of name
+
+**Authentik vs CloudTAK postgres** — both run as UID 70 on the host. The cgroup is the only reliable way to tell them apart at the process level. Never assume "UID 70 + not in container X" means orphan; always check against the full set of running containers.
 
 **Authentik 2026.x task table schema** — `authentik_tasks_task` PK is `message_id` (uuid), timestamp is `mtime`. The old assumed column names (`pk`, `finish_timestamp`) do not exist. `authentik_tasks_tasklog.task_id` → `authentik_tasks_task(message_id)`. Correct DELETE: `WHERE message_id IN (SELECT message_id ... WHERE mtime < NOW() - INTERVAL '30 days')`.
 

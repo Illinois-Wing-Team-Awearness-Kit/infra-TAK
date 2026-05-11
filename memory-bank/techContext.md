@@ -107,7 +107,7 @@ The list lives in `start.sh` (apt + pip) — no `requirements.txt` is committed 
 
 ## Versioning
 
-- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.10-alpha` on `main` and `dev`).
+- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.11-alpha` on `main` and `dev`).
 - Sidebar shows the running version. Mismatch with the "Latest release" line in the README's top-of-file pointer indicates the customer is behind.
 - Tags are pushed to GitHub when a release is shipped (`v0.9.4-alpha`). Pushing the tag is what triggers the in-product "Update Available" banner on customer installs (the customer's console polls GitHub releases).
 - Update flow: customer clicks "Update Now" → console does `git fetch && git reset --hard origin/main` (or `dev` for testers) → restarts → `_run_post_update()` runs the migration ladder.
@@ -162,6 +162,19 @@ There are **two completely separate Postgres clusters** on every infra-TAK insta
 - v0.9.10 (fixed): check against ALL running Docker container IDs (`docker ps -q --no-trunc`), kill only when cgroup matches NO running container; preserves legitimate processes in any postgres container regardless of name
 
 **Authentik vs CloudTAK postgres** — both run as UID 70 on the host. The cgroup is the only reliable way to tell them apart at the process level. Never assume "UID 70 + not in container X" means orphan; always check against the full set of running containers.
+
+**v0.9.11 — CloudTAK upstream RCE / PG_MEM cryptominer (security hotfix)** — dfpc-coe/CloudTAK ships `postgis ports: 5433:5432` on `0.0.0.0` with hardcoded `POSTGRES_PASSWORD=docker` literal. Live compromise observed on responder May 8-10 2026: scanner → brute-force `docker:docker` succeeds → `COPY FROM PROGRAM` drops `gcmanager-1.so` into postgis data volume → modify `postgresql.conf` `shared_preload_libraries` → Monero miner runs at 1000%+ CPU with C2 over Tor SOCKS5. Family: PG_MEM/PGMiner (Aqua Nautilus, Palo Alto Unit 42). Sample hash on responder: SHA256 `715348a40250549100cbbeb2a8d68ffa323e671b55fc46e8df24c7016b11e10a` (566 KB ELF static-pie, statically-linked musl libc, compiled for Alpine). Hashes vary across deployments — reliable IOC is the persistence technique (.so in data dir + shared_preload_libraries in postgresql.conf), not the hash.
+
+**v0.9.11 mitigation in app.py:**
+- `_cloudtak_build_override_yml()`: `postgis ports: !reset []` removes the public 5433 mapping entirely (CloudTAK uses internal Docker network); `store ports: !reset` binds only `127.0.0.1:9002:9002` (drops public 9000 S3 API, keeps console on loopback for SSH tunnel); `postgis environment.POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-docker}"` substitutes from .env.
+- `_cloudtak_build_env_content()`: new `postgres_pass` parameter, emits `POSTGRES_PASSWORD=` line + uses it in `POSTGRES=postgres://docker:<pass>@postgis:5432/gis` connection string. Default 'docker' for backwards compat.
+- 4 caller sites updated: fresh-install paths (2) generate `secrets.token_hex(24)` and save to `~/CloudTAK/.postgres-password` (chmod 600); reconfig paths (2) read existing value from `.env` (local) or via SSH grep from remote `.env` to preserve DB connection.
+- New `_auto_harden_cloudtak()` runs every Update Now after `cloudtak_t.join()`: scans postgis data volume for `*.so` files + uncommented `shared_preload_libraries` in `postgresql.conf`. If compromised: stops all CloudTAK containers, quarantines `.so` files to `quarantine-YYYYMMDD-HHMMSS/` subdir (preserves forensics, does not delete), comments out the malicious config line with `#INFRATAK_DISABLED# ` prefix, writes `~/CloudTAK/COMPROMISE-DETECTED.txt`, prints loud banner, leaves CloudTAK STOPPED pending operator Remove + Reinstall. Always (idempotent): writes hardened override, applies UFW deny rules for 5433/9000/9002, force-recreates only if clean.
+- Critical: Postgres reads `POSTGRES_PASSWORD` env var ONLY on `initdb` (first boot of empty volume). On existing volumes the env var is ignored and the previously-baked password persists. This is why update-only flows can't rotate the password on existing installs — only Remove + Reinstall (which wipes the volume) gets a fresh strong password baked in.
+
+**Operator paths post-v0.9.11:**
+- Update Now alone = network locked down via override + UFW; existing weak password remains but unreachable; compromised installs quarantined + stopped.
+- Update Now + Remove + Reinstall (recommended) = wipes data volume + reinstall path generates strong password baked into fresh DB. Full remediation.
 
 **Authentik 2026.x task table schema** — `authentik_tasks_task` PK is `message_id` (uuid), timestamp is `mtime`. The old assumed column names (`pk`, `finish_timestamp`) do not exist. `authentik_tasks_tasklog.task_id` → `authentik_tasks_task(message_id)`. Correct DELETE: `WHERE message_id IN (SELECT message_id ... WHERE mtime < NOW() - INTERVAL '30 days')`.
 

@@ -26,7 +26,7 @@
 
 - **Entry point:** `app.py` (loaded by Gunicorn).
 - **Port:** `5001` HTTPS (self-signed by default, switchable to LE via Caddy in FQDN mode).
-- **Service unit:** `/etc/systemd/system/takwerx-console.service` — `User=root` in v0.9.x (non-root migration was deferred from v0.9.2 to a future release; scaffolding is in place via `_sudo_wrap`/`_write_priv`/`_read_priv`).
+- **Service unit:** `/etc/systemd/system/takwerx-console.service` — `User=root` in v0.9.x (non-root migration scheduled for **v1.0.0** as the major-version disruptive change; see `docs/PLAN-v1.0.0.md`. Scaffolding is in place via `_sudo_wrap`/`_write_priv`/`_read_priv`).
 - **Working directory:** Whatever `start.sh` was run from on first boot (typically `/home/takwerx/infra-TAK`, but NOT guaranteed — varies per install). **ALWAYS resolve dynamically:** `grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service`. Never hardcode `/root/infra-TAK` or `/home/takwerx/infra-TAK` in pull commands given to the operator — this causes `cd: No such file or directory` failures.
 - **Config / state:** `<install_dir>/.config/auth.json` (password hash, mode 600), `<install_dir>/.config/settings.json` (FQDN, `last_version`, migration outcomes, schedules).
 - **Logs:** `journalctl -u takwerx-console`. UI long-running ops stream `plog` lines into the per-page log panel.
@@ -107,11 +107,17 @@ The list lives in `start.sh` (apt + pip) — no `requirements.txt` is committed 
 
 ## Versioning
 
-- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.11-alpha` on `main` and `dev`).
+- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.12-alpha` on `dev`; will be on `main` after v0.9.12 promotion).
 - Sidebar shows the running version. Mismatch with the "Latest release" line in the README's top-of-file pointer indicates the customer is behind.
 - Tags are pushed to GitHub when a release is shipped (`v0.9.4-alpha`). Pushing the tag is what triggers the in-product "Update Available" banner on customer installs (the customer's console polls GitHub releases).
 - Update flow: customer clicks "Update Now" → console does `git fetch && git reset --hard origin/main` (or `dev` for testers) → restarts → `_run_post_update()` runs the migration ladder.
 - Console rollback: every "Update Now" records `settings.console_rollback = {available, version, tag, snapshot_at}` so the operator can revert in one click for that update cycle.
+
+### Release roadmap (post v0.9.11)
+
+- **v0.9.12 — Cyber Security Hardening** (IMPLEMENTED on `dev`, see `docs/RELEASE-v0.9.12-alpha.md`). Generalised the v0.9.11 CloudTAK `!reset` override pattern to TAK Portal, MediaMTX (local + remote), remote Authentik, and CloudTAK's other public-bound services (`api`/`tiles`/`events`/`media`); added new `_auto_harden_takportal()`, `_auto_harden_mediamtx()`, `_auto_authentik_ports_remote()` post-update steps; patched the post-auth code bugs surfaced by the 2026-05-10 audit (snapshot path traversal via new `_validate_snapshot_label`, external-DB SQLi via psql `-v` substitution + identifier regex, webadmin-password RCE via argv-only `subprocess.run`, external-DB test-connection RCE via `socket.create_connection` replacing `bash -c "</dev/tcp/..."`, hardcoded `adm_ldapservice` fallback password replaced with `secrets.token_urlsafe(24)` persisted to `.env`, SSH host/user injection via new `_validate_ssh_target`). Also locked down Server One Postgres + Guard Dog health-agent UFW (removed unconditional `allow {port}/tcp` that overrode source-scope rules above). Ships `docs/PORT-EXPOSURE-POLICY.md` as the canonical Tier 1/3/4/5 reference.
+- **v0.9.13 — Auth hardening + UI cleanup** (tentative). Shared-secret header for `X-Authentik-Username` trust, `SESSION_COOKIE_SECURE`, masked secrets in API responses with re-auth-to-reveal, `atakatak` keystore rotation button.
+- **v1.0.0 — Non-root console migration** (planned, see `docs/PLAN-v1.0.0.md`). Moves the console off `User=root` to a `takwerx` sudo user. Reserved for v1.0.0 because the runtime behavioural change warrants the major-version semver bump.
 
 ## Tooling discipline
 

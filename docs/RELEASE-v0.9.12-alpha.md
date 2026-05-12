@@ -133,6 +133,20 @@ The literal 32-char `B9wobRV8wlFJmnlEWB71gJjD3aoKOBBW` baked into `app.py` since
 
 New `_validate_ssh_target(host, user, port)` regex-checks `host` (via `_safe_migration_db_host`) and `user` (`^[a-z_][a-z0-9_-]{0,31}\$?$` — POSIX username). Called from `_ssh_probe` and `_scp_to_host` before they build the ssh argv. Defends against a settings file (or compromised API caller) that supplies `host = '-oProxyCommand=touch /tmp/owned'` — pre-v0.9.12 ssh would happily interpret that as an option.
 
+### B7. `~/authentik` tilde expansion under gunicorn — HOME pinning
+
+**Symptom surfaced during v0.9.12 test cycle on `tak-10`:** clicking **Sync webadmin to Authentik** in the console returned `/bin/sh: 1: cd: can't cd to ~/authentik` even though `/root/authentik` clearly existed. Same failure mode would intermittently break `_ensure_authentik_ldap_service_account` and other code paths that shell out to `cd ~/authentik && docker compose …`.
+
+**Root cause:** `takwerx-console.service` has only ever pinned `Environment=PYTHONUNBUFFERED=1` and `Environment=CONFIG_DIR=…` — it never carried `Environment=HOME=…`. systemd does **not** inherit `HOME` from login env, so under gunicorn `os.environ.get('HOME')` returned `None` and `subprocess.run('cd ~/authentik …', shell=True)` invoked `/bin/sh` with no `HOME`, leaving `~` literal. **This is the same class of bug fixed for `takupdatesguard.service` in v0.2.7-alpha** (`Environment=HOME=…` added there) and the same root cause as the v0.9.2 `git safe.directory` / `git config --global` issue documented in [docs/RELEASE-v0.9.2-alpha.md](RELEASE-v0.9.2-alpha.md). It was never carried across to the console unit.
+
+Three-layer fix, belt + suspenders + migration:
+
+1. **Runtime guard (`app.py`, top of file, after stdlib imports):** if `HOME` is unset, derive it from `pwd.getpwuid(os.getuid()).pw_dir` (`/root` fallback) and write it into `os.environ`. All `subprocess.run` children inherit it. Fixes the **current** gunicorn process the moment v0.9.12 boots — no restart needed.
+2. **`start.sh create_service()`:** new installs get `Environment=HOME=$SERVICE_HOME` baked into `takwerx-console.service` (derived from the running shell's `$HOME`, falls back to `/root`).
+3. **`_startup_pin_console_service_home()` migration:** runs on every console startup. If `/etc/systemd/system/takwerx-console.service` is missing `Environment=HOME=`, the line is inserted after the existing `Environment=` block and `systemctl daemon-reload` is fired. Existing v0.9.11 installs converge automatically — operators don't have to edit unit files.
+
+After this fix, `cd ~/authentik`, `cd ~/CloudTAK`, `cd ~/TAK-Portal`, etc. all work consistently from any `subprocess.run(..., shell=True)` call site. No call-site changes were needed — fixing the root cause once at the env layer was the documented, reusable pattern.
+
 ---
 
 ## Operator action required

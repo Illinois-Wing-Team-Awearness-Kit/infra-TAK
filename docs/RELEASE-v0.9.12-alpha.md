@@ -2,7 +2,26 @@
 
 **Date:** 2026-05-11
 **Type:** Comprehensive security hardening (post-v0.9.11 follow-up). Not a fire drill — no live exploit observed.
-**Reference:** [docs/PLAN-v0.9.12.md](PLAN-v0.9.12.md), [docs/PORT-EXPOSURE-POLICY.md](PORT-EXPOSURE-POLICY.md), [docs/RELEASE-v0.9.11-alpha.md](RELEASE-v0.9.11-alpha.md).
+**Reference:** [docs/PORT-EXPOSURE-POLICY.md](PORT-EXPOSURE-POLICY.md), [docs/RELEASE-v0.9.11-alpha.md](RELEASE-v0.9.11-alpha.md).
+
+---
+
+## ⚠ Before you click Update Now — confirm the update channel is `main`
+
+v0.9.12 introduced a new **update channel toggle** on the Console page (top right of the **Update Now** card). The toggle has two states:
+
+- **`main` (green)** — tracks tagged releases on the `main` branch. **This is what every operator should be on for production.** Update Now will pull the latest tagged release (now `v0.9.12-alpha`).
+- **`dev` (yellow)** — tracks the `dev` branch HEAD. Used by maintainers for in-development testing. **Do not run a production install on `dev`** — it advances continuously and may contain partially-tested code between releases.
+
+**Before clicking Update Now on v0.9.12:**
+
+1. Open the Console page (`https://infratak.<your-fqdn>/`).
+2. Look at the update channel toggle on the **Update Now** card.
+3. If it shows yellow `dev`, click `main` (no password required to switch back to `main`). The button should flip to green `main`.
+4. Reload the page and confirm the toggle is still green `main` (the channel is persisted in `settings.json`).
+5. Now click **Update Now**.
+
+If your installation was on `dev` during the v0.9.12-alpha-rc testing cycle, switching back to `main` before Update Now ensures your VPS fetches the **tagged** v0.9.12-alpha release rather than whatever the `dev` branch HEAD points to.
 
 ---
 

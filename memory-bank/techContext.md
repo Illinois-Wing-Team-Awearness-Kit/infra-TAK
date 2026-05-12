@@ -107,7 +107,7 @@ The list lives in `start.sh` (apt + pip) — no `requirements.txt` is committed 
 
 ## Versioning
 
-- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.12-alpha` on `dev`; will be on `main` after v0.9.12 promotion).
+- Single `VERSION = "X.Y.Z-alpha"` constant near the top of `app.py` (currently `0.9.12-alpha` — **SHIPPED on `main` 2026-05-11**).
 - Sidebar shows the running version. Mismatch with the "Latest release" line in the README's top-of-file pointer indicates the customer is behind.
 - Tags are pushed to GitHub when a release is shipped (`v0.9.4-alpha`). Pushing the tag is what triggers the in-product "Update Available" banner on customer installs (the customer's console polls GitHub releases).
 - Update flow: customer clicks "Update Now" → console does `git fetch && git reset --hard origin/main` (or `dev` for testers) → restarts → `_run_post_update()` runs the migration ladder.
@@ -115,9 +115,9 @@ The list lives in `start.sh` (apt + pip) — no `requirements.txt` is committed 
 
 ### Release roadmap (post v0.9.11)
 
-- **v0.9.12 — Cyber Security Hardening** (IMPLEMENTED on `dev`, see `docs/RELEASE-v0.9.12-alpha.md`). Generalised the v0.9.11 CloudTAK `!reset` override pattern to TAK Portal, MediaMTX (local + remote), remote Authentik, and CloudTAK's other public-bound services (`api`/`tiles`/`events`/`media`); added new `_auto_harden_takportal()`, `_auto_harden_mediamtx()`, `_auto_authentik_ports_remote()` post-update steps; patched the post-auth code bugs surfaced by the 2026-05-10 audit (snapshot path traversal via new `_validate_snapshot_label`, external-DB SQLi via psql `-v` substitution + identifier regex, webadmin-password RCE via argv-only `subprocess.run`, external-DB test-connection RCE via `socket.create_connection` replacing `bash -c "</dev/tcp/..."`, hardcoded `adm_ldapservice` fallback password replaced with `secrets.token_urlsafe(24)` persisted to `.env`, SSH host/user injection via new `_validate_ssh_target`). Also locked down Server One Postgres + Guard Dog health-agent UFW (removed unconditional `allow {port}/tcp` that overrode source-scope rules above). Ships `docs/PORT-EXPOSURE-POLICY.md` as the canonical Tier 1/3/4/5 reference.
-- **v0.9.13 — Auth hardening + UI cleanup** (tentative). Shared-secret header for `X-Authentik-Username` trust, `SESSION_COOKIE_SECURE`, masked secrets in API responses with re-auth-to-reveal, `atakatak` keystore rotation button.
-- **v1.0.0 — Non-root console migration** (planned, see `docs/PLAN-v1.0.0.md`). Moves the console off `User=root` to a `takwerx` sudo user. Reserved for v1.0.0 because the runtime behavioural change warrants the major-version semver bump.
+- **v0.9.12 — Cyber Security Hardening — SHIPPED 2026-05-11** (see `docs/RELEASE-v0.9.12-alpha.md`). Generalised the v0.9.11 CloudTAK `!reset` override pattern to TAK Portal, MediaMTX (local + remote), remote Authentik, and CloudTAK's other public-bound services (`api`/`tiles`/`events`/`media`); added new `_auto_harden_takportal()`, `_auto_harden_mediamtx()`, `_auto_authentik_ports_remote()` post-update steps; patched the post-auth code bugs surfaced by the 2026-05-10 audit (snapshot path traversal via new `_validate_snapshot_label`, external-DB SQLi via psql `-v` substitution + identifier regex, webadmin-password RCE via argv-only `subprocess.run`, external-DB test-connection RCE via `socket.create_connection` replacing `bash -c "</dev/tcp/..."`, hardcoded `adm_ldapservice` fallback password replaced with `secrets.token_urlsafe(24)` persisted to `.env`, SSH host/user injection via new `_validate_ssh_target`). Also locked down Server One Postgres + Guard Dog health-agent UFW (removed unconditional `allow {port}/tcp` that overrode source-scope rules above). Ships `docs/PORT-EXPOSURE-POLICY.md` as the canonical Tier 1/3/4/5 reference. **Late-cycle additions during test phase:** B7 HOME pinning fix in `takwerx-console.service` (operator clicked Sync webadmin and `cd ~/authentik` failed under gunicorn — same class of bug as v0.2.7's `takupdatesguard.service`, finally closed for the console unit); B8 Authentik ReputationPolicy `negate=True` (binding semantics were inverted — `passes()` returns `True` for *bad* reputation, so `negate=False` denied all normal users; hid for 10 releases because LDAP outpost's `bind_mode: cached` masked the misconfig). Self-healing startup migrations now patch existing v0.9.11 installs end-to-end on first Update Now (port hardening compose files, LDAP SA bind drift, ReputationPolicy binding drift).
+- **v1.0.0 — NEXT MAJOR. Non-root console migration** (planned, see `docs/PLAN-v1.0.0.md`). Moves the console off `User=root` to a `takwerx` sudo user. Reserved for v1.0.0 because the runtime behavioural change warrants the major-version semver bump. Scaffolding (`_sudo_wrap`, `_write_priv`, `_read_priv`) already in place.
+- **v0.9.13 — Auth hardening + UI cleanup** (tentative, may slot in before or after v1.0.0). Shared-secret header for `X-Authentik-Username` trust, `SESSION_COOKIE_SECURE`, masked secrets in API responses with re-auth-to-reveal, `atakatak` keystore rotation button.
 
 ## Tooling discipline
 
@@ -183,6 +183,117 @@ There are **two completely separate Postgres clusters** on every infra-TAK insta
 - Update Now + Remove + Reinstall (recommended) = wipes data volume + reinstall path generates strong password baked into fresh DB. Full remediation.
 
 **Authentik 2026.x task table schema** — `authentik_tasks_task` PK is `message_id` (uuid), timestamp is `mtime`. The old assumed column names (`pk`, `finish_timestamp`) do not exist. `authentik_tasks_tasklog.task_id` → `authentik_tasks_task(message_id)`. Correct DELETE: `WHERE message_id IN (SELECT message_id ... WHERE mtime < NOW() - INTERVAL '30 days')`.
+
+## v0.9.12 lessons learned (May 2026)
+
+Patterns and gotchas that emerged during v0.9.12 testing on `tak-10` and `responder`. Each section is durable — if you see the symptom, the fix is here.
+
+### Pattern: systemd unit must pin `Environment=HOME=` if the service shells out with `~`
+
+**Symptom (v0.9.12):** clicking **Sync webadmin to Authentik** returned `/bin/sh: 1: cd: can't cd to ~/authentik` even though `/root/authentik` clearly existed. `_ensure_authentik_ldap_service_account` and `_auto_harden_*` paths could fail intermittently with the same error. Surfaces specifically under gunicorn-spawned `subprocess.run('cd ~/… && …', shell=True)` calls.
+
+**Root cause:** systemd does **not** inherit `HOME` from login env. `takwerx-console.service` only pinned `Environment=PYTHONUNBUFFERED=1` and `Environment=CONFIG_DIR=…`. Under gunicorn, `os.environ.get('HOME')` returned `None`, and `/bin/sh` cannot expand `~` without `$HOME`. Same root cause as:
+- **v0.2.7-alpha** — `takupdatesguard.service` needed `Environment=HOME=…` for the Guard Dog Updates timer.
+- **v0.9.2-alpha** — `git safe.directory` / `git config --global` writes failed because `git` couldn't find `~/.gitconfig`.
+
+**Three-layer fix pattern (canonical for this class of bug):**
+1. **Runtime guard at the top of `app.py` (after stdlib imports):** if `os.environ.get('HOME')` is unset, derive from `pwd.getpwuid(os.getuid()).pw_dir` (fallback `/root`) and write it to `os.environ`. Fixes the **current** process immediately; child shells inherit.
+2. **Installer (`start.sh create_service()`):** new installs get `Environment=HOME=$SERVICE_HOME` baked into the unit file (`$SERVICE_HOME` derived from `${HOME:-/root}`).
+3. **Idempotent startup migration (`_startup_pin_console_service_home()`):** patches existing v0.9.11- unit files on Update Now (sed-in-place insert of `Environment=HOME=/root` after the existing `Environment=` block, `systemctl daemon-reload` only when a change was made).
+
+**Rule of thumb:** any future systemd unit added under `/etc/systemd/system/` that wraps a Python/bash process which might `subprocess.run('cd ~/…', shell=True)` **must carry `Environment=HOME=…`**. If you're adding a new unit, set it at create time. If you find a unit missing it in the field, add a migration like `_startup_pin_console_service_home()`.
+
+### Pattern: Authentik PolicyBinding fields require DELETE+POST to change (PATCH returns 405)
+
+**Symptom (v0.9.12):** trying to fix the `negate` / `failure_result` fields on an existing `infratak-brute-force` PolicyBinding via `PATCH /api/v3/policies/bindings/{pk}/` returned `405 Method Not Allowed` on Authentik 2026.2.2.
+
+**Workaround:** DELETE the existing binding, then POST a fresh one with the corrected fields. Used in both `_authentik_setup_reputation_policy()` retro-fix branch and `_startup_fix_reputation_policy_drift()`. Capture the existing binding's `pk` from a GET first, DELETE by `pk`, then POST the new body — order matters because POST will fail with a uniqueness error if the old binding still exists on the same (policy, target) pair.
+
+### Pattern: Authentik `ReputationPolicy.passes()` semantics are inverted from intuition
+
+**The bug, verified against Authentik 2026.2.2 source via `inspect.getsource(ReputationPolicy.passes)` on the running container:**
+
+```python
+def passes(self, request: PolicyRequest) -> PolicyResult:
+    # ... aggregate Reputation score for this IP/username ...
+    passing = score <= self.threshold
+    return PolicyResult(bool(passing))
+```
+
+`passes()` returns `True` **only when the user has accumulated enough bad reputation to act on** (score ≤ threshold, threshold is negative — default `-5`). A normal user with `score = 0` returns `False`. Therefore:
+
+| Binding `negate` | Normal user (score 0) | Brute-force abuser (score ≤ -5) | Result |
+|---|---|---|---|
+| `False` (intuitive default) | binding denies | binding allows | **EVERYONE denied** (intuitive but wrong) |
+| `True` (correct) | binding allows | binding denies | only abusers blocked (correct brute-force gate) |
+
+**Cardinal rule (now documented in `docs/HANDOFF-LDAP-AUTHENTIK.md`):** when adding a ReputationPolicy as a brute-force gate on `ldap-authentication-flow`, ALWAYS set `negate=True, failure_result=True` on the PolicyBinding.
+
+**Why this hid for ten releases (v0.9.2 → v0.9.12-rc):** the LDAP outpost runs in `bind_mode: cached`. Once `adm_ldapservice`'s first successful bind landed in the cache, all subsequent binds for that DN were served from cache without re-consulting the flow. The misconfigured binding never had a chance to fail in production. v0.9.12's `_startup_resync_ldap_service_account` force-recreates the LDAP outpost on every console boot (to fix a separate password drift issue), wiping the bind cache and **exposing** the long-standing reputation-policy misconfig. This is a generalisable warning: any cached upstream behaviour can mask config bugs for a long time; wiping the cache is what surfaces them. Test cache-clearing paths in pre-release.
+
+### Pattern: never raw-copy YAML edits via Python regex backreferences when the value contains regex metacharacters
+
+**Symptom (v0.9.12 pre-rc):** `_patch_takportal_compose_ports` and `_patch_cloudtak_compose_ports` corrupted `docker-compose.yml` files into `ports:J7.0.0.1...` (literal `J` inserted) and similar garbage. Operator-reported as "TAK Portal map not working, weird YAML errors."
+
+**Root cause:** `re.sub(r'(ports:\s*)\N\1...', ...)` with `\N` backreferences silently consumes characters when the captured group contains characters that look like backreferences. Python's `re` module treats `\1` ... `\9` as backreferences in the replacement string, and `\N` (capital N) is ambiguous.
+
+**Fix:** use `\g<N>` syntax instead of `\N` for ALL Python regex backreferences in replacement strings. This is unambiguous. Also add corruption detection: if a compose file no longer parses as YAML after a patch, `git checkout` it from the current branch and re-apply.
+
+**Generalised rule:** when you find yourself doing `re.sub` on a structured config file (YAML, JSON, ini), strongly prefer:
+1. Parse the file with the proper parser (`yaml.safe_load`), modify the data structure, serialise back. This is the right answer 90% of the time and avoids all regex pitfalls.
+2. If you MUST use regex (because the file has comments / formatting / `!reset` directives you need to preserve), always:
+   - Use `\g<N>` not `\N` for backreferences.
+   - Validate the file parses correctly after the substitution.
+   - Have a fallback: detect corruption, `git checkout` from `origin/$branch`, re-apply.
+
+### Pattern: Docker Compose `ports: !reset` is NOT compatible with `docker-compose.yml` if the base file has `ports: [...]` as a list (vs map)
+
+Discovered while generalising the v0.9.11 CloudTAK pattern to TAK Portal and CloudTAK's other services. The `!reset` tag works when overriding compose files **at the override layer**, but if the base `docker-compose.yml` already has `ports:` as an explicit list, dropping `!reset` into that file directly is a syntax error in some compose versions.
+
+**Generalised rule:** the `!reset []` pattern in `_cloudtak_build_override_yml()` belongs in the **override file** (`docker-compose.override.yml`). For the base compose files (`docker-compose.yml`), patch the port mappings **directly** by parsing the file and rewriting the `ports:` list to bind only loopback. Don't try to inject `!reset` into the base file. The corrected v0.9.12 implementation uses `_patch_takportal_compose_ports` and `_patch_cloudtak_compose_ports` which parse + rewrite + serialise.
+
+### Pattern: end-to-end auto-heal migrations need to verify with the authoritative source (not log inspection)
+
+**Bug we briefly shipped in v0.9.12-rc:** `_test_ldap_bind()` checked Authentik server logs for `Bind successful` markers. This gave **false positives** because positive log lines from previous successful binds (cached) were within the `--since` window even when the current bind attempt was failing.
+
+**Fix:** replaced with `_test_ldap_bind_dn_verdict(dn, password)` which runs `ldapsearch -x -H ldap://… -D <dn> -w <pw> -b 'dc=takldap' -s base '(objectClass=*)'` and captures the **ldapsearch exit code directly into a variable** (don't rely on `$?` after pipelines). Returns one of `'ok' | 'fail' | 'inconclusive'`. Authoritative because it actually attempts the bind through the live LDAP outpost; doesn't depend on any log parsing.
+
+**Generalised rule:** when self-healing migrations need to know whether a state has been reached, prefer the **authoritative live probe** (CLI exit code, API GET, direct DB query) over **log scraping**. Logs are append-only and a stale positive will mask a current negative. The only exceptions are when:
+1. The log line is being written by the **current** process whose `pid` you can match, OR
+2. You can `truncate -s 0` / rotate the log immediately before the action.
+
+### Pattern: Authentik blueprint plaintext password fallback can drift `adm_ldapservice` even when the operator never touched it
+
+**The recurring class of bug** (this has bitten infra-TAK multiple times — May 2026 v0.9.12 was the most recent):
+
+The Authentik blueprint applied by `_authentik_apply_blueprint()` historically contained `password: !Env [AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD]` inside the service-account user definition. When the blueprint engine processes this on every Authentik startup, it writes the env var value to the user's `password` column **as plaintext**, not as a hash. Authentik then refuses to authenticate against the stored password because all bind paths expect the hashed form.
+
+**Symptom:** `ldapsearch -D 'cn=adm_ldapservice,ou=users,dc=takldap' …` returns 49 (Invalid Credentials) right after a fresh blueprint apply (e.g. Update Now), even though `~/authentik/.env` has the expected `AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD=<value>` and that value should be the one Authentik is checking.
+
+**Why it stays hidden:** the LDAP outpost's `bind_mode: cached` serves previously-successful binds from cache. The plaintext-vs-hash mismatch only manifests on the **first** bind after a cache clear (container recreate, outpost restart, fresh deploy). Once you hit it manually with `set_password` via the Authentik API (which always writes a proper hash), subsequent binds succeed and the cache rebuilds; the operator never sees the bug for weeks.
+
+**v0.9.12 mitigation (`_startup_resync_ldap_service_account`):**
+1. Test the bind with `_test_ldap_bind_dn_verdict` (authoritative).
+2. If it fails, call `POST /api/v3/core/users/{pk}/set_password/` with the `.env` value — Authentik hashes it correctly.
+3. Recreate the LDAP outpost container to clear its cache.
+4. Retest. If success, restart `takserver` so it picks up the new bind (TAK Server caches LDAP credentials itself; restart is the only documented way to flush that cache).
+5. Persist outcome to `settings.json` so future boots can audit what happened.
+
+**Generalised rule:** when an Authentik blueprint contains a literal `password:` field, ALWAYS audit it for `!Env` substitution that would write plaintext. Either remove the password from the blueprint entirely (set it via API afterwards) or accept that you need a startup-time resync migration to put the correct hash in place after every blueprint apply.
+
+### Pattern: when verifying upstream behaviour, read the live container source, not docs
+
+`.cursor/rules/consult-upstream-docs.mdc` is the always-applied rule that says read official docs first. The v0.9.12 ReputationPolicy bug surfaced the **next** level of rigour: even the docs can be ambiguous or omit edge cases. The decisive proof on `tak-10` was:
+
+```python
+docker exec authentik-server-1 ak shell -c "
+import inspect
+from authentik.policies.reputation.models import ReputationPolicy
+print(inspect.getsource(ReputationPolicy.passes))
+"
+```
+
+That ran the live code path against the deployed image (`authentik:2026.2.2`), printed the exact `passing = score <= self.threshold` line, and proved `negate=True` was required. **Generalised rule:** for any "the API says one thing but my install behaves differently" symptom, drop into the running container's interpreter and use `inspect.getsource()` to dump the live function. Authentik exposes `ak shell` which is a Django shell with all the auth models pre-imported — perfect for this.
 
 ## Things that are NOT in scope (yet)
 

@@ -147,6 +147,50 @@ Three-layer fix, belt + suspenders + migration:
 
 After this fix, `cd ~/authentik`, `cd ~/CloudTAK`, `cd ~/TAK-Portal`, etc. all work consistently from any `subprocess.run(..., shell=True)` call site. No call-site changes were needed — fixing the root cause once at the env layer was the documented, reusable pattern.
 
+### B8. Authentik ReputationPolicy binding was inverted — `negate=True` required
+
+**Symptom surfaced during v0.9.12 testing on `tak-10`:** every LDAP bind for `webadmin` (and `adm_ldapservice` until the cache rebuilt) returned `Invalid credentials (49)`, the Authentik server log filled with `FlowNonApplicableException` on `ldap-authentication-flow`, and Sync webadmin reported `webadmin exists but LDAP bind verification failed (DN/password)` — even with a freshly hashed password and the user in the correct groups (`authentik Admins`, `tak_ROLE_ADMIN`).
+
+**Root cause — verified against the deployed upstream source.** Per [.cursor/rules/consult-upstream-docs.mdc](../.cursor/rules/consult-upstream-docs.mdc), the canonical truth is what the running container does. From the deployed `authentik-server-1` container (Authentik `2026.2.2`) on `tak-10`:
+
+```python
+# inspect.getsource(authentik.policies.reputation.models.ReputationPolicy.passes)
+def passes(self, request: PolicyRequest) -> PolicyResult:
+    remote_ip = ClientIPMiddleware.get_client_ip(request.http_request)
+    query = Q()
+    if self.check_ip:
+        query |= Q(ip=remote_ip)
+    if self.check_username:
+        query |= Q(identifier=request.user.username)
+    score = Reputation.objects.filter(query).aggregate(
+        total_score=Sum("score"))["total_score"] or 0
+    passing = score <= self.threshold
+    return PolicyResult(bool(passing))
+```
+
+**`ReputationPolicy.passes()` returns `True` only when the score is `≤` threshold** — i.e. only when the user has accumulated enough bad reputation to *act on*. A normal user with `score = 0` or positive returns `False`. We shipped the binding with `negate=False`, so the binding result for every normal user was `False`. With `policy_engine_mode: any` on the flow and this as the **only** binding, every LDAP bind made the flow non-applicable. Authentik returned 49 regardless of whether the password was correct.
+
+**Why this hid for ten releases (v0.9.2 → v0.9.12-rc):** the LDAP outpost runs in `bind_mode: cached`. Once `adm_ldapservice`'s first successful bind landed in the cache, all subsequent binds for that DN were served from cache and never re-consulted the flow. The misconfigured binding never had a chance to fail. `webadmin` was only re-evaluated when the operator clicked Sync webadmin (rare in practice). v0.9.12's `_startup_resync_ldap_service_account` force-recreates the LDAP outpost on every console boot, wiping the bind cache, exposing the long-standing misconfig.
+
+**Fix — three layers:**
+
+1. **`_authentik_setup_reputation_policy()`** — new bindings POST with `negate=True, failure_result=True`. The block now carries the upstream source citation in a multi-line comment so the next agent doesn't re-flip it.
+2. **`_authentik_setup_reputation_policy()` retro-fix branch** — when the binding already exists, the drift detector triggers DELETE+POST recreate if **either** `failure_result != True` **or** `negate != True`. (PATCH on `policies/bindings/{pk}/` returns 405 on Authentik 2026.x — DELETE+POST is the documented workaround.)
+3. **`_startup_fix_reputation_policy_drift()`** — same dual-field idempotent migration runs on every console startup. Existing v0.9.11 installs converge automatically on first Update Now; subsequent boots are no-ops.
+
+**Boolean truth table after the fix:**
+
+| user state | `score <= -5`? | policy returns | after `negate` | binding result | flow applicable | bind result |
+|---|---|---|---|---|---|---|
+| normal (`score=0..+N`) | False | `False` | `True` | passes | YES | password check runs |
+| brute-force abuser (`score <= -5`) | True | `True` | `False` | denies | NO | bind rejected (intended gate) |
+
+This is the **Authentik-documented usage** of ReputationPolicy as a brute-force gate, and is now what infra-TAK actually ships.
+
+**Cross-references:**
+- `docs/HANDOFF-LDAP-AUTHENTIK.md` updated with a `negate=True` rule line so this can't get re-introduced without a doc trigger.
+- The session that diagnosed this on `tak-10` is captured in the project transcripts; the proof was a direct `inspect.getsource()` call on the running container's `ReputationPolicy.passes` — exactly the workflow `.cursor/rules/consult-upstream-docs.mdc` requires.
+
 ---
 
 ## Operator action required

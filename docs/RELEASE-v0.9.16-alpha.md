@@ -39,8 +39,8 @@ New post-update migration step: `_auto_remove_stale_docker_service_connections()
 
 Runs in `_run_post_update()` after `_authentik_tasklog_cleanup()`. Uses the Authentik API to:
 
-1. `GET /api/v3/core/service_connections/docker/` — list all Docker service connections.
-2. For each connection where `local: true` (meaning "connect to `/var/run/docker.sock` on the worker host"), issue `DELETE /api/v3/core/service_connections/docker/{pk}/`.
+1. `GET /api/v3/outposts/service_connections/docker/` — list all Docker service connections.
+2. For each connection where `local: true` (meaning "connect to `/var/run/docker.sock` on the worker host"), issue `DELETE /api/v3/outposts/service_connections/docker/{pk}/`.
 3. Log what was deleted, or "nothing to do" if no local connections were found.
 
 **Idempotent** — if no local Docker service connections exist, it logs one line and exits. Safe to run on every Update Now; subsequent runs are no-ops.
@@ -69,6 +69,12 @@ Runs in `_run_post_update()` after `_authentik_tasklog_cleanup()`. Uses the Auth
 - **No impact on any other Authentik functionality.** Docker service connections are only used to let Authentik manage outpost containers via the Docker daemon directly. infra-TAK does not use this feature.
 
 ---
+
+---
+
+## Authentik — Update button spinner
+
+The **Update** button on the Authentik detail page now shows a spinner and status line while the image pull and container restart is in progress (identical UX to TAK Portal and Caddy). Previously the button went silent for up to 5 minutes with no feedback during a version upgrade.
 
 ---
 

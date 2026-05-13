@@ -124,9 +124,3 @@ sed -n '/^  ldap:/,/^[a-z]/p' ~/authentik/docker-compose.yml | grep -c "extra_ho
 docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}' | grep authentik
 # Expected: all <5%
 ```
-
----
-
-## Slack-able summary
-
-> infra-TAK v0.9.18: critical hotfix to the v0.8.4/v0.8.5 LDAP outpost routing repair. Single-pass YAML rewriter was injecting a duplicate `extra_hosts:` key when the LDAP block already had one — making `docker-compose.yml` unparseable and trapping spiraling boxes in a forever repair-rollback loop (10-min cycles). Observed on tak-10: 492% Authentik CPU, 74 failed-flow events/min, 213 Postgres connections, 6 failed repair attempts in 70 min. Rewriter is now a shared helper that pre-scans the LDAP block once before deciding what to inject; validated against 5 real-world compose states. Drop-in update — next spiral monitor tick after Update Now will land the fix automatically.

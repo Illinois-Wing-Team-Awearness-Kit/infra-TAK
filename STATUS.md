@@ -9,7 +9,7 @@
 
 ## VPS
 - Host: `172.93.50.47` (tak-10)
-- Repo path: `/root/infra-TAK`
+- Repo path: `/home/takwerx/infra-TAK`
 - Container: `nodered`
 - Configurator: `http://172.93.50.47:1880/configurator`
 - Node-RED editor: `http://172.93.50.47:1880`
@@ -20,16 +20,16 @@
 
 | Commit | What |
 |--------|------|
-| `e21ddba` | **fix:** `ldap-authentication-login` session_duration=seconds=120 — password changes now propagate within 2 min instead of 24 hrs; revert token_validity (wrong field, silently ignored) |
-| `104d056` | **fix (reverted):** token_validity=minutes=2 on LDAP provider — this was the wrong field; superseded by e21ddba |
-| `fa1e859` | **fix:** TC AVL flow creation + add test connection button |
+| `22ef1f3` | **fix(authentik):** escape `\\n` in `akUpdate` confirm dialog — literal newline in JS string caused `SyntaxError: Invalid or unexpected token` |
+| `6003575` | **feat(authentik):** add `akUpdate()` spinner + status line on Update button; fix release notes API path (`/core/` → `/outposts/`) |
+| `260d3b6` | **docs:** update v0.9.16 release notes and memory-bank for Caddy update button |
 
 ---
 
 ## What we are testing next
 
-1. **LDAP password propagation** — confirmed working on tak-10; new password takes effect immediately, old password rejected within 2 min
-2. **Node-RED work (separate chat)** — Tablet Command AVL streaming, PulsePoint, per-source port routing
+1. **v0.9.16 release** — merge dev → main, tag `v0.9.16-alpha` ← **IN PROGRESS**
+2. **LDAP password propagation** — confirmed working on tak-10; new password takes effect immediately, old password rejected within 2 min
 
 ---
 

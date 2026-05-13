@@ -28,7 +28,7 @@
 
 ## What we are testing next
 
-1. **v0.9.16 release** — merge dev → main, tag `v0.9.16-alpha` ← **IN PROGRESS**
+1. **v0.9.16 release** — merged to `main`, tagged `v0.9.16-alpha` ✓ DONE
 2. **LDAP password propagation** — confirmed working on tak-10; new password takes effect immediately, old password rejected within 2 min
 
 ---

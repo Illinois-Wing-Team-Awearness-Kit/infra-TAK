@@ -20,15 +20,15 @@
 
 | Commit | What |
 |--------|------|
-| *(pending push)* | **v0.9.16-alpha:** hotfix — delete stale Authentik local Docker service connection causing ~26% worker CPU; `_auto_remove_stale_docker_service_connections()` in post-update ladder |
-| `e21ddba` | **fix:** `ldap-authentication-login` session_duration=seconds=120 — password changes now propagate within 2 min instead of 24 hrs; revert token_validity (wrong field, silently ignored) |
-| `104d056` | **fix (reverted):** token_validity=minutes=2 on LDAP provider — this was the wrong field; superseded by e21ddba |
+| `22ef1f3` | **fix(authentik):** escape `\\n` in `akUpdate` confirm dialog — literal newline in JS string caused `SyntaxError: Invalid or unexpected token` |
+| `6003575` | **feat(authentik):** add `akUpdate()` spinner + status line on Update button; fix release notes API path (`/core/` → `/outposts/`) |
+| `260d3b6` | **docs:** update v0.9.16 release notes and memory-bank for Caddy update button |
 
 ---
 
 ## What we are testing next
 
-1. **v0.9.16 hotfix** — pull dev on tak-10, click Update Now, confirm worker CPU drops and log shows "deleted stale local Docker service connection"
+1. **v0.9.16 release** — merge dev → main, tag `v0.9.16-alpha` ← **IN PROGRESS**
 2. **LDAP password propagation** — confirmed working on tak-10; new password takes effect immediately, old password rejected within 2 min
 
 ---

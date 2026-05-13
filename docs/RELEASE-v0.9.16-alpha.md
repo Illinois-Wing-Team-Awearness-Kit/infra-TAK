@@ -1,0 +1,75 @@
+# v0.9.16-alpha — Authentik Worker CPU Hotfix (Stale Docker Service Connection)
+
+**Date:** 2026-05-13
+**Type:** Hotfix. Drop-in update — no operator pre-flight, no migrations to run manually.
+
+---
+
+## What the operator does
+
+**Click Update Now in the Console.** That's it.
+
+After the update, the Authentik worker CPU will drop from ~26% sustained to near-idle. No restarts required — the cleanup runs against the live Authentik API during the post-update migration ladder.
+
+---
+
+## What this fixes
+
+After upgrading Authentik to 2026.2.3 (or any recent version), operators saw the `authentik-worker-1` container sitting at ~25–30% CPU continuously. The worker logs showed the same error firing every 30 seconds:
+
+```
+DockerException: Error while fetching server API version:
+  ('Connection aborted.', FileNotFoundError(2, 'No such file or directory'))
+outpost_service_connection_monitor(UUID('...'))
+```
+
+**Root cause — two-step chain:**
+
+1. **v0.9.2-alpha** (CVE-2026-31431 hardening) deliberately removed `/var/run/docker.sock` from the Authentik worker container's compose volumes. infra-TAK uses a standalone `authentik-ldap-1` container managed by docker compose — not Docker-managed outposts — so the socket was never needed and was a security liability (full Docker daemon access from a compromised worker = host root).
+
+2. That fix patched the compose file but never cleaned up the **Docker service connection** stored in Authentik's database. Authentik's upstream quickstart creates a "Local Docker" service connection by default. With the socket gone, the worker's `outpost_service_connection_monitor` task retries it every 30 seconds, fails, and dramatiq retries it again — burning CPU in a tight loop indefinitely.
+
+This was present on every operator install since v0.9.2 but became clearly visible after the Authentik 2026.2.3 upgrade improved logging.
+
+---
+
+## What changed under the hood
+
+New post-update migration step: `_auto_remove_stale_docker_service_connections()`.
+
+Runs in `_run_post_update()` after `_authentik_tasklog_cleanup()`. Uses the Authentik API to:
+
+1. `GET /api/v3/core/service_connections/docker/` — list all Docker service connections.
+2. For each connection where `local: true` (meaning "connect to `/var/run/docker.sock` on the worker host"), issue `DELETE /api/v3/core/service_connections/docker/{pk}/`.
+3. Log what was deleted, or "nothing to do" if no local connections were found.
+
+**Idempotent** — if no local Docker service connections exist, it logs one line and exits. Safe to run on every Update Now; subsequent runs are no-ops.
+
+**Non-fatal** — the entire function is wrapped in a top-level exception handler. If Authentik is unreachable at migration time (e.g. still starting up), it skips with a logged warning and does not block the rest of the update.
+
+---
+
+## Operator notes
+
+- **Drop-in from v0.9.15.** Leave the update channel on `main` (green).
+- **You will see this in the Update Now log:**
+  ```
+  Post-update: Authentik — deleted stale local Docker service connection 'Local Docker' (<uuid>)
+  ```
+  or, on installs where the connection was already cleaned up manually:
+  ```
+  Post-update: Authentik Docker SC cleanup — no local connections found, nothing to do
+  ```
+- **Verify the fix worked** — after Update Now, run:
+  ```bash
+  docker stats --no-stream --format '{{.Name}}\t{{.CPUPerc}}' | grep authentik-worker
+  ```
+  Expected: `authentik-worker-1` at `<2%` (idle). The 30-second `DockerException` loop in the worker logs will also stop.
+- **No impact on LDAP authentication.** The `authentik-ldap-1` outpost container connects back to Authentik over the network (`AUTHENTIK_HOST`) — it does not use the Docker socket and is completely unaffected.
+- **No impact on any other Authentik functionality.** Docker service connections are only used to let Authentik manage outpost containers via the Docker daemon directly. infra-TAK does not use this feature.
+
+---
+
+## Slack-able summary
+
+> infra-TAK v0.9.16 hotfix: Authentik worker was burning ~26% CPU on every install since v0.9.2 due to a stale "Local Docker" service connection in Authentik's database. The v0.9.2 CVE hardening removed the Docker socket mount but didn't clean up the DB record — so the worker retried the dead socket every 30 seconds forever. Update Now auto-deletes it via the Authentik API. Drop-in, no operator action.

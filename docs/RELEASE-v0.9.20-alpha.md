@@ -17,7 +17,7 @@ Four related fixes:
 
 4. **Authentik PostgreSQL connection-pool tuning** — three coordinated changes to address `FATAL: sorry, too many clients already` and idle-in-transaction pileup on the django_postgres_cache table observed on tak-10 after the v0.9.18 LDAP-routing fix: (a) bump `max_connections` 300 → 500 in the Postgres command line; (b) append `AUTHENTIK_POSTGRESQL__CONN_MAX_AGE=60` + `AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS=true` to `~/authentik/.env` so Django reuses connections instead of opening one per request; (c) add a `django_channels_postgres_message` row-count + size signal to the spiral monitor (informational — surfaces channel-layer bloat in operator logs without tripping routing repair). Refs: [goauthentik/authentik#20714](https://github.com/goauthentik/authentik/issues/20714), [#20644](https://github.com/goauthentik/authentik/issues/20644), [Authentik configuration docs](https://docs.goauthentik.io/install-config/configuration/).
 
-Validated on `tak-10` (`stream.test12.taktical.net`) running MediaMTX v1.18.1 — HLS Watch playback confirmed working after Update Now. Authentik PG pool tuning will be validated on the same box after the v0.9.20 push.
+**Fully validated on `tak-10`** (`test12.taktical.net`, MediaMTX v1.18.1) — 2026-05-13. All four parts confirmed working on a real production-shaped install. See the **Final validation on tak-10** section at the bottom for the full evidence pack.
 
 ---
 
@@ -366,3 +366,81 @@ ls -la ~/authentik/.env.bak.pg-persistent-conn.*                                
 ```
 
 Plus the corresponding `Startup migration: pg persistent connections: appended 2 var(s)...` log line in `journalctl -u takwerx-console`.
+
+---
+
+## Final validation on tak-10 (2026-05-13, 21:15 PT / 04:15 UTC)
+
+`tak-10` = `test12.taktical.net`, MediaMTX v1.18.1, Authentik 2026.x. Box was running v0.9.18-alpha at start of incident, pulled v0.9.19 dev → v0.9.20 dev → v0.9.20 final all in the same evening.
+
+### Part 1 + 2 — Caddy HLS + auto-regenerate
+
+- `/etc/caddy/Caddyfile` contains `header_down Location ^ /hls-proxy` inside the `handle_path /hls-proxy/*` block on `stream.test12.taktical.net` ✓
+- HLS Watch playback confirmed working by the MediaMTX team after the dev push ✓
+- `curl -sI https://stream.test12.taktical.net/hls-proxy/teststream/index.m3u8` returns `Location: /hls-proxy/teststream/index.m3u8?cookieCheck=1` (not the broken `/teststream/...`) ✓
+- `journalctl -u takwerx-console | grep "Caddyfile regenerated"` shows post-update banner ✓
+
+### Part 3 — Authentik PG pool tuning + wiring-gap fix
+
+After the wiring-gap fix's `_startup_migrations` push, the next `systemctl restart takwerx-console` produced this log sequence:
+
+```
+infra-TAK v0.9.20-alpha started
+Guard Dog: 2 script(s) updated on console startup.
+Startup migration:  authentik tunings: no changes needed (idempotent — already applied)
+Startup migration:  authentik config verify: all checks passed
+                    (workers=4, cache=600s, log_level=warning, pg_idle_timeout=300s,
+                     trusted_proxy_cidrs=172.16.0.0/12)
+Startup migration:  pg idle timeout: already 300s + max_connections=500 (idempotent — no-op)
+Startup migration:  gunicorn timeout: GUNICORN_CMD_ARGS already set in .env — skipping (idempotent)
+Startup migration:  pg persistent connections: both env vars already set in .env — skipping (idempotent)
+Startup migration:  ldap flow recursion: no bindings need fixing (idempotent — already correct)
+Startup migration:  trusted proxy CIDRs: already set — idempotent-noop
+Startup migration:  reputation policy: ✓ applied successfully
+Startup migration:  snapshot schedule: enabled (daily at 14:00, retention=7)
+[spiral monitor] PID 1668763 acquired monitor lock — starting
+[spiral monitor]   proactive routing: outpost already on FQDN — skipping (already correct)
+```
+
+Direct evidence on the running containers:
+
+| Verification | Expected | Got |
+|---|---|---|
+| `SHOW max_connections` (Postgres) | `500` | `500` ✓ |
+| `printenv AUTHENTIK_POSTGRESQL__CONN_MAX_AGE` (server) | `60` | `60` ✓ |
+| `printenv AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS` (worker) | `true` | `true` ✓ |
+| `pg_stat_activity` total connections | < 200 healthy | **157** ✓ |
+| `pg_stat_activity WHERE state='idle in transaction'` | < 5 | **0** ✓ |
+| `count(*) FROM django_channels_postgres_message` | < 5,000 | **3,834** ✓ |
+| `pg_total_relation_size('django_channels_postgres_message')` | < 50 MB | **40 MB** ✓ |
+| Authentik server CPU (steady state) | < 50% | **29%** ✓ |
+| Authentik worker CPU (steady state) | < 50% | **0.3%** ✓ |
+| New error/critical log lines in worker (18 min post-deploy) | 0 | **0** ✓ |
+
+Before/after on the same box for context:
+
+| Metric | Pre-v0.9.20 (incident state) | Post-v0.9.20 (validated) |
+|---|---|---|
+| Authentik server CPU | 807% | 29% |
+| Authentik worker CPU | 73% | 0.3% |
+| PG total connections | 221 | 157 |
+| PG idle-in-transaction | 75 | 0 |
+| `channels_postgres_message` rows | 109,840 | 3,834 |
+| `channels_postgres_message` size | 61 MB | 40 MB |
+| "too many clients" errors/min | continuous | 0 |
+
+The 33-second log storm of `failed to resolve host 'postgresql'` / `AdminShutdown` errors at `2026-05-14T03:48:24` → `03:48:57` (matching the Postgres recreate window when `max_connections=300 → 500` was applied) recovered cleanly thanks to `CONN_HEALTH_CHECKS=true` — every dead connection was detected and replaced on the next request, no manual worker restart needed.
+
+### Part 4 — Guard Dog 8089 false-positive fix
+
+- `Guard Dog: 2 script(s) updated on console startup.` log line confirmed both `tak-8089-watch.sh` and `tak-post-start.sh` auto-deployed to `/opt/tak-guarddog/` ✓ (no manual "Deploy Guard Dog" click required)
+- `grep -c 'nc -z\|CONNECT_OK\|CONNECT_TIMEOUT' /opt/tak-guarddog/tak-8089-watch.sh` → only matches are inside the explanatory comment, no live code references ✓
+- `grep -c 'nc -z' /opt/tak-guarddog/tak-post-start.sh` → only the LDAP-389 plain-TCP probes remain (intentional — port 389 is plaintext LDAP) ✓
+- `sudo /opt/tak-guarddog/tak-8089-watch.sh; echo exit=$?` → `exit=0` ✓
+- `cat /var/lib/takguard/8089.failcount` → `0` ✓
+
+### Wiring-gap fix prevention test
+
+The wiring-gap subsection above (Part 3 follow-up) was specifically validated by **NOT bumping VERSION** on the wiring-gap fix push and confirming the new migration helpers ran via `_startup_migrations` on next `systemctl restart takwerx-console`. tak-10 was the same box where the gap was discovered. After the fix landed, the next `Update Now` correctly applied the missing env-vars on the box that previously had `last_console_version=0.9.20-alpha` and was being silently skipped by the version-gated post-update hook.
+
+This validates the architectural decision: **migrations that need guaranteed reach should live in `_startup_migrations`, not in version-gated `_post_update_auto_deploy`**. Both call sites are kept (defense in depth) but the startup-migration block is now authoritative.

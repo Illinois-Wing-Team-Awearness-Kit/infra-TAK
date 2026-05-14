@@ -1,12 +1,13 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
   "contentVersion": "1.0.0.0",
+  "_comment": "infra-TAK App Node NSG — aligned with deployment as of v0.9.15-alpha (2026-05). Public streaming via MediaMTX (8554/8322/8890/8000-8001) and CloudTAK Media (18554/11935/18890). All admin UIs (Authentik 9000/9443, TAK Portal 3000, Node-RED 1880, MediaMTX webedit 5080 / HLS 8888 / API 9898, CloudTAK api/tiles/media-admin 5000/5002/9997/18888/9002) are bound to 127.0.0.1 on the host and reached only via Caddy on 443 with Authentik forward_auth — no NSG rule required. See docs/PORT-EXPOSURE-POLICY.md for the tier model.",
   "parameters": {
     "nsgName": {
       "type": "string",
-      "defaultValue": "tak-test-1-nsg",
+      "defaultValue": "tak-app-nsg",
       "metadata": {
-        "description": "Name of the existing NSG to update"
+        "description": "Name of the existing NSG to update (App Node)"
       }
     },
     "location": {
@@ -54,7 +55,7 @@
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
               "destinationPortRange": "80",
-              "description": "HTTP - redirects to HTTPS via Caddy"
+              "description": "HTTP - Caddy ACME HTTP-01 challenge and redirect to HTTPS"
             }
           },
           {
@@ -68,7 +69,7 @@
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
               "destinationPortRange": "443",
-              "description": "HTTPS - all web services via Caddy"
+              "description": "HTTPS - Caddy terminates TLS for CloudTAK, TAK Portal, Node-RED, Authentik, MediaMTX webedit/HLS"
             }
           },
           {
@@ -82,7 +83,7 @@
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
               "destinationPortRange": "5001",
-              "description": "infra-TAK management console"
+              "description": "infra-TAK management console - direct-IP backdoor (admin only)"
             }
           },
           {
@@ -96,7 +97,7 @@
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
               "destinationPortRange": "8089",
-              "description": "TAK Server - ATAK/WinTAK/iTAK client connections (TLS)"
+              "description": "TAK Server - ATAK/WinTAK/iTAK client connections (TLS, client-cert)"
             }
           },
           {
@@ -110,7 +111,7 @@
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
               "destinationPortRange": "8443",
-              "description": "TAK Server admin - certificate auth"
+              "description": "TAK Server admin WebGUI - client certificate auth"
             }
           },
           {
@@ -124,11 +125,11 @@
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
               "destinationPortRange": "8446",
-              "description": "TAK Server admin - LDAP/password auth"
+              "description": "TAK Server admin WebGUI - LDAP/password auth (Let's Encrypt cert via Caddy)"
             }
           },
           {
-            "name": "RTSP",
+            "name": "MediaMTX-RTSP",
             "properties": {
               "priority": 170,
               "protocol": "Tcp",
@@ -138,11 +139,11 @@
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
               "destinationPortRange": "8554",
-              "description": "MediaMTX - RTSP drone video stream"
+              "description": "MediaMTX - RTSP drone/video stream (basic-auth + token)"
             }
           },
           {
-            "name": "WebRTC-HLS",
+            "name": "MediaMTX-RTSPS",
             "properties": {
               "priority": 180,
               "protocol": "Tcp",
@@ -151,12 +152,12 @@
               "sourceAddressPrefix": "*",
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
-              "destinationPortRange": "8889",
-              "description": "MediaMTX - WebRTC/HLS video playback"
+              "destinationPortRange": "8322",
+              "description": "MediaMTX - RTSPS (TLS-wrapped RTSP) for encrypted drone/video streams"
             }
           },
           {
-            "name": "WebRTC-signal",
+            "name": "MediaMTX-SRT",
             "properties": {
               "priority": 190,
               "protocol": "Udp",
@@ -165,12 +166,12 @@
               "sourceAddressPrefix": "*",
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
-              "destinationPortRange": "8189",
-              "description": "MediaMTX - WebRTC signaling"
+              "destinationPortRange": "8890",
+              "description": "MediaMTX - SRT streaming clients (UDP)"
             }
           },
           {
-            "name": "RTP-media",
+            "name": "MediaMTX-RTP",
             "properties": {
               "priority": 200,
               "protocol": "Udp",
@@ -179,28 +180,70 @@
               "sourceAddressPrefix": "*",
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
-              "destinationPortRange": "9000-9100",
-              "description": "MediaMTX - WebRTC RTP media ports"
+              "destinationPortRange": "8000",
+              "description": "MediaMTX - RTP companion port for RTSP (UDP)"
             }
           },
           {
-            "name": "MediaMTX-web-editor",
+            "name": "MediaMTX-RTCP",
             "properties": {
               "priority": 210,
+              "protocol": "Udp",
+              "access": "Allow",
+              "direction": "Inbound",
+              "sourceAddressPrefix": "*",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "*",
+              "destinationPortRange": "8001",
+              "description": "MediaMTX - RTCP companion port for RTSP (UDP)"
+            }
+          },
+          {
+            "name": "CloudTAK-Media-RTSP",
+            "properties": {
+              "priority": 220,
               "protocol": "Tcp",
               "access": "Allow",
               "direction": "Inbound",
-              "sourceAddressPrefix": "[parameters('adminSourceIP')]",
+              "sourceAddressPrefix": "*",
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
-              "destinationPortRange": "5080",
-              "description": "MediaMTX web editor - admin only"
+              "destinationPortRange": "18554",
+              "description": "CloudTAK Media - RTSP clients for CloudTAK video tab"
+            }
+          },
+          {
+            "name": "CloudTAK-Media-RTMP",
+            "properties": {
+              "priority": 230,
+              "protocol": "Tcp",
+              "access": "Allow",
+              "direction": "Inbound",
+              "sourceAddressPrefix": "*",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "*",
+              "destinationPortRange": "11935",
+              "description": "CloudTAK Media - RTMP publishers for CloudTAK video tab"
+            }
+          },
+          {
+            "name": "CloudTAK-Media-SRT",
+            "properties": {
+              "priority": 240,
+              "protocol": "Udp",
+              "access": "Allow",
+              "direction": "Inbound",
+              "sourceAddressPrefix": "*",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "*",
+              "destinationPortRange": "18890",
+              "description": "CloudTAK Media - SRT clients for CloudTAK video tab (UDP)"
             }
           },
           {
             "name": "TAK-Server-plaintext-disabled",
             "properties": {
-              "priority": 220,
+              "priority": 300,
               "protocol": "Tcp",
               "access": "Deny",
               "direction": "Inbound",
@@ -208,7 +251,21 @@
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
               "destinationPortRange": "8087",
-              "description": "TAK Server plaintext port - disabled by default, deny explicitly"
+              "description": "TAK Server plaintext input - disabled by default, deny explicitly (defense-in-depth)"
+            }
+          },
+          {
+            "name": "PostgreSQL-never-public",
+            "properties": {
+              "priority": 310,
+              "protocol": "Tcp",
+              "access": "Deny",
+              "direction": "Inbound",
+              "sourceAddressPrefix": "*",
+              "sourcePortRange": "*",
+              "destinationAddressPrefix": "*",
+              "destinationPortRange": "5432",
+              "description": "PostgreSQL - never publicly reachable on the App Node. CloudTAK PostGIS and Authentik PG are Docker-internal only. Deny explicitly (PG_MEM incident, v0.9.11)."
             }
           }
         ]

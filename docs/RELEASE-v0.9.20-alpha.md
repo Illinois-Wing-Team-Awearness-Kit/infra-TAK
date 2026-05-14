@@ -1,4 +1,4 @@
-# v0.9.20-alpha — MediaMTX HLS Caddyfile fix + Caddyfile auto-regenerate on Update Now + Authentik PostgreSQL connection-pool tuning
+# v0.9.20-alpha — MediaMTX HLS Caddyfile fix + Caddyfile auto-regenerate on Update Now + Authentik PostgreSQL connection-pool tuning + Guard Dog 8089 false-positive fix
 
 **Date:** 2026-05-13
 **Type:** Drop-in update — no operator pre-flight, no migrations to run manually.
@@ -7,19 +7,32 @@
 
 ## TL;DR
 
-Three related fixes:
+Four related fixes:
 
-1. **Caddyfile — MediaMTX HLS cookie-check** — Added `header_down Location ^ /hls-proxy` inside the `handle_path /hls-proxy/*` block on the MediaMTX FQDN, so MediaMTX v1.18.x's new HLS session-tracking cookie-check redirect (302 → `?cookieCheck=1`) lands back inside Caddy's `/hls-proxy/*` handler instead of 404'ing outside it. Without the fix, HLS Watch playback is broken on every infra-TAK server running MediaMTX v1.18.0+; the v1.18.x release notes flag the cookie-check redirect as the breaking change. Reference: [INFRA-TAK-CADDY-HLS-v1.18.md](https://github.com/takwerx/mediamtx-installer/blob/main/docs/INFRA-TAK-CADDY-HLS-v1.18.md).
+1. **Guard Dog — 8089 false-positive restarts** — Replaced the `nc -z 127.0.0.1:8089` TCP-connect liveness probe with an `ss -ltn` LISTEN check. Port 8089 requires mutual TLS (`auth="x509"`); raw TCP probes cause Netty to log an SSL error on every check and, on some netcat-openbsd builds, return non-zero — triggering false-positive restarts that drain the 3/day restart cap and spam the Guard Dog activity log with "SKIP | 8089 unhealthy but daily restart cap reached". The `ss` LISTEN check is sufficient: if Netty is bound, the messaging process is accepting connections. Same change applied to `tak-post-start.sh`'s boot-wait loop (which used `nc -z` for the same port). Fixes [issue #24](https://github.com/takwerx/infra-TAK/issues/24).
 
-2. **Caddyfile auto-regenerate on Update Now** — `_post_update_auto_deploy()`'s migration thread now ends with `generate_caddyfile() + systemctl reload caddy` (idempotent no-op when FQDN isn't set). Surfaced during the v0.9.19 HLS rollout: the Caddyfile template change in `generate_caddyfile()` was correct, but `Update Now` only does `git fetch → checkout → systemctl restart takwerx-console` — it never rewrites `/etc/caddy/Caddyfile`. So the new template code was on disk and the rendered Caddyfile was stale. From this release on, every version bump auto-rolls Caddyfile template changes without operator action.
+2. **Caddyfile — MediaMTX HLS cookie-check** — Added `header_down Location ^ /hls-proxy` inside the `handle_path /hls-proxy/*` block on the MediaMTX FQDN, so MediaMTX v1.18.x's new HLS session-tracking cookie-check redirect (302 → `?cookieCheck=1`) lands back inside Caddy's `/hls-proxy/*` handler instead of 404'ing outside it. Without the fix, HLS Watch playback is broken on every infra-TAK server running MediaMTX v1.18.0+; the v1.18.x release notes flag the cookie-check redirect as the breaking change. Reference: [INFRA-TAK-CADDY-HLS-v1.18.md](https://github.com/takwerx/mediamtx-installer/blob/main/docs/INFRA-TAK-CADDY-HLS-v1.18.md).
 
-3. **Authentik PostgreSQL connection-pool tuning** — three coordinated changes to address `FATAL: sorry, too many clients already` and idle-in-transaction pileup on the django_postgres_cache table observed on tak-10 after the v0.9.18 LDAP-routing fix: (a) bump `max_connections` 300 → 500 in the Postgres command line; (b) append `AUTHENTIK_POSTGRESQL__CONN_MAX_AGE=60` + `AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS=true` to `~/authentik/.env` so Django reuses connections instead of opening one per request; (c) add a `django_channels_postgres_message` row-count + size signal to the spiral monitor (informational — surfaces channel-layer bloat in operator logs without tripping routing repair). Refs: [goauthentik/authentik#20714](https://github.com/goauthentik/authentik/issues/20714), [#20644](https://github.com/goauthentik/authentik/issues/20644), [Authentik configuration docs](https://docs.goauthentik.io/install-config/configuration/).
+3. **Caddyfile auto-regenerate on Update Now** — `_post_update_auto_deploy()`'s migration thread now ends with `generate_caddyfile() + systemctl reload caddy` (idempotent no-op when FQDN isn't set). Surfaced during the v0.9.19 HLS rollout: the Caddyfile template change in `generate_caddyfile()` was correct, but `Update Now` only does `git fetch → checkout → systemctl restart takwerx-console` — it never rewrites `/etc/caddy/Caddyfile`. So the new template code was on disk and the rendered Caddyfile was stale. From this release on, every version bump auto-rolls Caddyfile template changes without operator action.
+
+4. **Authentik PostgreSQL connection-pool tuning** — three coordinated changes to address `FATAL: sorry, too many clients already` and idle-in-transaction pileup on the django_postgres_cache table observed on tak-10 after the v0.9.18 LDAP-routing fix: (a) bump `max_connections` 300 → 500 in the Postgres command line; (b) append `AUTHENTIK_POSTGRESQL__CONN_MAX_AGE=60` + `AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS=true` to `~/authentik/.env` so Django reuses connections instead of opening one per request; (c) add a `django_channels_postgres_message` row-count + size signal to the spiral monitor (informational — surfaces channel-layer bloat in operator logs without tripping routing repair). Refs: [goauthentik/authentik#20714](https://github.com/goauthentik/authentik/issues/20714), [#20644](https://github.com/goauthentik/authentik/issues/20644), [Authentik configuration docs](https://docs.goauthentik.io/install-config/configuration/).
 
 Validated on `tak-10` (`stream.test12.taktical.net`) running MediaMTX v1.18.1 — HLS Watch playback confirmed working after Update Now. Authentik PG pool tuning will be validated on the same box after the v0.9.20 push.
 
 ---
 
 ## What was wrong
+
+### Part 4 — Guard Dog 8089 false-positive restarts (issue #24)
+
+Port 8089 on TAK Server is configured with `auth="x509" protocol="tls"` (mutual TLS). The Guard Dog's `tak-8089-watch.sh` ran two checks every minute:
+
+1. `ss -ltn "sport = :8089"` → port is LISTEN ✓
+2. `nc -z -w 5 127.0.0.1 8089` → raw TCP connect (no TLS)
+
+Step 2 is the problem. When `nc -z` connects to an mTLS port, the TCP 3-way handshake completes but Netty immediately begins TLS negotiation. `nc -z` sends no TLS ClientHello, so Netty logs an SSL error and closes the connection. On some builds of netcat-openbsd, the RST/FIN arrives before `nc` has reported success — causing it to return non-zero. Result: `CONNECT_OK=false` → `LISTEN_OK && CONNECT_OK` fails → false-positive unhealthy count increments every minute → 3 restarts hit the daily cap → every subsequent check logs `SKIP | 8089 unhealthy but daily restart cap (3) reached` in the Guard Dog activity log. TAK Server is healthy; the health check is not.
+
+Same `nc -z 127.0.0.1 8089` pattern in `tak-post-start.sh`'s boot-wait loop polluted the TAK server log with SSL errors on every boot.
 
 ### Part 1 — MediaMTX v1.18.x HLS cookie check
 
@@ -38,6 +51,21 @@ This is the exact reason the v0.9.19 HLS fix appeared "not applied" on tak-10 af
 ---
 
 ## What changed
+
+### Part 4 — `tak-8089-watch.sh` and `tak-post-start.sh`
+
+**`scripts/guarddog/tak-8089-watch.sh`** — removed the `nc -z` TCP-connect block and the `CONNECT_TIMEOUT` constant. `CONNECT_OK` variable eliminated. The "healthy" condition is now just `LISTEN_OK` (port is bound per `ss -ltn`). Detail log line updated from `listen=$LISTEN_OK connect=$CONNECT_OK` to `listen=$LISTEN_OK`. No logic changes to restart thresholds, cooldown, daily cap, or alerting.
+
+**`scripts/guarddog/tak-post-start.sh`** — boot-wait loop changed from:
+```bash
+if nc -z 127.0.0.1 8089 2>/dev/null; then
+```
+to:
+```bash
+if ss -ltn "sport = :8089" 2>/dev/null | grep -q LISTEN; then
+```
+
+Both files are read from disk at Guard Dog deploy time — the fix ships to servers when the operator runs **Deploy Guard Dog** or via the next Guard Dog re-deploy. No console restart required; the scripts land in `/opt/tak-guarddog/` at deploy.
 
 ### Part 1 — `generate_caddyfile()` Caddyfile template
 
@@ -107,6 +135,8 @@ Safe to deploy to all infra-TAK servers regardless of their current MediaMTX ver
 ---
 
 ## Operator notes
+
+- **Guard Dog 8089 fix (issue #24):** If your Guard Dog activity log is full of `SKIP | 8089 unhealthy but daily restart cap (3) reached`, TAK Server is almost certainly healthy — the health check was the problem. After Update Now, re-deploy Guard Dog from the infra-TAK console (Guard Dog page → Deploy Guard Dog). This writes the updated `tak-8089-watch.sh` and `tak-post-start.sh` to `/opt/tak-guarddog/`. The 24-hour restart counter resets automatically at midnight — no manual intervention required. To reset it immediately: `echo 0 > /var/lib/takguard/tak_restart_count_24h`.
 
 - **Drop-in from v0.9.18.** Hit Update Now. No pre-flight, no manual Caddy reload required.
 - **Dev-channel boxes that pulled v0.9.19 dev commits before this hook landed:** resolved by v0.9.20. The version bump (`0.9.19-alpha → 0.9.20-alpha`) triggers the post-update hook on every box, including the dev fleet, so the Caddyfile auto-regenerate step fires on the next Update Now. No manual workaround required.

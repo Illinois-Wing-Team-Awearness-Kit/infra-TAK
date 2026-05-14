@@ -262,6 +262,77 @@ docker exec authentik-postgresql-1 psql -U authentik -d authentik -tA -c \
 # Expected: < 5,000 rows on a healthy box
 
 # 6. Migration outcome saved to settings
-python3 -c "import json; print(json.dumps(json.load(open('/root/takwerx-console/settings.json')).get('authentik_pg_persistent_conn_migration', {}), indent=2))"
+INSTALL_DIR=$(grep -E '^WorkingDirectory=' /etc/systemd/system/takwerx-console.service | cut -d= -f2-)
+python3 -c "import json; print(json.dumps(json.load(open('$INSTALL_DIR/.config/settings.json')).get('authentik_pg_persistent_conn_migration', {}), indent=2))"
 # Expected: {"ts": ..., "outcome": "success", "conn_max_age": 60, "conn_health_checks": true}
+# Note: settings.json lives at <WorkingDirectory>/.config/settings.json — the dir varies
+# per box (e.g. /home/takwerx/infra-TAK/.config/settings.json on installs running as the
+# takwerx user, not under /root/takwerx-console as an earlier draft of these notes said).
 ```
+
+---
+
+## Part 3 follow-up — wiring-gap fix (post-push, same v0.9.20-alpha)
+
+### Symptom on tak-10 (during v0.9.20 validation)
+
+After the v0.9.20 push, validation on tak-10 showed:
+
+- `max_connections=500` in PG ✓ (migration (a) landed)
+- `django_channels_postgres_message` cleanup happened (109,840 → 1,690 rows) ✓
+- Authentik server CPU dropped 807% → 16.80% ✓
+- **But** `AUTHENTIK_POSTGRESQL__CONN_MAX_AGE` and `CONN_HEALTH_CHECKS` were NOT in `~/authentik/.env`, NOT on the containers, and `settings.authentik_pg_persistent_conn_migration = {}` (empty audit) — migration (b) silently skipped.
+- No `.env.bak.pg-persistent-conn.*` backup file existed — proving the helper never wrote `.env`.
+
+### Root cause — burned VERSION-string + version-gated wiring
+
+The post-update auto-deploy hook (`_post_update_auto_deploy`) is version-gated: `if last_ver == VERSION: return`. tak-10 had pulled an earlier v0.9.20-alpha dev SHA (`ea0c951`, Caddy-only Caddyfile auto-regenerate fix) before the full v0.9.20 commit (`2970470`, Authentik PG pool tuning) landed. The first pull set `last_console_version=0.9.20-alpha` via the post-update hook's banner (`Post-update: version changed 0.9.19-alpha → 0.9.20-alpha`). The second pull (my full v0.9.20) had the same VERSION string, so the post-update hook **short-circuited** with no banner and no migration thread — even though new migration code was on disk.
+
+The startup-migration block (around line 39123 of `_startup_migrations`) is NOT version-gated: it runs on every console restart. It already had `_authentik_fix_pg_idle_timeout` wired in, which is why the `max_connections=500` bump did land on the second restart (compose patcher caught the drift, force-recreated Postgres, wrote the `last_outcome: fixed` audit at `2026-05-14T00:24:43Z` — 19 min after the second console restart). But `_ensure_authentik_pg_persistent_connections` and `_ensure_authentik_gunicorn_timeout` were ONLY in the version-gated post-update hook + the full-Authentik-deploy path + the TAK-deploy path. None of those fired on the second pull.
+
+### Fix
+
+Two-line addition to `_startup_migrations`, right after the existing `_authentik_fix_pg_idle_timeout` block:
+
+```python
+# v0.8.5 / v0.9.20 wiring-gap fix: gunicorn timeout + PG persistent connections
+# also run as startup migrations, not just post-update. Discovered during v0.9.20
+# tak-10 validation: when a VERSION string is burned by a partial commit (e.g. dev
+# SHA bumps VERSION to 0.9.20-alpha for a Caddy-only fix, then a later commit on
+# the same VERSION string adds Authentik migrations), the version-gated post-update
+# hook short-circuits on the next Update Now and the new migrations never fire.
+try:
+    _ensure_authentik_gunicorn_timeout(lambda m: print(f"Startup migration: {m}", flush=True))
+except Exception as ak_gt_err:
+    print(f"Startup migration: gunicorn timeout fix error (non-fatal): {ak_gt_err}")
+try:
+    _ensure_authentik_pg_persistent_connections(lambda m: print(f"Startup migration: {m}", flush=True))
+except Exception as ak_pc_err:
+    print(f"Startup migration: pg persistent connections fix error (non-fatal): {ak_pc_err}")
+```
+
+Both helpers are idempotent — they're no-ops on boxes where the env vars are already set or `~/authentik` isn't installed. They're safe to call unconditionally on every console restart.
+
+### Why no VERSION bump
+
+The fix is shipped under the same `0.9.20-alpha` string. The whole point of the wiring-gap fix is that the startup-migration block runs **on plain console restart**, not on version-change. Boxes that already have `last_console_version=0.9.20-alpha` (like tak-10) will pick up the helpers on their next `Update Now` (which does `git checkout new commit → systemctl restart takwerx-console`) — the restart fires the startup-migration block automatically.
+
+Also, this is the second wiring-gap discovery on v0.9.20 already (v0.9.19 dev iteration → v0.9.20 cut). Burning another VERSION number on a discovery that the fix mechanism itself was wrong would just compound the disposal pattern. Keeping `0.9.20-alpha` and adding a "wiring-gap follow-up" subsection here is the cleanest accounting.
+
+### Expected behaviour on tak-10 next Update Now
+
+1. `git fetch + checkout` to the new dev SHA.
+2. `systemctl restart takwerx-console` — gunicorn imports the new app.py.
+3. `_post_update_auto_deploy()` checks: `last_ver=0.9.20-alpha == VERSION=0.9.20-alpha` → short-circuits (still gated). No banner, no migration thread.
+4. **`_startup_migrations()` runs unconditionally** — calls `_ensure_authentik_gunicorn_timeout` (idempotent, already-set → skip) and `_ensure_authentik_pg_persistent_connections` (new code path → detects missing vars → backs up `.env` → appends 2 vars → recreates server + worker → writes audit).
+
+After step 4 completes (~30-45s after restart):
+
+```bash
+docker exec authentik-server-1 printenv AUTHENTIK_POSTGRESQL__CONN_MAX_AGE       # expect: 60
+docker exec authentik-worker-1 printenv AUTHENTIK_POSTGRESQL__CONN_HEALTH_CHECKS # expect: true
+grep AUTHENTIK_POSTGRESQL__CONN ~/authentik/.env                                  # expect: both lines
+ls -la ~/authentik/.env.bak.pg-persistent-conn.*                                  # expect: backup file from this run
+```
+
+Plus the corresponding `Startup migration: pg persistent connections: appended 2 var(s)...` log line in `journalctl -u takwerx-console`.

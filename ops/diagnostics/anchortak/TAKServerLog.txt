@@ -1,0 +1,82 @@
+TAKServer Log As Of Fri May 15 02:14:01 PM UTC 2026
+
+at org.apache.ignite.internal.processors.job.GridJobProcessor.processJobExecuteRequest(GridJobProcessor.java:1441)
+	at org.apache.ignite.internal.processors.job.GridJobProcessor$JobExecutionListener.onMessage(GridJobProcessor.java:2223)
+	at org.apache.ignite.internal.managers.communication.GridIoManager.invokeListener(GridIoManager.java:1877)
+	at org.apache.ignite.internal.managers.communication.GridIoManager.processRegularMessage0(GridIoManager.java:1498)
+	at org.apache.ignite.internal.managers.communication.GridIoManager$9.execute(GridIoManager.java:1402)
+	at org.apache.ignite.internal.managers.communication.TraceRunnable.run(TraceRunnable.java:55)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)
+	at java.base/java.lang.Thread.run(Thread.java:840)
+2026-05-15-13:43:33.330 [svc-#78] ERROR c.b.m.s.DistributedSubscriptionManager - exception in sendUpdatedGroupsLatestReachableSA for user : 62592anc
+java.lang.IllegalStateException: null subscription
+	at com.bbn.marti.service.DistributedSubscriptionManager.getSubscription(DistributedSubscriptionManager.java:1633)
+	at com.bbn.marti.groups.MessagingUtilImpl.sendLatestReachableSA(MessagingUtilImpl.java:138)
+	at com.bbn.marti.service.DistributedSubscriptionManager.sendUpdatedGroupsLatestReachableSA(DistributedSubscriptionManager.java:2672)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke0(Native Method)
+	at java.base/jdk.internal.reflect.NativeMethodAccessorImpl.invoke(NativeMethodAccessorImpl.java:77)
+	at java.base/jdk.internal.reflect.DelegatingMethodAccessorImpl.invoke(DelegatingMethodAccessorImpl.java:43)
+	at java.base/java.lang.reflect.Method.invoke(Method.java:569)
+	at org.apache.ignite.internal.processors.service.GridServiceProxy.callServiceMethod(GridServiceProxy.java:335)
+	at org.apache.ignite.internal.processors.service.GridServiceProxy$ServiceProxyCallable.callOrdinaryService(GridServiceProxy.java:614)
+	at org.apache.ignite.internal.processors.service.GridServiceProxy$ServiceProxyCallable.callService(GridServiceProxy.java:592)
+	at org.apache.ignite.internal.processors.service.GridServiceProxy$ServiceProxyCallable.call(GridServiceProxy.java:582)
+	at org.apache.ignite.internal.processors.service.GridServiceProxy$ServiceProxyCallable.call(GridServiceProxy.java:518)
+	at org.apache.ignite.internal.processors.closure.GridClosureProcessor$C2.execute(GridClosureProcessor.java:1694)
+	at org.apache.ignite.internal.processors.job.GridJobWorker$1.call(GridJobWorker.java:628)
+	at org.apache.ignite.internal.util.IgniteUtils.wrapThreadLoader(IgniteUtils.java:7473)
+	at org.apache.ignite.internal.processors.job.GridJobWorker.execute0(GridJobWorker.java:622)
+	at org.apache.ignite.internal.processors.job.GridJobWorker.body(GridJobWorker.java:547)
+	at org.apache.ignite.internal.util.worker.GridWorker.run(GridWorker.java:125)
+	at org.apache.ignite.internal.processors.job.GridJobProcessor.processJobExecuteRequest(GridJobProcessor.java:1441)
+	at org.apache.ignite.internal.processors.job.GridJobProcessor$JobExecutionListener.onMessage(GridJobProcessor.java:2223)
+	at org.apache.ignite.internal.managers.communication.GridIoManager.invokeListener(GridIoManager.java:1877)
+	at org.apache.ignite.internal.managers.communication.GridIoManager.processRegularMessage0(GridIoManager.java:1498)
+	at org.apache.ignite.internal.managers.communication.GridIoManager$9.execute(GridIoManager.java:1402)
+	at org.apache.ignite.internal.managers.communication.TraceRunnable.run(TraceRunnable.java:55)
+	at java.base/java.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1136)
+	at java.base/java.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:635)
+	at java.base/java.lang.Thread.run(Thread.java:840)
+2026-05-15-13:43:58.620 [RemoveSubscriptionPool-0] INFO c.b.m.s.DistributedSubscriptionManager - Removed Subscription: tls:40
+2026-05-15-13:44:01.805 [epollEventLoopGroup-4-5] INFO c.b.m.s.DistributedSubscriptionManager - Added Subscription: id=tls:81 source=166.137.148.252
+2026-05-15-13:44:35.215 [epollEventLoopGroup-4-6] INFO c.b.m.s.DistributedSubscriptionManager - Added Subscription: id=tls:82 source=166.137.148.58
+2026-05-15-13:44:42.402 [RemoveSubscriptionPool-0] INFO c.b.m.s.DistributedSubscriptionManager - Removed Subscription: tls:81
+2026-05-15-13:44:44.335 [epollEventLoopGroup-4-7] INFO c.b.m.s.DistributedSubscriptionManager - Added Subscription: id=tls:83 source=166.137.148.252
+2026-05-15-13:45:01.274 [CallsignAssignmentExecutor-0] INFO c.b.m.s.DistributedSubscriptionManager - Set client for subscription: tls:83 to D18 (E3913228-D72B-410D-B499-BC0B72CEAE25) source=166.137.148.252:31155
+2026-05-15-13:45:36.462 [CallsignAssignmentExecutor-0] INFO c.b.m.s.DistributedSubscriptionManager - Set client for subscription: tls:82 to D15 (8DC80876-6CE3-4587-A510-5522B710609A) source=166.137.148.58:4545
+2026-05-15-13:46:03.305 [RemoveSubscriptionPool-0] INFO c.b.m.s.DistributedSubscriptionManager - Removed Subscription: tls:83
+2026-05-15-13:46:06.251 [epollEventLoopGroup-4-8] INFO c.b.m.s.DistributedSubscriptionManager - Added Subscription: id=tls:84 source=166.137.148.252
+2026-05-15-13:46:06.393 [CallsignAssignmentExecutor-0] INFO c.b.m.s.DistributedSubscriptionManager - Set client for subscription: tls:84 to D18 (E3913228-D72B-410D-B499-BC0B72CEAE25) source=166.137.148.252:18299
+2026-05-15-13:48:07.727 [epollEventLoopGroup-4-9] INFO c.b.m.s.DistributedSubscriptionManager - Added Subscription: id=tls:85 source=166.137.148.121
+2026-05-15-13:49:40.489 [RemoveSubscriptionPool-0] INFO c.b.m.s.DistributedSubscriptionManager - Removed Subscription: tls:70
+2026-05-15-13:49:59.392 [CallsignAssignmentExecutor-0] INFO c.b.m.s.DistributedSubscriptionManager - Set client for subscription: tls:85 to D-24 (39EA5167-ECC8-4FFC-BCB9-62705594E414) source=166.137.148.121:49758
+2026-05-15-13:50:10.152 [epollEventLoopGroup-4-10] INFO c.b.m.s.DistributedSubscriptionManager - Added Subscription: id=tls:86 source=166.137.148.73
+2026-05-15-13:50:34.407 [CallsignAssignmentExecutor-0] INFO c.b.m.s.DistributedSubscriptionManager - Set client for subscription: tls:86 to D14 (C1064D77-398E-40FD-A9CD-435734CFC99F) source=166.137.148.73:14462
+2026-05-15-13:51:22.849 [svc-#76] ERROR c.b.m.s.DistributedSubscriptionManager - sendReachableDisconnectMessage : User lookup failed for 65414anc
+2026-05-15-13:51:22.866 [svc-#70] ERROR c.b.m.s.DistributedSubscriptionManager - sendUpdatedGroupsLatestReachableSA : User lookup failed for 65414anc
+2026-05-15-13:51:22.867 [svc-#77] ERROR c.b.m.s.DistributedSubscriptionManager - sendGroupsUpdatedMessage : User lookup failed for 65414anc
+2026-05-15-13:51:26.207 [grpc-federation-executor-0] INFO c.b.m.s.DistributedSubscriptionManager - Set client for subscription: FedClient_v2_30be75e3b6cf6cc395d9fea186c4f13c071305005c84517fede25c6861bce067 to AAPD-GENTRY (109D393A-2986-4985-BADD-88A22968D10B) 
+2026-05-15-13:52:25.437 [grpc-federation-executor-0] INFO c.b.m.s.DistributedSubscriptionManager - Set client for subscription: FedClient_v2_30be75e3b6cf6cc395d9fea186c4f13c071305005c84517fede25c6861bce067 to AAPD-GENTRY (109D393A-2986-4985-BADD-88A22968D10B) 
+2026-05-15-13:53:33.612 [RemoveSubscriptionPool-0] INFO c.b.m.s.DistributedSubscriptionManager - Removed Subscription: tls:77
+2026-05-15-13:53:40.293 [epollEventLoopGroup-4-11] INFO c.b.m.s.DistributedSubscriptionManager - Added Subscription: id=tls:87 source=166.137.148.192
+2026-05-15-13:54:03.803 [RemoveSubscriptionPool-0] INFO c.b.m.s.DistributedSubscriptionManager - Removed Subscription: tls:60
+2026-05-15-13:54:07.716 [epollEventLoopGroup-4-12] INFO c.b.m.s.DistributedSubscriptionManager - Added Subscription: id=tls:88 source=166.137.148.124
+2026-05-15-13:54:34.386 [epollEventLoopGroup-4-13] INFO c.b.m.s.DistributedSubscriptionManager - Added Subscription: id=tls:89 source=166.137.148.33
+2026-05-15-13:54:35.772 [svc-#71] ERROR c.b.m.s.DistributedSubscriptionManager - sendReachableDisconnectMessage : User lookup failed for 30556anc
+2026-05-15-13:54:35.783 [svc-#76] ERROR c.b.m.s.DistributedSubscriptionManager - sendUpdatedGroupsLatestReachableSA : User lookup failed for 30556anc
+2026-05-15-13:54:35.784 [svc-#75] ERROR c.b.m.s.DistributedSubscriptionManager - sendGroupsUpdatedMessage : User lookup failed for 30556anc
+2026-05-15-13:54:37.232 [CallsignAssignmentExecutor-0] INFO c.b.m.s.DistributedSubscriptionManager - Set client for subscription: tls:89 to D10 (E9AF53B6-EB2C-4506-B81B-D770E9E88AF1) source=166.137.148.33:16942
+2026-05-15-13:54:40.045 [CallsignAssignmentExecutor-0] INFO c.b.m.s.DistributedSubscriptionManager - Set client for subscription: tls:87 to D19 (2F86BD3F-0639-4B0E-B5C9-BFB4BF28106A) source=166.137.148.192:9764
+2026-05-15-13:55:03.853 [RemoveSubscriptionPool-0] INFO c.b.m.s.DistributedSubscriptionManager - Removed Subscription: tls:89
+2026-05-15-13:55:09.462 [svc-#68] ERROR c.b.m.s.DistributedSubscriptionManager - sendReachableDisconnectMessage : User lookup failed for 30556anc
+2026-05-15-13:55:09.473 [svc-#71] ERROR c.b.m.s.DistributedSubscriptionManager - sendUpdatedGroupsLatestReachableSA : User lookup failed for 30556anc
+2026-05-15-13:55:09.475 [svc-#78] ERROR c.b.m.s.DistributedSubscriptionManager - sendGroupsUpdatedMessage : User lookup failed for 30556anc
+2026-05-15-13:59:51.688 [svc-#77] ERROR c.b.m.s.DistributedSubscriptionManager - found subscription with null user!
+2026-05-15-13:59:51.689 [svc-#77] ERROR c.b.m.s.DistributedSubscriptionManager - found subscription with null user!
+2026-05-15-13:59:52.103 [epollEventLoopGroup-4-14] INFO c.b.m.s.DistributedSubscriptionManager - Added Subscription: id=tls:90 source=192.168.0.1
+2026-05-15-13:59:56.924 [CallsignAssignmentExecutor-0] INFO c.b.m.s.DistributedSubscriptionManager - Set client for subscription: tls:90 to APD-Endress-CloudTAK (ANDROID-CloudTAK-63303anc) source=192.168.0.1:46058
+2026-05-15-14:00:29.097 [RemoveSubscriptionPool-0] INFO c.b.m.s.DistributedSubscriptionManager - Removed Subscription: tls:90
+2026-05-15-14:00:29.598 [epollEventLoopGroup-4-15] INFO c.b.m.s.DistributedSubscriptionManager - Added Subscription: id=tls:91 source=192.168.0.1
+2026-05-15-14:00:34.555 [CallsignAssignmentExecutor-0] INFO c.b.m.s.DistributedSubscriptionManager - Set client for subscription: tls:91 to APD-Endress-CloudTAK (ANDROID-CloudTAK-63303anc) source=192.168.0.1:50410
+2026-05-15-14:04:36.500 [RemoveSubscriptionPool-0] INFO c.b.m.s.DistributedSubscriptionManager - Removed Subscription: tls:57

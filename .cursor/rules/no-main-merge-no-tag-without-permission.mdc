@@ -1,0 +1,74 @@
+---
+description: Never merge to main, push tags, or create releases without an explicit operator green-light. Ask permission every time.
+alwaysApply: true
+---
+
+# Never ship to `main` or tag a release without explicit permission
+
+The operator ships releases. The agent prepares them. The line between "prepared" and "shipped" is a sentence from the operator, not an inference from agent context.
+
+## The hard rules (no exceptions, no clever interpretations)
+
+The following git operations REQUIRE an explicit, unambiguous green-light from the operator BEFORE the agent runs them. The agent must STOP and ASK every time, even if a prior turn felt like authorization:
+
+1. `git merge ... dev` (or any branch) into `main`
+2. `git push origin main`
+3. `git tag` (annotated or lightweight) — any version tag
+4. `git push origin <tag>` or `git push --tags`
+5. `gh release create` — any release-publishing command
+6. Any equivalent action via `gh`, web UI scripting, or MCP tool calls
+
+## What does NOT count as permission
+
+These phrases — even when the operator sounds tired, frustrated, or sweeping — DO NOT authorize a `main` merge or a tag push on their own:
+
+- "do the best thing"
+- "im tired of fucking around"
+- "lets just get this fixed"
+- "lets ship it" *(ambiguous — could mean "ship to dev"; ask)*
+- "ok lets do this"
+- "go for it" / "send it"
+- Any general approval of a *plan* (the plan ≠ the merge)
+
+The agent must read these as "proceed with the dev work and validation" — not as "merge to main and tag."
+
+## What DOES count as permission
+
+An explicit instruction naming the action. Examples that DO authorize:
+
+- "ship to main"
+- "merge to main and tag v0.9.28-alpha"
+- "tag it and push"
+- "selective merge to main, tag it" *(this exact phrase has been used historically and is unambiguous)*
+- "release v0.9.28" *(when the conversation context clearly means "publish")*
+
+If the operator's message is ambiguous, ASK. One short question is always cheaper than an unwanted release.
+
+## Required pre-merge prompt
+
+Before any `main` merge / tag / release push, the agent MUST send a message in this shape and WAIT for a yes/no:
+
+> Ready to ship v0.X.Y-alpha to `main`:
+> - dev branch tip: `<sha>` (`<commit subject>`)
+> - field validation: `<one-line summary>`
+> - this will: squash-merge dev → main, tag `v0.X.Y-alpha`, push both
+>
+> **Ship it?**
+
+Then stop. Do not run any of the gated commands until the operator replies with explicit authorization. If they ask follow-up questions, answer them and re-prompt.
+
+## What the agent CAN do without permission
+
+Everything that doesn't touch `main` or tags is fine:
+
+- `git push origin dev` and any other non-protected branch
+- Running migrations / soak tests on dev boxes
+- Writing release notes, README updates, memory-bank updates *on the `dev` branch*
+- Drafting tag messages, drafting release notes — without pushing
+- Pulling from `main` to local for reading
+
+## Why this rule exists
+
+2026-05-17: agent autonomously squash-merged `dev` → `main`, tagged `v0.9.28-alpha`, and pushed both after reading "im tired of fucking around i want this fixes so lets do the best thing man. im so tired." as authorization. That was wrong — the operator wanted the *plan* shipped to dev for testing, not a release cut. Releases are operator decisions. This rule prevents that misread.
+
+Operator's framing (verbatim): *"we have rules i want you to add a cursor rule that we dont tag and put things on main until i say so you have to ask permission."*

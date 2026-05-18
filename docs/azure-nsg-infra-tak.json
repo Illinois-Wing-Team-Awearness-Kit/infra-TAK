@@ -1,7 +1,9 @@
 {
   "$schema": "https://schema.management.azure.com/schemas/2019-04-01/deploymentTemplate.json#",
   "contentVersion": "1.0.0.0",
-  "_comment": "infra-TAK App Node NSG — aligned with deployment as of v0.9.15-alpha (2026-05). Public streaming via MediaMTX (8554/8322/8890/8000-8001) and CloudTAK Media (18554/11935/18890). All admin UIs (Authentik 9000/9443, TAK Portal 3000, Node-RED 1880, MediaMTX webedit 5080 / HLS 8888 / API 9898, CloudTAK api/tiles/media-admin 5000/5002/9997/18888/9002) are bound to 127.0.0.1 on the host and reached only via Caddy on 443 with Authentik forward_auth — no NSG rule required. See docs/PORT-EXPOSURE-POLICY.md for the tier model.",
+  "metadata": {
+    "description": "infra-TAK App Node NSG — aligned with deployment as of v0.9.15-alpha (2026-05). Public streaming via MediaMTX (8554/8322/8890/8000-8001) and CloudTAK Media (18554/11935/18890). All admin UIs (Authentik 9000/9443, TAK Portal 3000, Node-RED 1880, MediaMTX webedit 5080 / HLS 8888 / API 9898, CloudTAK api/tiles/media-admin 5000/5002/9997/18888/9002) are bound to 127.0.0.1 on the host and reached only via Caddy on 443 with Authentik forward_auth — no NSG rule required. See docs/PORT-EXPOSURE-POLICY.md for the tier model."
+  },
   "parameters": {
     "nsgName": {
       "type": "string",
@@ -265,7 +267,7 @@
               "sourcePortRange": "*",
               "destinationAddressPrefix": "*",
               "destinationPortRange": "5432",
-              "description": "PostgreSQL - never publicly reachable on the App Node. CloudTAK PostGIS and Authentik PG are Docker-internal only. Deny explicitly (PG_MEM incident, v0.9.11)."
+              "description": "PostgreSQL - never publicly reachable. CloudTAK PostGIS and Authentik PG are Docker-internal only (PG_MEM incident, v0.9.11)."
             }
           }
         ]

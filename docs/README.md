@@ -53,7 +53,7 @@ Quick reference for what's in this folder. Internal docs (HANDOFF, session notes
 
 ## Release notes
 
-Latest: [RELEASE-v0.6.7-alpha.md](RELEASE-v0.6.7-alpha.md)
+Latest: [RELEASE-v0.9.33-alpha.md](RELEASE-v0.9.33-alpha.md)
 
 Older releases are on the [GitHub Releases tab](https://github.com/takwerx/infra-TAK/releases).
 

@@ -619,9 +619,20 @@ DELETE /Marti/api/missions/{name}/contents for stale UIDs
 
 **Verified:** Map Items (not Files), no broadcast, human-readable callsigns, full reconciliation lifecycle, field users read-only, admin writes successfully.
 
+### Multipart polygon / polyline support (v0.9.33)
+
+ArcGIS features with multiple outer rings (e.g. wildfire main perimeter + spot-fire polygons) or multiple paths now emit one CoT event per part:
+
+- **Outer-ring detection**: rings with signed area ≤ 0 (clockwise in Y-up geographic coordinates, per ArcGIS REST convention) are outer rings; CCW rings are interior holes and are skipped. If no rings pass the outer-ring test (non-standard winding), all rings are treated as outer rings (defensive fallback).
+- **Degenerate rings skipped**: rings with fewer than 4 vertices are not emitted.
+- **UID per part**: single-ring/path features keep their existing UID unchanged. Multipart features append `-r0`, `-r1`, … for polygon rings and `-p0`, `-p1`, … for polyline paths.
+- **Hash per part**: multipart CoT events use a ring-level hash (`djb2(featureHash + '|r' + idx + '|' + ringGeoKey)`) so reconcile detects part-level geometry changes without re-streaming unaffected parts.
+- **Callsign**: all parts of the same feature share the same callsign (from the base UID or configured label field); the UID distinguishes them in TAK.
+- **Reconcile / DELETE**: if a feature loses a ring part between polls, the orphaned ring UID is DELETEd from the mission automatically.
+- **Existing single-ring / single-path feeds**: behavior unchanged — no UID suffix, hash identical to pre-v0.9.33.
+
 ### Open items
 
-- **Multi-polygon support**: `eng_parse` only processes `g.rings[0]`. Future: iterate all rings, emit separate CoT per ring with UID `<prefix>-<id>-<ringIndex>`.
 - **Update detection**: currently re-streams all CoT every poll. Could hash geometry/attributes to skip unchanged features for efficiency.
 - **ArcGIS token auth**: add optional token field to Configurator for secured (non-public) services.
 - **`StreamingEndpointRewriteFilter` error**: cosmetic — logs `unable to find mission subscription for client CA AIR INTEL, CN=admin` but data still flows. Low priority.

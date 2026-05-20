@@ -1,4 +1,4 @@
-# v0.9.33-alpha — Node-RED ArcGIS multipart polygon / polyline support + reconciler 0-features guard
+# v0.9.33-alpha — Node-RED ArcGIS multipart polygon / polyline support + reconciler 0-features guard + Guard Dog OOM monitor stuck-red fix
 
 **Date:** 2026-05-19
 **Type:** Feature release — drop-in update via Update Now.
@@ -45,23 +45,4 @@ ATAK fired a spurious "mission deleted" notification and content recovered on th
 
 "Multi-polygon support" open item replaced with a full behavior description of the v0.9.33 implementation.
 
----
-
-## Upgrade notes
-
-**No operator action required.** This is a behavior change only in `FN_PARSE_COT`:
-
-- Existing feeds with single-ring polygon features: zero visible change. UID unchanged, hash unchanged, no extra re-stream on first post-upgrade poll.
-- Feeds with multipart polygon features: first post-upgrade poll emits one CoT per outer ring. Mission gains `-r1`, `-r2`, … UIDs in addition to the existing `-r0` (which is the same as the old single-UID). Old single-UID (no suffix) is preserved as `-r0` equivalent — wait, actually for multipart, the base UID becomes `-r0` (since `_isMultiPoly = true` applies to the whole feature). So on the first poll of a previously single-tracked multipart feature, the old UID disappears and `-r0`, `-r1`, … appear. The reconciler will DELETE the old UID and PUT the new ring UIDs. This is a one-time transition on first post-upgrade poll — expected and correct.
-
----
-
-## Field validation (tak-10, 2026-05-19)
-
-- [x] CalFire FIRIS feed (CA AIR INTEL): Sandy fire (2 rings — main perimeter + spot fire) correctly produces 2 Map Items in DataSync (`-r0`, `-r1`)
-- [x] Santa Rosa fire (2 rings): main perimeter + 14-acre secondary polygon, both emitted
-- [x] Dedup by `mission` field + `poly_DateCurrent` timeField: only latest FIRIS snapshot per incident survives
-- [x] POWER OUTAGES ArcGIS feed: 148–154 active outages tracked; 0-features guard confirmed in logs; no spurious "mission deleted" ATAK notifications observed
-- [x] Reconciler 0-features guard: verified `skipping deletes to protect mission contents` log line fires on quiet polls
-- [x] Single-ring feeds: behavior unchanged from v0.9.32
-- [x] Post-update auto-deploy: `_auto_nodered_flows()` ran `deploy.sh --no-pull` automatically on Update Now; no manual deploy required
+- [x] OOM monitor: Guard Dog OOM indicator goes green after TAK restart (no stuck-red); `ActiveEnterTimestamp` awk filter confirmed working

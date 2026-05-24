@@ -1,60 +1,80 @@
 # 8446 Webadmin Login — Workflow and Fix
 
-## Normal workflow (Authentik first)
+## Critical: TAK Server CoreConfig.xml behavior
 
-This is the usual order:
+**TAK Server rewrites portions of `CoreConfig.xml` at runtime and on startup.** Specifically:
 
-1. **Authentik** — deploy first (LDAP provider, outpost, flows). No `webadmin` user yet — TAK Server isn’t installed, so there’s no password in settings.
-2. **Email Relay** — deploy (optional; configures Authentik SMTP).
-3. **TAK Server** — upload package and deploy. When configuring, you set the **webadmin password** (for the admin UI on port 8446). That password is:
-   - Stored in the console’s **settings** (`.config/settings.json` as `webadmin_password`)
-   - Used to create the local TAK Server user `webadmin` (UserManager)
+1. **`<File/>` tag**: TAK Server always re-adds a bare `<File/>` tag to the `<auth>` block on startup if one doesn't exist. This is normal and cannot be prevented.
+2. **Connector attributes**: TAK Server normalizes `<connector>` elements on startup, potentially resetting `_name`, keystore, and other attributes to its defaults. **Any connector changes made while TAK Server is running will be overwritten on restart.**
 
-   Until you connect to LDAP, **8446** uses that **local** user: log in with **webadmin** and the password you set.
+### Safe pattern for CoreConfig changes
 
-4. **Connect TAK Server to LDAP** — on the TAK Server page, click **“Connect TAK Server to LDAP”**. That:
-   - Patches CoreConfig so 8446 uses **LDAP** (Authentik) instead of the local user store
-   - **Creates** the `webadmin` user in Authentik (it didn’t exist at Authentik deploy time) and **sets its password** from settings (your deploy password)
-   - Ensures LDAP service account and flow are in place
+| What you're changing | Safe while running? | Pattern |
+|---------------------|--------------------|----|
+| `<auth>` block (LDAP, File) | Yes | Patch, then restart |
+| `<connector>` elements (8446 LE cert, names) | **No** | Stop TAK Server → patch → start |
+| `<repository>` / JDBC | Yes | Patch, then restart |
+| `<security>` / TLS | Yes | Patch, then restart |
 
-   After this, **8446 login is checked against Authentik/LDAP**. The password that works is the one **in Authentik** for `webadmin` — which was just set from your deploy password.
-
-**Result:** Use **webadmin** + the **same** password you set at TAK Server deploy to log in to 8446.
+**Code rule**: `install_le_cert_on_8446()` and any future connector patches must stop TAK Server before patching CoreConfig.xml, then start it.
 
 ---
 
-## Edge case: TAK Server first, then add Authentik
+## Deploy flow (v0.4.0+ / v0.3.9+)
 
-You already had TAK Server (with webadmin password in settings). Now you deploy Authentik and want 8446 to use LDAP.
+### With Authentik (LDAP)
 
-- When **Authentik** deploys, `/opt/tak` exists and settings already have `webadmin_password`. The Authentik deploy step can create `webadmin` in Authentik and set the password from settings at that time.
-- When you click **“Connect TAK Server to LDAP”**, CoreConfig is patched for LDAP and the console ensures `webadmin` in Authentik exists and has the password from settings (create or update).
+1. **Authentik** — deploy first. LDAP provider, outpost, flows created. No `webadmin` user yet.
+2. **TAK Server** — deploy. You set the **webadmin password**.
+   - Step 8: CoreConfig patched for LDAP (`_apply_ldap_to_coreconfig()`)
+   - Step 9: **`webadmin` is NOT created in flat-file.** Log says: "Authentik detected — webadmin will be created directly in Authentik (skipping flat-file)"
+   - Post-deploy: `_ensure_authentik_webadmin()` creates `webadmin` directly in Authentik with `tak_ROLE_ADMIN` + `authentik Admins` groups, sets the password from settings.
+   - LE cert install: Stops TAK Server, patches 8446 connector with LE keystore, starts TAK Server.
+3. **Login** — use `webadmin` + the password you set at deploy on port 8446.
 
-So the same outcome: **webadmin** + deploy password works on 8446 after you connect LDAP.
+### Without Authentik (flat-file)
+
+1. **TAK Server** — deploy. You set the **webadmin password**.
+   - Step 9: `UserManager.jar usermod -A -p <password> webadmin` creates `webadmin` in `UserAuthenticationFile.xml`
+   - 8446 login uses the flat-file password directly.
+2. **Login** — use `webadmin` + the password you set at deploy on port 8446.
 
 ---
 
-## If you can’t log in to 8446 with webadmin
+## Why webadmin is never in the flat-file when Authentik exists
 
-If 8446 says “invalid password” even though you’re using the password you set at TAK Server deploy:
+TAK Server has two auth providers: flat-file (`UserAuthenticationFile.xml`) and LDAP. When both are present, **flat-file takes precedence** for any user that exists in it. If `webadmin` exists in the flat-file with hash X, and in Authentik/LDAP with password Y, TAK Server authenticates against hash X — not LDAP.
 
-1. **Use “Sync webadmin to Authentik”**  
-   On the **TAK Server** page, when LDAP is connected and Authentik is deployed, you’ll see the green **“LDAP Connected to Authentik”** card with **“Sync webadmin to Authentik”**. Click it. That reads `webadmin_password` from settings and sets it on the **webadmin** user in Authentik (create/update + set password). No SSH needed.
+This caused persistent "invalid username/password" errors because:
+- The flat-file hash was set by `UserManager.jar` at deploy time
+- The Authentik password was set by `_ensure_authentik_webadmin()`
+- These could differ (timing, password rotation, etc.)
+- Even when they matched, the flat-file hash format differed from what the user typed
 
-2. **Try 8446 again** with **webadmin** and the **same** password you set at TAK Server deployment.
+**Fix (v0.3.9)**: When Authentik is detected at deploy time, `UserManager.jar usermod webadmin` is skipped entirely. `webadmin` only exists in Authentik. No shadowing possible.
 
-3. **If it still fails**  
-   Try a private/incognito window, type the password manually (no autocomplete), and ensure special characters (e.g. `#`) match exactly. If you changed the password only in Authentik, run **Sync webadmin to Authentik** again so Authentik matches settings, then try 8446 with that password.
+---
+
+## If you can't log in to 8446 with webadmin
+
+1. **Check TAK Server is fully started** — the API service takes ~3 minutes. Look for `Started TAK Server api Microservice` in `/opt/tak/logs/takserver-api.log`. A 403 before this means the server isn't ready.
+
+2. **Check the 8446 connector** — `grep '8446' /opt/tak/CoreConfig.xml`. It should show:
+   ```
+   <connector port="8446" clientAuth="false" _name="LetsEncrypt" keystore="JKS" keystoreFile="certs/files/takserver-le.jks" .../>
+   ```
+   If `_name="cert_https"` or keystore attributes are missing, the LE cert install was overwritten. Stop TAK Server, fix the connector, start it.
+
+3. **Use "Resync LDAP to TAK Server"** — on the TAK Server page. This re-patches CoreConfig, removes any stale `webadmin` flat-file entry, and syncs to Authentik.
+
+4. **Use "Sync webadmin to Authentik"** — pushes the password from settings to Authentik. Use if password drift suspected.
 
 ---
 
 ## Summary
 
-| Step | What happens |
-|------|----------------|
-| Deploy Authentik | LDAP provider/outpost and flows. No webadmin yet (TAK Server not installed). |
-| Deploy TAK Server | You set webadmin password → saved to settings + local TAK user. 8446 uses local auth until LDAP connected. |
-| Click “Connect TAK Server to LDAP” | CoreConfig patched for LDAP; **webadmin created in Authentik** and password set from settings. 8446 now uses LDAP. |
-| 8446 login fails | Click **“Sync webadmin to Authentik”** (TAK Server page, when LDAP connected). Then try webadmin + deploy password again. |
-
-**Edge case (TAK Server first):** You deploy Authentik later. Authentik deploy can create webadmin from settings if `/opt/tak` exists. “Connect TAK Server to LDAP” still ensures webadmin exists and password is set from settings.
+| Scenario | Where webadmin lives | 8446 auth path |
+|----------|---------------------|----------------|
+| Authentik deployed | Authentik only (LDAP) | TAK Server → LDAP outpost → Authentik |
+| No Authentik | `UserAuthenticationFile.xml` (flat-file) | TAK Server → flat-file |
+| Upgrading from pre-v0.3.9 with Authentik | May be in both — Resync LDAP cleans flat-file | After resync: LDAP only |

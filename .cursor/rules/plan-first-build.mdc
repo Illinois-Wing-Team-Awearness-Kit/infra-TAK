@@ -1,0 +1,57 @@
+---
+description: Plan-first build workflow — two scenarios, two workflows
+alwaysApply: true
+---
+
+# Plan-First Build Workflow
+
+There are exactly two scenarios in infra-TAK development. Name the scenario at the start of every chat.
+
+---
+
+## Scenario A — New Feature or Idea
+
+**Trigger:** "I want to add X" or "Operators need Y"
+
+1. **Planning chat** (Plan mode, short) — produce `docs/PLAN-v[X.Y.Z].md`. One chat, one doc.
+2. **Build chat** (new chat, Agent mode) — first message:
+   > "Read `docs/PLAN-v[X.Y.Z].md`. Implement it exactly as specced. Start with [section]."
+
+No re-explaining. The PLAN doc is the context. The agent goes straight to code.
+
+---
+
+## Scenario B — Bug Found (the common one)
+
+Bugs in infra-TAK usually cascade: one critical issue surfaces, plus 2–4 related things that need to be tightened up. The workflow:
+
+### B1 — Hot fix (ship now)
+- Scope the critical fix in 2–3 sentences (inline in the chat, no full PLAN needed)
+- State: function name, what's wrong, what the fix is
+- Build it, version-bump (e.g. v0.8.8 → v0.8.9), ship
+- Keep this chat SHORT — fix the critical thing only, nothing else
+
+### B2 — Cascade planning (after the hot fix ships)
+- Write `docs/PLAN-v[next].md` for everything the bug revealed but didn't block the ship
+- Each item gets a name, a one-line description, and a "parked to vX.Y.Z" note
+- Next build chat opens with: "Read `docs/PLAN-v[next].md`..."
+
+**The discipline:** never fold cascade items into the hot fix chat. Ship the critical fix clean, then plan the next version properly.
+
+---
+
+## What a PLAN doc must contain (see `docs/PLAN-TEMPLATE.md`)
+
+1. **Headline** — one sentence: what ships and why
+2. **Scope discipline** — what is explicitly NOT in this release
+3. **The bug / the need** — full description with exact log evidence
+4. **The fix** — function names, migration call order, approximate line anchors
+5. **Acceptance test** — exact shell commands to confirm it worked
+6. **What this does NOT ship** — every parked item named explicitly
+
+## Rules for the PLAN doc
+
+- Name functions explicitly (e.g. `_authentik_fix_trusted_proxy_cidrs`)
+- Include approximate line range so the agent can Grep directly, not explore
+- If scope creep appears during a build chat, STOP — update the PLAN first, then continue
+- One PLAN = one release. Everything else goes in "What this does NOT ship"

@@ -37,6 +37,75 @@ if [ "$EUID" -ne 0 ]; then
 fi
 
 # ==========================================
+# Server IP detection (v0.9.29)
+# ==========================================
+# Prefer public/external IP for cloud deployments (Azure/AWS/GCP).
+# `hostname -I` on those VMs returns the private/internal IP, which is wrong for:
+#   - SSL self-signed cert SAN (CN/IP)
+#   - settings.server_ip used by TAK Server reachability + console "Access URL"
+#   - Caddy / SSL bootstrap that builds the public-facing console URL
+# Detection order (each step has its own timeout, falls through on failure):
+#   1. Azure Instance Metadata Service (no internet egress required)
+#   2. AWS Instance Metadata Service v1 (token-less, still works on older AMIs)
+#   3. External IP echo (api.ipify.org → ifconfig.me)
+#   4. Fallback: hostname -I (private/LAN — correct for on-prem / no public IP)
+detect_server_ip() {
+    local public_ip=""
+    public_ip=$(curl -s --max-time 2 -H "Metadata: true" \
+        "http://169.254.169.254/metadata/instance/network/interface/0/ipv4/ipAddress/0/publicIpAddress?api-version=2021-02-01&format=text" \
+        2>/dev/null || true)
+    if [ -z "$public_ip" ]; then
+        public_ip=$(curl -s --max-time 2 \
+            http://169.254.169.254/latest/meta-data/public-ipv4 \
+            2>/dev/null || true)
+    fi
+    if [ -z "$public_ip" ]; then
+        public_ip=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || true)
+    fi
+    if [ -z "$public_ip" ]; then
+        public_ip=$(curl -s --max-time 3 https://ifconfig.me 2>/dev/null || true)
+    fi
+    if echo "$public_ip" | grep -qE '^[0-9]{1,3}(\.[0-9]{1,3}){3}$'; then
+        echo "$public_ip"
+    else
+        hostname -I 2>/dev/null | awk '{print $1}'
+    fi
+}
+
+# ==========================================
+# VPS Disk I/O Check
+# ==========================================
+check_disk_io() {
+    echo -e "  ${BOLD}Checking disk I/O performance...${NC}"
+    local write_output
+    write_output=$(dd if=/dev/zero of=/tmp/.infratak-disktest bs=1M count=256 oflag=dsync 2>&1)
+    rm -f /tmp/.infratak-disktest
+    local speed_str
+    speed_str=$(echo "$write_output" | tail -1 | grep -oP '[\d.]+ [MGk]?B/s' | tail -1)
+    local speed_mb=0
+    if echo "$speed_str" | grep -q "GB/s"; then
+        speed_mb=$(echo "$speed_str" | grep -oP '[\d.]+' | head -1 | awk '{printf "%d", $1 * 1024}')
+    elif echo "$speed_str" | grep -q "MB/s"; then
+        speed_mb=$(echo "$speed_str" | grep -oP '[\d.]+' | head -1 | awk '{printf "%d", $1}')
+    elif echo "$speed_str" | grep -q "kB/s"; then
+        speed_mb=0
+    fi
+
+    if [ "$speed_mb" -ge 400 ] 2>/dev/null; then
+        echo -e "  ${GREEN}✓ Disk write: ${speed_str} — excellent${NC}"
+    elif [ "$speed_mb" -ge 200 ] 2>/dev/null; then
+        echo -e "  ${GREEN}✓ Disk write: ${speed_str} — acceptable${NC}"
+    elif [ "$speed_mb" -gt 0 ] 2>/dev/null; then
+        echo -e "  ${YELLOW}⚠ Disk write: ${speed_str} — slow (< 200 MB/s)${NC}"
+        echo -e "  ${YELLOW}  Deploys may be slow. Consider migrating to a faster VPS node.${NC}"
+        echo -e "  ${YELLOW}  Contact your provider about SSD-backed storage.${NC}"
+    else
+        echo -e "  ${YELLOW}⚠ Could not measure disk speed (${speed_str:-unknown})${NC}"
+    fi
+    echo ""
+}
+
+# ==========================================
 # Detect Operating System
 # ==========================================
 detect_os() {
@@ -98,20 +167,58 @@ detect_os() {
 }
 
 # ==========================================
-# Wait for Unattended Upgrades
+# Wait for unattended-upgrades / apt-daily / dpkg lock
 # ==========================================
+# Fresh VPS images often run automatic updates at first boot. apt-get in
+# install_dependencies() fails with "Could not get lock" if we don't wait.
 wait_for_upgrades() {
-    if pgrep -f "/usr/bin/unattended-upgrade$" > /dev/null 2>&1; then
-        echo -e "${YELLOW}  System upgrades in progress, waiting...${NC}"
-        SECONDS=0
-        while pgrep -f "/usr/bin/unattended-upgrade$" > /dev/null 2>&1; do
-            printf "\r  Waiting... %02d:%02d elapsed" $((SECONDS/60)) $((SECONDS%60))
-            sleep 2
-        done
-        echo ""
-        echo -e "  ${GREEN}✓ System updates complete${NC}"
-        echo ""
-    fi
+    local waited=0
+    local max_wait=3600
+    local busy=1
+
+    while [ "$waited" -lt "$max_wait" ]; do
+        busy=0
+        # apt-daily / explicit apt & dpkg (real work)
+        if pgrep -f apt.systemd.daily > /dev/null 2>&1 \
+            || pgrep -x apt-get > /dev/null 2>&1 \
+            || pgrep -x apt > /dev/null 2>&1 \
+            || pgrep -x dpkg > /dev/null 2>&1; then
+            busy=1
+        fi
+        # Do NOT treat unattended-upgrade-shutdown as busy — it stays running forever on Ubuntu.
+        while read -r _u_line; do
+            case "$_u_line" in
+                *unattended-upgrade-shutdown*) ;;
+                *) busy=1; break ;;
+            esac
+        done < <(pgrep -af unattended-upgrade 2>/dev/null)
+        if command -v fuser > /dev/null 2>&1; then
+            for lock in /var/lib/dpkg/lock-frontend /var/lib/dpkg/lock /var/cache/apt/archives/lock; do
+                [ -e "$lock" ] || continue
+                if fuser "$lock" > /dev/null 2>&1; then
+                    busy=1
+                    break
+                fi
+            done
+        fi
+        if [ "$busy" -eq 0 ]; then
+            if [ "$waited" -gt 0 ]; then
+                echo ""
+                echo -e "  ${GREEN}✓ Package manager is idle${NC}"
+                echo ""
+            fi
+            return 0
+        fi
+        if [ "$waited" -eq 0 ]; then
+            echo -e "${YELLOW}  Automatic updates / apt are using the package manager (common on first boot). Waiting...${NC}"
+        fi
+        printf "\r  Waiting... %02d:%02d elapsed" $((waited / 60)) $((waited % 60))
+        sleep 2
+        waited=$((waited + 2))
+    done
+    echo ""
+    echo -e "${RED}  Still waiting after 1 hour. Reboot or run: sudo systemctl status unattended-upgrades${NC}"
+    exit 1
 }
 
 # ==========================================
@@ -120,18 +227,36 @@ wait_for_upgrades() {
 install_dependencies() {
     echo -e "  Installing dependencies..."
 
+    local apt_log="/tmp/infratak-apt-$$.log"
+
     case "$PKG_MGR" in
         apt)
             export DEBIAN_FRONTEND=noninteractive
             export NEEDRESTART_MODE=a
-            apt-get update -qq > /dev/null 2>&1
-            # Dpkg options avoid config prompts; NEEDRESTART_MODE=a avoids "Which services should be restarted?" dialog
-            NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
+            if ! apt-get update -qq > "$apt_log" 2>&1; then
+                echo -e "${RED}  apt-get update failed:${NC}"
+                tail -20 "$apt_log"
+                rm -f "$apt_log"
+                exit 1
+            fi
+            if ! NEEDRESTART_MODE=a DEBIAN_FRONTEND=noninteractive apt-get install -y \
                 -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold" \
-                python3 python3-pip python3-venv openssl sshpass > /dev/null 2>&1
+                python3 python3-pip python3-venv openssl sshpass > "$apt_log" 2>&1; then
+                echo -e "${RED}  apt-get install failed:${NC}"
+                tail -30 "$apt_log"
+                rm -f "$apt_log"
+                exit 1
+            fi
+            rm -f "$apt_log"
             ;;
         dnf)
-            dnf install -y python3 python3-pip openssl sshpass > /dev/null 2>&1
+            if ! dnf install -y python3 python3-pip openssl sshpass > "$apt_log" 2>&1; then
+                echo -e "${RED}  dnf install failed:${NC}"
+                tail -30 "$apt_log"
+                rm -f "$apt_log"
+                exit 1
+            fi
+            rm -f "$apt_log"
             ;;
         *)
             echo -e "${RED}  Cannot auto-install dependencies for $PKG_MGR${NC}"
@@ -142,12 +267,24 @@ install_dependencies() {
 
     # Create virtual environment if it doesn't exist
     if [ ! -d "$INSTALL_DIR/.venv" ]; then
-        python3 -m venv "$INSTALL_DIR/.venv" 2>/dev/null || python3 -m venv "$INSTALL_DIR/.venv" --without-pip
+        if ! python3 -m venv "$INSTALL_DIR/.venv" && ! python3 -m venv "$INSTALL_DIR/.venv" --without-pip; then
+            echo -e "${RED}  python3 -m venv failed. Install package python3-venv (apt) and re-run.${NC}"
+            exit 1
+        fi
     fi
 
-    # Install Flask and dependencies in venv
-    "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn 2>/dev/null || \
-        "$INSTALL_DIR/.venv/bin/pip" install flask psutil werkzeug gunicorn
+    if [ ! -x "$INSTALL_DIR/.venv/bin/pip" ]; then
+        echo -e "${RED}  No pip in .venv. Install python3-venv, remove $INSTALL_DIR/.venv, re-run.${NC}"
+        exit 1
+    fi
+
+    if ! "$INSTALL_DIR/.venv/bin/pip" install --quiet flask psutil werkzeug gunicorn 2>"$apt_log"; then
+        echo -e "${RED}  pip install failed:${NC}"
+        tail -20 "$apt_log"
+        rm -f "$apt_log"
+        exit 1
+    fi
+    rm -f "$apt_log"
 
     echo -e "  ${GREEN}✓ Dependencies installed${NC}"
     echo ""
@@ -199,8 +336,11 @@ print(generate_password_hash(sys.argv[1]))
 EOF
     chmod 600 "$AUTH_FILE"
 
-    # Detect server IP
-    SERVER_IP=$(hostname -I | awk '{print $1}')
+    # Detect server IP — public-preferring (cloud-aware). See detect_server_ip()
+    # near the top of the script for the detection order. On Azure/AWS/GCP this
+    # picks the public IP from the cloud's metadata service; on on-prem hosts
+    # it falls back to the first interface from `hostname -I`.
+    SERVER_IP=$(detect_server_ip)
 
     # Save settings — always start in IP/self-signed mode
     # FQDN setup happens in the browser through the Caddy module
@@ -232,9 +372,11 @@ generate_self_signed_cert() {
 
     if [ ! -f "$CERT_DIR/console.key" ]; then
         echo -e "  Generating self-signed certificate..."
-        
-        SERVER_IP=$(hostname -I | awk '{print $1}')
-        
+
+        # v0.9.29: use the same public-preferring detection so the cert SAN
+        # matches the IP operators actually browse to on cloud VMs.
+        SERVER_IP=$(detect_server_ip)
+
         openssl req -x509 -newkey rsa:4096 \
             -keyout "$CERT_DIR/console.key" \
             -out "$CERT_DIR/console.crt" \
@@ -283,6 +425,14 @@ except Exception:
         GUNICORN_ARGS="$GUNICORN_ARGS --certfile=$CERT_DIR/console.crt --keyfile=$CERT_DIR/console.key"
     fi
 
+    # v0.9.12: pin HOME so shell commands like `cd ~/authentik` work under systemd.
+    # systemd does NOT inherit HOME from login env; without this, /bin/sh can't
+    # expand ~/. Same documented pattern as v0.2.7-alpha takupdatesguard.service.
+    SERVICE_HOME="${HOME:-/root}"
+    if [ -z "$SERVICE_HOME" ] || [ "$SERVICE_HOME" = "/" ]; then
+        SERVICE_HOME="/root"
+    fi
+
     cat > "$SERVICE_FILE" << EOF
 [Unit]
 Description=infra-TAK - Team Awareness Kit Infrastructure Platform
@@ -295,9 +445,9 @@ ExecStart=$GUNICORN_BIN $GUNICORN_ARGS app:app
 WorkingDirectory=$USE_DIR
 Restart=always
 RestartSec=5
-User=root
 Environment=PYTHONUNBUFFERED=1
 Environment=CONFIG_DIR=$USE_DIR/.config
+Environment=HOME=$SERVICE_HOME
 
 [Install]
 WantedBy=multi-user.target
@@ -311,7 +461,9 @@ EOF
 # Main
 # ==========================================
 detect_os
+check_disk_io
 wait_for_upgrades
+
 install_dependencies
 
 # First-time setup if no auth file exists
@@ -341,15 +493,22 @@ if command -v firewall-cmd >/dev/null 2>&1; then
     firewall-cmd --reload >/dev/null 2>&1 || true
 fi
 
-# Get access URL
+# Get access URL — on Azure/AWS the private IP is returned by hostname -I
+# Try to resolve the public IP so operators get the right URL
 SERVER_IP=$(hostname -I | awk '{print $1}')
+PUBLIC_IP=$(curl -s --max-time 3 https://api.ipify.org 2>/dev/null || echo "")
 
 echo ""
 echo -e "${GREEN}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
 echo -e "${GREEN}${BOLD}  ║  infra-TAK is running!                               ║${NC}"
 echo -e "${GREEN}${BOLD}  ╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
-echo -e "  ${BOLD}Access:${NC} https://$SERVER_IP:5001"
+if [ -n "$PUBLIC_IP" ] && [ "$PUBLIC_IP" != "$SERVER_IP" ]; then
+    echo -e "  ${BOLD}Access (public):${NC}  https://$PUBLIC_IP:5001"
+    echo -e "  ${BOLD}Access (private):${NC} https://$SERVER_IP:5001"
+else
+    echo -e "  ${BOLD}Access:${NC} https://$SERVER_IP:5001"
+fi
 echo -e "  ${YELLOW}(Accept the self-signed certificate warning in your browser)${NC}"
 echo ""
 echo -e "  ${BOLD}Service:${NC} systemctl status takwerx-console"

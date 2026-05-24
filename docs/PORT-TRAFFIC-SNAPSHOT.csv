@@ -1,0 +1,26 @@
+record_type,port_proto,ufw_rule_scope,public_exposure,listener_status,current_meaning,source_ip,destination_ip,observed_behavior,interpretation
+inbound_port,22/tcp,ALLOW IN Anywhere,Public,unknown,SSH reachable from internet,,,,
+inbound_port,80/tcp,ALLOW IN Anywhere,Public,unknown,HTTP reachable from internet,,,,
+inbound_port,443/tcp,ALLOW IN Anywhere,Public,unknown,HTTPS reachable from internet,,,,
+inbound_port,8089/tcp,ALLOW IN Anywhere,Public,LISTEN (java),TAK TLS client ingress active,,,,
+inbound_port,8443/tcp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,8446/tcp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,9001/tcp+udp,ALLOW IN Anywhere,Public,unknown,Federation/other inbound if service bound,,,,
+inbound_port,8060/tcp,ALLOW IN Anywhere,Public by firewall,NOT LISTENING,Open in firewall but app not accepting,,,,
+inbound_port,8061/tcp,ALLOW IN Anywhere,Public by firewall,unknown,Publicly reachable if service bound,,,,
+inbound_port,8062/tcp,ALLOW IN Anywhere,Public by firewall,unknown,Publicly reachable if service bound,,,,
+inbound_port,5000/tcp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,5001/tcp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,5002/tcp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,8554/tcp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,8322/tcp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,8888/tcp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,5080/tcp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,9898/tcp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,8890/udp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,8000/udp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,8001/udp,ALLOW IN Anywhere,Public,unknown,Publicly reachable if service bound,,,,
+inbound_port,25/tcp+udp,ALLOW IN 172.16.0.0/12,Internal-only,unknown,Only private-range sources allowed,,,,
+observed_flow,8060/tcp,,,,,104.225.219.254,63.250.55.132,SYN then immediate RST,Feeder is trying 8060 but no listener is active
+observed_flow,8089/tcp,,,,,47.153.3.83,63.250.55.132,ESTABLISHED session present,Another client is connected on 8089
+observed_flow,8089/tcp,,,,,104.225.219.254,63.250.55.132,No payload seen in capture window,Feeder not currently using 8089

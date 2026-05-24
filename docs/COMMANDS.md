@@ -5,7 +5,6 @@
 ```bash
 git clone --depth 1 -b dev https://github.com/takwerx/infra-TAK.git
 cd infra-TAK
-chmod +x start.sh
 sudo ./start.sh
 ```
 
@@ -50,14 +49,14 @@ After a VPS reboot, everything that’s **enabled** starts automatically. You do
 
 - SSH in (or use the provider’s web console). Go to your infra-TAK install directory, then run:
   ```bash
-  cd /root/infra-TAK   # or wherever you cloned (e.g. /opt/infra-TAK)
+  cd /home/takwerx/infra-TAK   # or wherever you cloned (e.g. /opt/infra-TAK)
   sudo ./fix-console-after-pull.sh
   ```
   That pins the config path and then runs the password reset script. Enter a new password twice. Then use **`https://<server-IP>:5001`** with the new password.
 
 - If you only need to reset the password (config path is already correct):
   ```bash
-  cd /root/infra-TAK
+  cd /home/takwerx/infra-TAK
   sudo ./reset-console-password.sh
   ```
 
@@ -90,6 +89,7 @@ After a fresh deploy (e.g. Authentik remote → Email Relay → TAK Server, or a
 | **Authentik link from TAK Portal (to tak.fqdn) broken** | Same: **Save & Reload Caddy**. Authentik is served at **tak.***your-fqdn* by default. |
 | **At tak.fqdn (Authentik) — "no applications"** | The console creates Authentik apps (infra-TAK, TAK Portal) when the domain is saved or when you run **Update config** on the Authentik page. Go to **Authentik** → **Update config & reconnect**. Wait for it to finish; then open **tak.***your-fqdn* again. If you just set the domain, re-saving the domain (Caddy → Domains → **Save**) also triggers app creation (including when Authentik is remote). |
 | **8446 Web Admin — can't log in (username/password)** | 8446 uses **LDAP** only after you connect it. On **TAK Server** page click **Connect TAK Server to LDAP** (once). Then log in with **webadmin** and the **same password** you set at TAK Server deploy. If it still fails: click **Sync webadmin to Authentik** (green LDAP card), wait a few seconds, then try again. See **docs/WORKFLOW-8446-WEBADMIN.md** for full flow. For **"Invalid Credentials" (LDAP 49)** that keeps happening (same host or remote Authentik), see **8446 / LDAP 49** below. |
+| **CloudTAK / ATAK / TAK app login fails after password change** | TAK Server caches failed login attempts internally. After a password is changed in TAK Portal or Authentik, that cached failure blocks the new password. The **console self-heals automatically within 5 minutes** (ldap-sa watchdog detects ≥ 2 LDAP 49 errors and flushes the LDAP outpost). If the user needs access immediately: on the **TAK Server** page, LDAP card → **Sync webadmin to Authentik** — this force-recreates the LDAP outpost and clears the cache as a side effect. |
 
 **8446 / LDAP 49 (Invalid Credentials) — same host or remote Authentik**
 
@@ -212,6 +212,60 @@ TAK Portal is left unbound so all authenticated users see it. No manual steps re
 **Short version:** Deploy gives you one brand (domain set), LDAP, webadmin, TAK Portal proxy, and policies. Forgot password comes from **Email Relay → Configure Authentik**. Everything else (flows on the brand, logo, background, extra brands) is optional and up to you.
 
 ---
+
+## Caddy — adding custom vhosts / rules
+
+The Caddyfile is regenerated automatically on every domain change, “Update Now”, and deploy. To add custom rules that **survive regeneration**, place them **below** the preservation marker line at the bottom of the file:
+
+```
+# --- User-added blocks (do not remove) ---
+```
+
+Everything below this line is preserved automatically. Do not remove the marker itself.
+
+**Example — health-check vhost for Uptime Robot:**
+
+```caddyfile
+# --- User-added blocks (do not remove) ---
+
+# Plain HTTPS reverse proxy — no auth, no forward_auth
+health.example.com {
+    reverse_proxy 127.0.0.1:8080
+}
+```
+
+**How to edit:** SSH into the server and edit `/etc/caddy/Caddyfile` directly, then reload:
+
+```bash
+sudo nano /etc/caddy/Caddyfile
+sudo systemctl reload caddy
+```
+
+The marker line is injected automatically by `generate_caddyfile()` if it is not present, so adding it once is enough.
+
+---
+
+## TAK Portal — integration cert download fails (Permission denied)
+
+**Symptom:** TAK Portal → Integrations → Download Certs returns HTTP 400. The TAK Server log shows:
+
+```
+./makeCert.sh: line 6: cert-metadata.sh: Permission denied
+mkdir: cannot create directory '': No such file or directory
+```
+
+**Cause:** `/opt/tak/certs/cert-metadata.sh` is owned by `root:root 600`. `makeCert.sh` runs as user `tak` and cannot read it, so `$DIR` is never set.
+
+**Fix (one-time on affected hosts):**
+
+```bash
+sudo chown tak:tak /opt/tak/certs/cert-metadata.sh
+sudo chmod 600 /opt/tak/certs/cert-metadata.sh
+# verify:
+sudo -u tak bash -c 'cd /opt/tak/certs && . ./cert-metadata.sh && test -n "$DIR" && echo OK'
+```
+
+As of v0.9.3, “Update Now” automatically corrects ownership and mode and runs the source-test, so this is self-healing going forward.
 
 ## Authentik — configurable “home” subdomain
 
@@ -380,7 +434,7 @@ If (4) shows nothing when you trigger a reset, Authentik isn't reaching Postfix.
 ## Pull dev branch only
 
 ```bash
-cd ~/infra-TAK && git fetch origin dev && git checkout dev && git pull origin dev
+cd ~/infra-TAK && git remote set-branches origin '*' && git fetch origin --tags && git checkout -B dev origin/dev
 ```
 
 *(If your repo lives elsewhere, use that path instead of `~/infra-TAK`, e.g. `~/tak-infra`.)*
@@ -710,7 +764,7 @@ cd /path/to/infra-TAK && chmod +x pull-dev-and-restart.sh && ./pull-dev-and-rest
 **Or run the steps manually:**
 
 ```bash
-cd ~/infra-TAK && git fetch origin dev && git checkout dev && git pull origin dev
+cd ~/infra-TAK && git remote set-branches origin '*' && git fetch origin --tags && git checkout -B dev origin/dev
 ```
 
 ```bash
@@ -725,20 +779,21 @@ sudo systemctl restart takwerx-console
 
 When you want to release a version but **not** put internal/reference files on `main` (no HANDOFF, PROMPT, testing notes, retention PDFs, etc.), merge only the files users need to run, update, or start fresh. Run from repo root (e.g. `~/infra-TAK`).
 
-**Included on main:** app, overlay, start/scripts, static, modules, Guard Dog scripts, user-facing docs (README, COMMANDS, GUARDDOG, DISK-AND-LOGS, MEDIAMTX-TAKPORTAL-ACCESS, WORKFLOW-8446-WEBADMIN, REFERENCES, email template, OpenAPI spec), **docs/TESTING-UPDATES.md** (maintainer pre-release protocol), and **only the latest** release doc (e.g. `docs/RELEASE-v0.3.2-alpha.md` — change each release). Past release notes are on the GitHub Releases tab.
+**Included on main:** app, overlay, start/scripts, static, modules, Guard Dog scripts, user-facing docs (README, COMMANDS, GUARDDOG, DISK-AND-LOGS, MEDIAMTX-TAKPORTAL-ACCESS, WORKFLOW-8446-WEBADMIN, REFERENCES, FED-HUB, FEDHUB-LOGIN-RUNBOOK, email template, OpenAPI spec), **docs/TESTING-UPDATES.md** (maintainer pre-release protocol), and **only the latest** release doc (e.g. `docs/RELEASE-v0.8.9-alpha.md` — change each release). Past release notes are on the GitHub Releases tab.
 
 **Excluded from main:** older `docs/RELEASE-*.md` (only the current release is copied), `docs/HANDOFF-LDAP-AUTHENTIK.md`, `docs/PROMPT-update-handoff.txt`, `docs/TAK-Data-Retention-notes.md`, `docs/TAK_Server_Configuration_Guide.pdf`, `docs/TAK-Data-Retention-Tool.pdf`, `TESTING.md`, `scripts/ldap-diagnose-and-fix.sh` (and any other internal-only files you add to dev).
 
-**Order:** Update `dev` first so the files you copy to `main` are current. Then switch to `main`, pull, copy the listed paths from (local) `dev`, commit, push, and switch back to `dev`.
+**Order:** Sync local `dev` and `main` exactly to `origin` first (avoids divergent-branch pull errors), then copy the listed paths from `dev`, commit, push, and switch back to `dev`.
 
 ```bash
-# 1) Ensure dev has the latest (so the copy to main is current)
-git checkout dev
-git pull origin dev
+# 1) Sync local branches to remote (clean deterministic base)
+# NOTE: always run git fetch before git checkout -B so local tracking refs are current.
+# Without fetch, checkout -B uses a stale origin/dev pointer and deploys old code.
+git fetch origin --tags
+git checkout -B dev origin/dev
 
-# 2) Switch to main, update it, then copy selected files from dev
-git checkout main
-git pull origin main
+# 2) Switch to main, sync it, then copy selected files from dev
+git checkout -B main origin/main
 git checkout dev -- \
   app.py \
   mediamtx_ldap_overlay.py \
@@ -748,11 +803,16 @@ git checkout dev -- \
   .gitignore \
   static/ \
   modules/ \
+  nodered/ \
   scripts/set-docker-log-limits.sh \
   scripts/guarddog/ \
   README.md \
   docs/COMMANDS.md \
-  docs/RELEASE-v0.3.2-alpha.md \
+  docs/RELEASE-v0.9.24-alpha.md \
+  ops/diagnostics/anchortak/zombies.sh \
+  ops/diagnostics/anchortak/zombies.py \
+  docs/PORT-EXPOSURE-POLICY.md \
+  docs/EXTERNAL-DEPS.md \
   docs/TESTING-UPDATES.md \
   docs/GUARDDOG.md \
   docs/DISK-AND-LOGS.md \
@@ -763,16 +823,34 @@ git checkout dev -- \
   docs/HLS-FIX-CLIENT-VS-SERVER.md \
   docs/PULL-AND-RESTART.md \
   docs/AUTHENTIK-LOGIN-BRANDING.md \
+  docs/FED-HUB.md \
+  docs/FEDHUB-LOGIN-RUNBOOK.md \
   docs/email-template-user-created-without-password.html \
-  docs/TAK_Server_OpenAPI_v0.json
+  docs/TAK_Server_OpenAPI_v0.json \
+  docs/EXTERNAL-DB-SETUP.md
 git add -A && git status
-git commit -m "v0.3.2-alpha"
+python3 - <<'PY'
+import re, sys
+tag = "v0.9.24-alpha"  # change each release
+want = tag.lstrip("v")
+app = open("app.py", encoding="utf-8").read()
+m = re.search(r'^VERSION\s*=\s*"([^"]+)"', app, re.M)
+if not m:
+    print("ERROR: VERSION not found in app.py")
+    sys.exit(1)
+got = m.group(1)
+if got != want:
+    print(f"ERROR: app.py VERSION is {got}, expected {want} for tag {tag}")
+    sys.exit(1)
+print(f"OK: app.py VERSION matches tag ({tag})")
+PY
+git commit -m "v0.9.24-alpha"
 git push origin main
-git tag v0.3.2-alpha && git push origin v0.3.2-alpha
+git tag v0.9.24-alpha && git push origin v0.9.24-alpha
 git checkout dev
 ```
 
-**Note:** If a file doesn’t exist on dev (e.g. you removed `scripts/fix-mediamtx-stream-redirect.sh`), drop that line from the `git checkout dev --` list. For a new release, change the release doc (e.g. `docs/RELEASE-v0.3.2-alpha.md` → next release), the commit message, and the tag; then run the tag push.
+**Note:** Do **not** `git merge dev` into `main` for a release — that would put **HANDOFF** and other internal-only files on `main`. Use **only** the `git checkout dev -- …` paths below. If a file doesn’t exist on dev (e.g. you removed `scripts/fix-mediamtx-stream-redirect.sh`), drop that line from the list. For a new release, change the release doc (e.g. `docs/RELEASE-v0.6.5-alpha.md` → next), the commit message, and the tag; then run the tag push. Keep the Python check and update the `tag = "..."` line each release — it prevents update-loop bugs when **`app.py` `VERSION`** does not match the Git tag. Before pushing a new tag, optionally run `git show $(git rev-parse HEAD):app.py | grep '^VERSION = '` and confirm it matches the tag (see [RELEASE-v0.6.4-alpha.md](RELEASE-v0.6.4-alpha.md)).
 
 ---
 

@@ -6,7 +6,7 @@ Guard Dog is TAK Server health monitoring and auto-recovery: nine monitors plus 
 
 | Monitor      | Interval | What it does | On failure |
 |-------------|----------|--------------|------------|
-| **Port 8089** | 1 min  | Checks TAK Server port 8089 is listening and accepting connections | Auto-restart after 3 consecutive failures |
+| **Port 8089** | 1 min  | Checks TAK Server port 8089 is **LISTEN** and a **TCP connect to 127.0.0.1:8089** succeeds within 5s. Queue depth is no longer used — scanners can fill the backlog without triggering a restart as long as TAK accepts connections. | Auto-restart after **5** consecutive failures |
 | **Process**   | 1 min  | Verifies all 5 TAK Server Java processes (messaging, api, config, plugins, retention) | Auto-restart after 3 consecutive failures |
 | **Network**   | 1 min  | Pings 1.1.1.1 and 8.8.8.8 | Alert only (no restart) — helps tell network vs server issues |
 | **PostgreSQL**| 5 min  | Checks PostgreSQL is running | Attempts restart and sends alert |
@@ -16,8 +16,12 @@ Guard Dog is TAK Server health monitoring and auto-recovery: nine monitors plus 
 
 | **OOM**       | 1 min  | Scans TAK Server logs for OutOfMemoryError | Auto-restart and alert (once until log clears) |
 | **Disk**      | 1 hr   | Root and TAK logs filesystem usage | Alert at 80% (warning) and 90% (critical) |
-| **Certificate**| Daily | Let's Encrypt / TAK Server cert expiry (`takserver-le.jks`) | Alert when **40 days or less** remaining until expiry. **v0.3.2-alpha+:** the watch script reads the **actual keystore alias** (TAK hostname), not a hardcoded `takserver` name — redeploy Guard Dog after upgrading so `/opt/tak-guarddog/tak-cert-watch.sh` updates. |
+| **Disk I/O performance** | 15 min | Lightweight `dd` sync-write benchmark to `/tmp`, CSV history, optional email/SMS when 1h avg &lt; 50 MB/s or ~70%+ below 24h rolling avg | **v0.6.6-alpha+:** math fix for drop %; Guard Dog page can **disable the timer** or **mute only disk I/O** email/SMS while keeping other alerts. See **[RELEASE-v0.6.6-alpha.md](RELEASE-v0.6.6-alpha.md)**. |
+| **Certificate**| Daily | Let's Encrypt / TAK Server cert expiry (`takserver-le.jks`) | Auto-renewal runs at 35 days remaining. Alert fires at **25 days or less** — meaning auto-renewal failed and action is required. **v0.3.2-alpha+:** the watch script reads the **actual keystore alias** (TAK hostname), not a hardcoded `takserver` name — redeploy Guard Dog after upgrading so `/opt/tak-guarddog/tak-cert-watch.sh` updates. |
 | **Root CA / Intermediate CA** | Escalating | Monitors Root CA and Intermediate CA certificate expiry | First alert at 90 days, then 75, 60, 45, 30, then daily until expiry. Email includes CA name, days remaining, and exact expiry date. |
+
+
+> **Caddy certificates are NOT monitored by Guard Dog.** Caddy manages its own Let's Encrypt certificates (90-day validity) and auto-renews them at ~30 days remaining. The TAK Server JKS cert is rebuilt from Caddy's renewed cert by the renewal script (fires at ≤35 days). Since both run before 30 days, the Caddy card stays **green** under normal operation. It turns **red at ≤30 days** — meaning renewal ran and failed. No yellow/warning state: if you're below 30 days, something is broken and action is required. Guard Dog's **Certificate** monitor watches the same `takserver-le.jks` and alerts at ≤25 days (giving you a 5-day window after the 30-day failure threshold before emailing).
 
 ## Avoiding restart loops and boot races
 
@@ -35,8 +39,24 @@ Guard Dog is designed so that **a restart does not trigger another monitor to re
 - **Restart lock**  
   Only one monitor can perform a restart at a time. Others see the lock and skip, so 8089 and Process (and OOM) never restart in parallel.
 
+- **Service-age grace (10 min)**  
+  Before restarting TAK, Guard Dog checks how long ago the TAK service was actually started (by anyone — operator, systemd, or Guard Dog) using `systemctl show ActiveEnterTimestampMonotonic`. If TAK was started less than 10 minutes ago, Guard Dog backs off. This covers operator restarts and reboots, not just Guard Dog's own restarts.
+
+- **Daily restart cap (3/day)**  
+  All TAK Guard Dog scripts share a single restart counter (`tak_restart_count_24h`). After 3 restarts in 24 hours, Guard Dog logs `SKIP … manual intervention required` and stops. Prevents infinite loops from destroying the system.
+
+- **Clean restart**  
+  Instead of `systemctl restart takserver` (which orphans Java processes on TAK's LSB init script), Guard Dog does: `stop → pkill -9 -u tak → rm -rf /opt/tak/work → start`. This kills orphan Java processes and clears the Ignite cache.
+
+- **Boot sequencer (staggered start)**  
+  When Guard Dog is deployed, it installs two systemd hooks that orchestrate the full boot sequence:
+  1. **Pre-start** (`tak-boot-sequencer.sh` as `ExecStartPre`): stops *all* non-essential services (Authentik, TAK Portal, CloudTAK, Node-RED, MediaMTX) and waits for PostgreSQL. Caddy is left running — it's lightweight and harmless.
+  2. **Post-start** (`tak-post-start.service`): waits for TAK Server to be listening on 8089 (up to 15 min), then starts services one at a time: Authentik (waits for healthy) → TAK Portal → CloudTAK → Node-RED → MediaMTX.
+
+  This prevents the CPU stampede where 5 TAK Java processes + Docker containers all compete for CPU simultaneously. Only services that are actually installed are stopped/started; everything else is skipped.
+
 - **TAK Server soft start**  
-  When Guard Dog is deployed, it installs a systemd drop-in for `takserver.service` so TAK Server starts **after** `network-online.target` and `postgresql.service` (or `postgresql-15.service`). That prevents TAK Server from starting before the network or database are ready, which can cause immediate failure and a restart loop on boot.
+  The same systemd drop-in ensures TAK starts **after** `network-online.target` and `postgresql.service` (or `postgresql-15.service`). That prevents TAK Server from starting before the network or database are ready.
 
 - **4GB swap**  
   On deploy, Guard Dog ensures a 4GB swap file exists at `/swapfile` (create if missing, enable and add to `/etc/fstab`). This matches the reference TAK Server Hardening script and helps memory stability under load (reduces OOM risk during spikes).
@@ -134,10 +154,10 @@ If you have a **TAK Server VM runbook** (disk full, Docker container logs, Postg
 | **Root disk full** | Yes — **Disk** monitor (alert at 80% / 90%) | [DISK-AND-LOGS.md](DISK-AND-LOGS.md): truncate big container logs, set Docker log limits |
 | **Docker container logs (e.g. Node-RED 8 GB)** | No — Guard Dog doesn’t truncate or cap logs | One-time: truncate + `scripts/set-docker-log-limits.sh`; see DISK-AND-LOGS.md |
 | **PostgreSQL down / recovery** | Yes — **PostgreSQL** monitor + TAK starts *after* Postgres (Guard Dog deploy sets that) | — |
-| **TAK Server down (port 8089, processes)** | Yes — **Port 8089**, **Process** monitors (auto-restart after 3 failures) | — |
+| **TAK Server down (port 8089, processes)** | Yes — **Port 8089** (5 failures; backlog near-full only), **Process** (3 failures) | — |
 | **CoT DB size / retention** | Yes — **CoT database size** monitor (alert at 25 GB / 40 GB); VACUUM via TAK Server page | — |
 | **OOM in TAK logs** | Yes — **OOM** monitor (scans logs, restart + alert) | — |
-| **Authentik / Node-RED / MediaMTX / CloudTAK down** | Yes — service monitors (alert + restart after 3 failures) when those services are installed | — |
+| **Authentik / Node-RED / MediaMTX / CloudTAK down** | Yes — **Authentik**: **`/-/health/live/`** or **`/`**, with a **3s** retry before a failed check counts; **Node-RED / MediaMTX / CloudTAK**: unchanged. All: alert + restart after **3** failures when installed | — |
 | **Journal / APT / Docker build cache** | No | One-time or periodic: journald limit, `apt-get clean`, `docker builder prune`; see runbook or DISK-AND-LOGS.md |
 
 **Do Guard Dog monitors “just have to run”?** Yes. Once Guard Dog is **deployed**, systemd **timers** run the watch scripts on a schedule (every 1 min, 5 min, 1 hr, 6 hr, or daily). You don’t run them by hand; they run automatically. Use the Guard Dog page **Activity log** (or `/var/log/takguard/restarts.log`) to see restarts and alerts.

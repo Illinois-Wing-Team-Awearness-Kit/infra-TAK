@@ -1,34 +1,49 @@
 # Testing the Update Now button before a release
 
-The Update Now button in the web console runs a completely different code path from `git pull origin dev`. Pulling dev and restarting does **not** test the updater. You must test the button itself.
+**Rule:** Do **not** push a Git **tag** until you have run this protocol on a test VPS and **Update Now** succeeds end-to-end. Pushing a tag is what shows customers the banner; mistakes are public.
 
-## How Update Now works
+The Update Now button uses a **different code path** from `git pull origin dev`. Pulling dev and restarting does **not** validate the updater.
 
-1. Console checks GitHub **tags** (not branches) to find the highest version.
-2. If that tag is newer than the running `VERSION`, it shows "Update Available."
-3. When you click **Update Now**, it runs: fetch tags → checkout highest tag → restart console.
+## How Update Now works (current code)
 
-Tags drive everything. Pushing to `dev` or `main` does **not** trigger customer updates. Only pushing a **tag** makes the banner appear.
+1. Console asks the GitHub **API** for tags and picks the **highest** release tag (e.g. `v0.4.5-alpha`).
+2. If that version is newer than running `VERSION`, it shows **Update Available**.
+3. On **Update Now**, it runs **`git -c remote.origin.fetch= fetch origin +refs/tags/<that-tag>:refs/tags/<that-tag>`** (default fetch disabled so Git does not also update every remote-tracking ref / tag), then **`git checkout --force`** that tag, then restarts the service. If tag resolution fails, it falls back to an isolated fetch of **`main`** as `origin/main`.
+
+Tags drive the banner. Pushing to **`dev`** or **`main`** alone does **not** trigger customer updates. Pushing a **tag** does.
+
+## Why “it worked for months” then broke
+
+Older updaters used **`git fetch --tags`**. That updates **every** tag. If a field box has a **local** `v0.3.8-alpha` (or similar) pointing at a **different commit** than GitHub, Git refuses with **`would clobber existing tag`** and the whole update fails. Clones where local tags always matched GitHub never saw it.
+
+**v0.4.0+** resolved the latest tag via the API and passed a single-tag refspec. **v0.4.1+** also clears **`remote.origin.fetch`** for that fetch, because explicit refspecs are **additive** with the default — without that, some installs still hit **`would clobber existing tag`**.
+
+**Chicken-and-egg:** A box still running **pre-v0.4.0** code cannot get that fix via **Update Now** if fetch already fails there. **One-time** recovery: [PULL-AND-RESTART.md](PULL-AND-RESTART.md) (or SSH: `git fetch` + `git checkout --force v0.4.5-alpha` + restart console). After that, **Update Now** uses the isolated-fetch path.
+
+---
 
 ## Pre-release test (zero customer exposure)
 
 ### Prerequisites
 
-- Your test VPS is running (e.g. `63.250.55.132`).
-- You have SSH access.
-- Your new code is committed and pushed to `dev`.
+- Test VPS with the console installed (same style as production).
+- SSH access.
+- New updater logic is **committed and pushed to `dev`** (no new **tag** yet).
 
 ### Steps
 
-**1. Pull dev onto your test VPS**
+**1. Sync test VPS to `dev` (no mass tag fetch)**
+
+Use branch sync only so you don’t simulate a broken “fetch all tags” on the tester.
 
 ```bash
-cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
-git pull origin dev
+cd "$(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)"
+git fetch origin
+git checkout -B dev origin/dev
 sudo systemctl restart takwerx-console
 ```
 
-Your VPS now has the new updater code. No one else sees anything yet.
+*(If your clone is shallow/single-branch, follow [PULL-AND-RESTART.md](PULL-AND-RESTART.md) for `remote set-branches` / fetch first.)*
 
 **2. Fake the version down**
 
@@ -37,48 +52,41 @@ sed -i 's/VERSION = "[^"]*"/VERSION = "0.0.1"/' app.py
 sudo systemctl restart takwerx-console
 ```
 
-Console now thinks it's `0.0.1`. It sees the current highest tag on GitHub (e.g. `v0.2.7-alpha`) as an update.
+The console now reports `0.0.1` and treats the **current highest tag on GitHub** as an update target.
 
-**3. Open the console in your browser**
+**3. Open the console in a browser**
 
-You should see "Update Available" with the current highest tag. If the cache hasn't expired, click **Check for new release** or add `?refresh=1`.
+Confirm **Update Available** (refresh or wait for cache; use **Check for new release** if present).
 
 **4. Click Update Now**
 
-This runs the actual updater code path — the same thing customers will run. Watch for:
+This is the **exact** customer path. Check:
 
-- Does it restart cleanly? (brief 502, then console loads)
-- Does the sidebar show the tag version after restart?
-- Any error banner?
+- Clean restart (brief 502, then UI loads).
+- Sidebar **VERSION** matches the tag you expected.
+- No red error banner.
 
-**5. If it works — restore dev and proceed with release**
+**5. If it passed — restore the test VPS to real `dev`**
 
 ```bash
-cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
+cd "$(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)"
 git checkout -- app.py
-git pull origin dev
+git fetch origin
+git checkout -B dev origin/dev
 sudo systemctl restart takwerx-console
 ```
 
-VPS is back on dev with the real VERSION. Now do the normal release flow — **the exact list of paths to copy from `dev` to `main` is in [COMMANDS.md](COMMANDS.md) → “Merge dev → main (selective — release only)”** (not the whole `dev` branch). Each release, update the `docs/RELEASE-v…` line, commit message, and tag in that block.
+**6. Cut the release (selective `main` + tag)**
 
-```
-git checkout dev && git pull origin dev
-git checkout main && git pull origin main
-git checkout dev -- …   # see COMMANDS.md for the full path list
-git add -A && git commit -m "vX.Y.Z-alpha"
-git push origin main
-git tag vX.Y.Z-alpha && git push origin vX.Y.Z-alpha
-git checkout dev
-```
+Use **[COMMANDS.md](COMMANDS.md) → “Merge dev → main (selective — release only)”** — full path list, Python `VERSION` check, commit, **`git push origin main`**, then **`git tag`** / **`git push origin <tag>`**.
 
-**6. If it breaks — fix before anyone sees it**
+**7. If step 4 failed — fix on `dev`, repeat from step 1**
 
-No tag was pushed, so no customer saw anything. Fix the code on dev, repeat from step 1.
+No tag was pushed; customers were not prompted.
 
-### Optional: Guard Dog / updates email (v0.2.7-alpha+)
+### Optional: Guard Dog updates email (v0.2.7-alpha+)
 
-After **Update Now** succeeds on the test VPS, click **↻ Update Guard Dog** once. To sanity-check the “updates available” email path without waiting for the timer:
+After **Update Now** succeeds, **↻ Update Guard Dog** once. To exercise the updates email path:
 
 ```bash
 sudo rm -f /var/lib/takguard/updates_notified
@@ -86,29 +94,33 @@ sudo /opt/tak-guarddog/tak-updates-watch.sh
 tail -5 /var/log/takguard/updates.log
 ```
 
-You should see `Updates email sent to …` or `No updates available`. Use **Guard Dog → Send test email** first if you have not confirmed Email Relay.
+Use **Guard Dog → Send test email** first if Email Relay is not verified.
 
-## Why this works
-
-- The fake version (`0.0.1`) makes the console think it needs an update.
-- The updater targets the highest **tag on GitHub**, which already exists from a previous release.
-- No new tag is pushed during testing, so customers never see an update prompt.
-- You are testing the exact code path customers will use (fetch → checkout → restart).
+---
 
 ## What this catches
 
-- Rebase/merge/cherry-pick conflicts (the v0.2.4 bug).
-- Broken git state handling (detached HEAD, stale operations).
-- Tag resolution failures.
-- Restart failures after checkout.
+- Updater `git` failures (tag clobber, shallow clone, wrong ref).
+- Detached HEAD / stale merge-rebase state (`update_apply` aborts those first).
+- Wrong **VERSION** vs tag after restart.
+- Service restart failures.
+
+## See also
+
+- **Node-RED / Configurator only** (checkout `dev`, `nodered/deploy.sh --no-pull`, curl + UI smoke tests): **[TESTING-NODERED-DEPLOYS.md](TESTING-NODERED-DEPLOYS.md)**
 
 ## Quick reference
 
-| Action | Who sees it? |
-|--------|-------------|
-| Push to `dev` | Nobody (no update banner) |
-| Push to `main` | Nobody (no update banner) |
-| Push a **tag** | Everyone on older versions sees "Update Available" |
-| Delete a tag | Banner disappears on next cache refresh (~10 min) |
+| Action | Who sees “Update Available”? |
+|--------|-------------------------------|
+| Push `dev` | Nobody |
+| Push `main` | Nobody |
+| Push a **tag** | Everyone whose `VERSION` is older than that release |
 
-**Rule: never push a tag until you have tested Update Now on your VPS.**
+**Release safety:** Before `git tag`, `app.py` **`VERSION`** must equal the tag without the `v` (e.g. tag `v0.4.3-alpha` → `VERSION = "0.4.5-alpha"`). Copy-paste check: [COMMANDS.md](COMMANDS.md) release block.
+
+---
+
+## What went wrong if you skipped this
+
+Rushing **tag → customers** without step 4 can ship a broken **Update Now**. That is not a “you’re stupid” problem — it is a **process** problem. This doc **is** the process; follow it every time.

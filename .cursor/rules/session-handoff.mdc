@@ -1,0 +1,45 @@
+---
+description: Session start/end protocol — cheap cross-chat context, replaces memory
+alwaysApply: true
+---
+
+# Session Handoff Protocol
+
+Reading 50 lines of a HANDOFF file costs ~150 tokens. Reconstructing lost context from scratch costs ~8,000 tokens. Write the HANDOFF.
+
+## Starting a session
+1. Read `docs/HANDOFF-<latest-date>.md` BEFORE opening any code file
+2. Anchor immediately: "Per the HANDOFF, picking up from [X]. Today's task: [Y]."
+3. Open ONLY files mentioned in the handoff — nothing else speculatively
+
+## Ending any chat longer than 10 turns
+Before closing, write or update `docs/HANDOFF-<YYYY-MM-DD>.md`:
+
+```
+## Status
+[Done / In progress / Blocked]
+
+## What was done
+- [function/route changed] — [why]
+
+## Current state
+[Does it work? What's confirmed broken? What's unknown?]
+
+## Exact next step
+[Single action: "Fix the FileNotFoundError in deploy_nodered() around line 4200"]
+
+## Files touched
+- app.py (lines ~XXXX–YYYY)
+- nodered/deploy.sh
+```
+
+## The HANDOFF is your memory — treat it like source code
+It lives in `docs/` and gets committed. Future-you (and the agent) will thank present-you.
+
+## If a bug takes >2 chats to resolve
+Add a `## Known context` section to the HANDOFF with:
+- What you've already ruled out
+- Exact error messages / log lines
+- Which approaches failed and why
+
+This prevents the agent from re-exploring dead ends at your expense.

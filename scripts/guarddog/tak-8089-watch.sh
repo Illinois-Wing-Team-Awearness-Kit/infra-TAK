@@ -9,7 +9,7 @@ LAST_RESTART_FILE="$STATE_DIR/last_restart_time"
 RESTART_LOCK="$STATE_DIR/restart.lock"
 
 PORT=8089
-MAX_FAILS=3
+MAX_FAILS=5
 COOLDOWN_SECS=900
 MIN_UPTIME_SECS=900
 
@@ -21,15 +21,21 @@ if [ "$UPTIME_SECS" -lt "$MIN_UPTIME_SECS" ]; then
   exit 0
 fi
 
+# TAK takes ~5 min to fully start; restarting during startup orphans Java processes.
+# Check actual service activation time (covers operator restart, systemd restart, Guard Dog restart).
+STARTUP_GRACE=600
+_tak_mono=$(systemctl show takserver --property=ActiveEnterTimestampMonotonic --value 2>/dev/null || echo "")
+if [ -n "$_tak_mono" ] && [ "$_tak_mono" != "0" ]; then
+  _tak_age=$(( UPTIME_SECS - _tak_mono / 1000000 ))
+  [ "$_tak_age" -ge 0 ] && [ "$_tak_age" -lt "$STARTUP_GRACE" ] && exit 0
+fi
+
 # Check if we're in grace period (15 minutes after any restart)
 if [ -f "$LAST_RESTART_FILE" ]; then
   LAST_RESTART=$(cat "$LAST_RESTART_FILE")
   CURRENT_TIME=$(date +%s)
   TIME_SINCE_RESTART=$((CURRENT_TIME - LAST_RESTART))
-  
-  # 900 seconds = 15 minutes
   if [ $TIME_SINCE_RESTART -lt 900 ]; then
-    # Still in grace period, skip check
     exit 0
   fi
 fi
@@ -42,25 +48,21 @@ if [ -f "$RESTART_LOCK" ]; then
   exit 0
 fi
 
-# Check if port 8089 is listening and accepting connections
-LQ_LINE=$(ss -ltn "sport = :$PORT" | awk 'NR==2')
-
+# ── Health check ──
+# Signal: is port 8089 bound and listening?
+# Port 8089 uses mutual TLS (auth="x509") — a raw TCP connect via nc -z
+# reaches Netty, which immediately closes the connection on a non-TLS probe
+# and logs SSL errors on every check. The ss LISTEN check is sufficient:
+# if Netty is bound, the messaging process is accepting connections.
 LISTEN_OK=false
-BACKLOG_BAD=false
 
+LQ_LINE=$(ss -ltn "sport = :$PORT" | awk 'NR==2')
 if echo "$LQ_LINE" | grep -q LISTEN; then
   LISTEN_OK=true
-  RECVQ=$(echo "$LQ_LINE" | awk '{print $2}')
-  SENDQ=$(echo "$LQ_LINE" | awk '{print $3}')
-
-  # Check if listen backlog is saturated
-  if [ -n "$RECVQ" ] && [ -n "$SENDQ" ] && [ "$SENDQ" -gt 0 ] && [ "$RECVQ" -ge $((SENDQ-5)) ]; then
-    BACKLOG_BAD=true
-  fi
 fi
 
-# If healthy, reset fail counter
-if $LISTEN_OK && ! $BACKLOG_BAD; then
+# Healthy: port is listening
+if $LISTEN_OK; then
   echo 0 > "$FAIL_FILE"
   exit 0
 fi
@@ -84,6 +86,23 @@ if [ $((NOW - LAST)) -lt "$COOLDOWN_SECS" ]; then
   exit 0
 fi
 
+# Daily restart cap — shared across all Guard Dog TAK scripts to prevent infinite loops
+DAILY_COUNT_FILE="$STATE_DIR/tak_restart_count_24h"
+DAILY_WINDOW_FILE="$STATE_DIR/tak_restart_window"
+MAX_DAILY_RESTARTS=3
+_window_start=$(cat "$DAILY_WINDOW_FILE" 2>/dev/null || echo 0)
+if [ $((NOW - _window_start)) -ge 86400 ]; then
+  echo "$NOW" > "$DAILY_WINDOW_FILE"
+  echo 0 > "$DAILY_COUNT_FILE"
+fi
+_daily=$(cat "$DAILY_COUNT_FILE" 2>/dev/null || echo 0)
+if [ "$_daily" -ge "$MAX_DAILY_RESTARTS" ]; then
+  TS="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  mkdir -p /var/log/takguard
+  echo "$TS | SKIP | 8089 unhealthy but daily restart cap ($MAX_DAILY_RESTARTS) reached — manual intervention required" >> /var/log/takguard/restarts.log
+  exit 0
+fi
+
 # Log and alert
 logger -t takguard "8089 unhealthy for $FAILS checks; restarting takserver"
 
@@ -101,7 +120,8 @@ LOAD="$(cut -d' ' -f1-3 /proc/loadavg)"
 MEMFREE="$(free -h | awk '/Mem:/ {print $4}')"
 MSGPID="$(ps -ef | grep takserver.war | grep messaging | grep -v grep | awk '{print $2}' | head -n1)"
 
-echo "$TS | restart | 8089 unhealthy | load=$LOAD | mem_free=$MEMFREE | msg_pid=${MSGPID:-na}" >> "$LOGFILE"
+DETAIL="listen=$LISTEN_OK"
+echo "$TS | restart | 8089 unhealthy | $DETAIL | load=$LOAD | mem_free=$MEMFREE | msg_pid=${MSGPID:-na}" >> "$LOGFILE"
 
 # Send alerts
 SUBJ="TAK Guard Dog Restart on $SERVER_IDENTIFIER"
@@ -117,8 +137,8 @@ System State:
 - Messaging PID before restart: ${MSGPID:-na}
 
 This usually indicates:
-- Dead TLS connections accumulating
-- Client reconnect loops
+- TAK Server messaging thread stuck or crashed
+- Kernel accepting connections but TAK not processing them
 - Network issues
 
 Check /var/log/takguard/restarts.log for history.
@@ -139,8 +159,16 @@ touch "$RESTART_LOCK"
 # Record restart time for grace period
 date +%s > "$LAST_RESTART_FILE"
 
-# Restart TAK Server
-systemctl restart takserver
+# Increment daily restart counter
+echo $((_daily + 1)) > "$DAILY_COUNT_FILE"
+
+# Clean restart: stop → kill orphan Java processes → clear Ignite cache → start
+systemctl stop takserver
+sleep 2
+pkill -9 -u tak 2>/dev/null || true
+sleep 1
+rm -rf /opt/tak/work
+systemctl start takserver
 
 # Wait 30 seconds then remove lock
 sleep 30

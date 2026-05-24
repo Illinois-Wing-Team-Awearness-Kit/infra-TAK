@@ -5,18 +5,740 @@
 ## Prompt for a new chat (copy and paste this)
 
 ```
-Read docs/HANDOFF-LDAP-AUTHENTIK.md section "0. Current Session State" — we're on v0.2.6-alpha.
+Read docs/HANDOFF-LDAP-AUTHENTIK.md — current release is v0.8.9-alpha.
 
-CRITICAL: v0.2.4-alpha introduced a broken updater (git pull --rebase) that caused rebase conflicts on customer boxes. v0.2.6-alpha fixes it (fetch + force-checkout). See Section 0 for full details, customer recovery command, and new testing protocol (docs/TESTING-UPDATES.md).
+CRITICAL INCIDENTS:
+- v0.8.0: introduced AUTHENTIK_HOST internal-URL fix (correct for fresh installs) but the post-update migration unconditionally restarted the LDAP outpost, causing thundering herd (bind cache wipe → all clients re-auth simultaneously → worker/Postgres exhaustion) on active installs.
+- v0.8.1: hotfix — LDAP migration now health-gated (checks websocket + no TLS error before patching/restart).
+- v0.8.2: post-update migration auto-sets AUTHENTIK_WEB_WORKERS=4 and restarts server only (never ldap).
+- v0.8.3: idle_in_transaction_session_timeout 120s → 30s with force-recreate to apply (10s was tried first and broke Authentik startup — migration lifecycle has idle gaps of 10-20s).
+- v0.8.4: REVERSED the v0.8.0 routing migration for boxes whose outpost was spiraling on http://authentik-server-1:9000. Through Caddy (https://<fqdn> + extra_hosts:host-gateway), HTTP/2 multiplexing and connection pooling shape the request flow and prevent parallel unbounded queries from exposing Authentik 2026.2.2's slow policybindingmodel evaluation. Tak-10 dropped from 200+ active Postgres queries to 1 the moment routing was reversed.
+- v0.8.5: HARDENING of v0.8.4. (a) PROACTIVE routing migration `_ensure_authentik_ldap_outpost_on_fqdn` — migrates boxes from internal direct routing to FQDN on Authentik deploy / TAK Server deploy / Update Now / every 10 min, gated on `/opt/tak` installed AND FQDN configured AND Caddy reachable. Catches the responder-class latent misroute that the reactive detector cannot see (cached SA session masks the spiral until first fresh bind). (b) Gunicorn worker timeout bump 30s→120s — `_ensure_authentik_gunicorn_timeout` appends `GUNICORN_CMD_ARGS=--timeout=120` to `~/authentik/.env` once and recreates only the server container. Closes the SIGABRT cascade observed on tak-10 (heavy LDAP load → Authentik 2026.2.2 flow planner exceeds 30s → gunicorn kills worker → in-flight TCP drops → Caddy 502 → outpost retry → stage recursion). Idempotent — never overwrites operator override; safe everywhere because timeout never fires on fast boxes. (c) Verifier hardening — `_test_ldap_bind_dn_verdict` returns tri-state `'ok' | 'fail' | 'inconclusive'`; `_ensure_authentik_webadmin` no longer does destructive DELETE+POST recreate on inconclusive verdicts and re-queries before POST on confirmed-fail (kills the responder `400 username must be unique` regression). (d) Dual-signal spiral detection with two-tier markers — outpost trips on ≥1 spiral-specific marker (`result code 50`, `nil pointer`, `exceeded stage recursion`, 502/503) OR Postgres idle-in-trans ≥30. General markers (`failed to execute flow`, `EOF`) tracked for forensics only — they appear on healthy boxes from typos and normal disconnects, false-positive trapped during tak-10 dev testing. (e) Periodic 10-min monitor thread (PID-locked, 6h rate limit) so spirals manifesting after Update Now self-heal. (f) Granular gate logging at every early-return. (g) Forensics persisted to settings.authentik_spiral_last_repair, settings.authentik_proactive_routing_migration, and settings.authentik_gunicorn_timeout_migration.
+- v0.8.6: AZURE / NAT DEPLOY RELIABILITY. Four field bugs found and fixed during first Azure deployment test (tak-test-3, D8as_v5, P10 64 GiB OS disk, ~145 MB/s sync write). (a) Authentik containers never started on slow-disk VMs — Step 7 (docker compose up -d) was nested inside `elif needs_pg_update:` which is always False on fresh deploys; un-indented 121 lines so bring-up is unconditional. (b) start.sh showed private IP on Azure/AWS NAT — added curl api.ipify.org (3s timeout) with graceful fallback; shows both public and private when they differ. (c) Dashboard disk I/O showed cached vmstat speed (998 MB/s) instead of real sync speed (145 MB/s) — Guard Dog diskio_history.csv read first when available; vmstat fallback now labeled "(vmstat, cached)" so source is visible; manual test switched to oflag=dsync. (d) LDAP SA bind check always reported failure even when LDAP was working — two bugs: ldapsearch searched dc=takldap base scope (Authentik returns LDAP error 32 there regardless of bind outcome, so exit code always non-zero); fixed by searching ou=users,dc=takldap one-level for cn=adm_ldapservice. Race: sleep(2) was too short on Azure (log entry written at same second as docker logs check); fixed: sleep(5), --since 90s, direct Docker log fallback ("authenticated from session") that bypasses ldapsearch entirely. Confirmed on tak-test-3: attempt 2 passed via Docker log fallback, full clean deploy in ~4 minutes.
+- v0.8.7: AUTHENTIK STABILITY — env var name fix + official tunings + runtime-config verifier. Apr 30 2026 SMOKING GUN on tak-10: `docker top authentik-server-1` showed only **2 gunicorn workers** despite `.env` containing `AUTHENTIK_WEB_WORKERS=4` since v0.8.2. Root cause: Authentik 2026.x requires DOUBLE underscore (`AUTHENTIK_WEB__WORKERS`) per official docs (https://docs.goauthentik.io/install-config/configuration/) — single underscore was silently ignored on every box in the fleet for 5 releases. `ak dump_config` also confirmed cache and log_level were all running at defaults (300s/300s/info) despite our intent. Three pieces shipped: (a) `_authentik_apply_official_tunings(plog)` — renames `AUTHENTIK_WEB_WORKERS` → `AUTHENTIK_WEB__WORKERS=4` (correct name, finally applies); adds `AUTHENTIK_CACHE__TIMEOUT_FLOWS=600`, `AUTHENTIK_CACHE__TIMEOUT_POLICIES=600`, `AUTHENTIK_LOG_LEVEL=warning` (only if missing — never overwrites operator-set values). (b) `_authentik_verify_runtime_config(plog)` — closes the audit loop: runs `ak dump_config`, parses JSON, counts gunicorn workers via `docker top`; persists pass/fail to settings.authentik_runtime_config_check so we can never have this silent-default scenario again. (c) `_recreate_authentik_server_worker(plog, reason)` — runs `docker compose up -d --force-recreate --no-deps server worker` (NEVER touches ldap), called only when env vars actually change. v0.8.2 migration block in `_post_update_auto_deploy` superseded — now delegates to `_authentik_apply_official_tunings`. Migration runs on every console startup via `_startup_migrations` (idempotent — only first run triggers recreate). Validated tak-10 with real 351-bind workload: server CPU p50 99% → **2.1%** (~47x reduction), Postgres p50 94% → **0.0%**, all 4 workers running per `docker top`, `ak dump_config` confirms cache/log_level applied. NO UI changes (operator explicit). **DELETED before ship**: daily 04:00 periodic restart, ASGI WebSocket loop reactive trigger, admin-API safety gate — all built on the wrong "state drift" theory; with the real fix in, none are needed. Lesson encoded as alwaysApply Cursor rule `.cursor/rules/consult-upstream-docs.mdc`.
+- v0.8.8: TWO fleet-wide stability fixes — (1) LDAP flow stage-binding recursion, (2) `idle_in_transaction_session_timeout=30s` too aggressive on slow disks. Both surfaced on the same Apr 30 2026 slow-disk SSDNodes investigation. Apr 30 2026 SMOKING GUN on a slow-disk SSDNodes box (1795 random-write 4k IOPS, 31.7 MB/s sequential write): Postgres CPU pinned at 900-1500% sustained, 5 PG backends running 86-second `SELECT FROM authentik_policies_policybindingmodel` queries on a box doing 0.36 LDAP binds per second (essentially idle workload). Root cause: every stage binding on `ldap-authentication-flow` had **both** `evaluate_on_plan=true` AND `re_evaluate_policies=true`. That combo causes a cascading policy re-evaluation on every step of every authentication plan. Authentik 2025.10+ uses Postgres for cache/channels/tasks (no Redis), and `policybindingmodel` has only the PK as an index, so each cascading lookup is a sequential scan. Fast-disk boxes hide it (cascading queries complete in microseconds); slow-disk boxes explode under it. The fix: blueprint YAML + healing function changed to ship `evaluate_on_plan=false` (matching how `default-authentication-flow` is configured — that flow has zero recursion and works fine on every box). Three pieces shipped: (a) two blueprint YAML copies in app.py — six occurrences of `evaluate_on_plan: true` flipped to `false` on the three `ldap-authentication-flow` stage bindings. `re_evaluate_policies: true` preserved (matches default flow, not part of the recursion combo). (b) `_ensure_ldap_flow_authentication_none()` line ~24548 — same fix on the healing path so post-update healing doesn't re-introduce the bug. (c) NEW idempotent self-healing migration `_authentik_fix_ldap_flow_recursion(plog)` — counts bad bindings via SQL on every console startup AND post-update; if `count > 0`, runs idempotent UPDATE and restarts `authentik-server-1` ONLY (server alone, never `--no-deps server worker`, never ldap outpost) so the in-memory flow plan cache rebuilds. Persists outcome to `settings.authentik_ldap_flow_recursion_fix` (`fixed` / `idempotent-noop`). Validated on the SSDNodes box: Postgres CPU dropped 900%+ → **~7.8% in 60 seconds** (~115x reduction), zero long-running queries persisted, LDAP outpost StartedAt unchanged. NO UI changes (same scope discipline as v0.8.7).
+- v0.8.9: AUTHENTIK AUDIT LOG IP FIX — fleet-wide silent bug since the Caddy→Authentik wiring shipped. May 1 2026 SMOKING GUN on takserver2: a deliberate failed login from a cellular phone was recorded as `client_ip: "172.18.0.1"` (the Docker bridge gateway) instead of the phone's real public IP. Root cause: `AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS` defaults to "trust nothing" in Authentik — per the SAME official docs page that surfaced the v0.8.7 `AUTHENTIK_WEB__WORKERS` silent-ignore bug. Caddy correctly forwards `X-Forwarded-For` on every request, but Authentik discards it because no proxy CIDR is trusted. Authentik records the immediate-upstream connection source (the Docker bridge gateway) instead. This means: (a) every audit log event on every infra-TAK install has been wrong since the project began; (b) the v0.9.0 Authentik Reputation policy would score all attempts as if from one IP — completely useless; (c) any fail2ban jail reading `client_ip` would ban `172.18.0.1` (the Docker gateway), DoS-ing the entire Caddy→Authentik path. Fix: NEW idempotent migration `_authentik_fix_trusted_proxy_cidrs(plog)` appends `AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128` to `~/authentik/.env`. `172.16.0.0/12` covers all observed Docker bridge subnets fleet-wide (172.17 default, 172.18 authentik, 172.19 tak-portal, 172.20 infratak, 172.21 cloudtak). `127.0.0.1/32` and `::1/128` cover loopback (Guard Dog health probes). Idempotent — if the key is already present (any value, including operator-set custom), records `idempotent-noop` and never overwrites. When applied, triggers `_recreate_authentik_server_worker(reason='trusted-proxy-cidrs-migration')` (server+worker only — LDAP outpost untouched, cardinal rule upheld). Verifier extended with 4th probe: reads `listen.trusted_proxy_cidrs` from `ak dump_config`, asserts `172.16.0.0/12` is present. Persists `last_outcome` to `settings.authentik_trusted_proxy_cidrs_fix`. Wired into both `_startup_migrations` and `_post_update_auto_deploy`, runs AFTER the v0.8.8 recursion fix to batch server restarts on old boxes (one restart serves both fixes on first upgrade). Migration window: ~35-60s on first upgrade; sub-second no-op on every subsequent restart. Validated May 1 2026 on tak-10 and responder: `ak dump_config` confirms `trusted_proxy_cidrs: 172.16.0.0/12,...`, `ak shell` query on `Event.objects.filter(action='login_failed')` confirms `client_ip: 174.244.110.118` (real WAN IP, not 172.18.0.1). Overnight soak on both boxes: `idempotent-noop` + verifier `pass` on all restarts. NO UI changes. fail2ban and Reputation policy explicitly parked to v0.9.x — trusted-proxy fix is a prerequisite for both.
 
-v0.2.5-alpha fixed: MediaMTX External Sources UI corruption (stale overlay on server), Guard Dog Updates monitor staying red (missing systemd timer). v0.2.6-alpha fixed: Update Now button rebase conflicts (rewrote updater to use deterministic git checkout --force).
+**ALWAYS pin `Environment=HOME=…` in `takwerx-console.service`** — systemd does NOT inherit `HOME` from login env, and without it `/bin/sh -c 'cd ~/authentik …'` fails with `cd: can't cd to ~/authentik`. This bit `takserver_sync_webadmin` during v0.9.12 testing on tak-10. Same root cause as v0.2.7-alpha (`takupdatesguard.service` HOME fix) and v0.9.2 `git safe.directory` (HOME-unset → `git config --global` wrote to wrong file). v0.9.12 added three layers: runtime `os.environ['HOME']` guard at the top of `app.py`, `Environment=HOME=$SERVICE_HOME` in `start.sh create_service()` for new installs, and `_startup_pin_console_service_home()` migration that patches existing units + daemon-reloads. **Whenever you add a `subprocess.run('cd ~/…', shell=True)` call site, this fix must already be in place** — do not invent per-call-site `cwd=os.path.expanduser('~/…')` workarounds when the env-layer fix exists.
 
+**Authentik `ReputationPolicy.passes()` returns `True` ONLY when `score <= threshold` — i.e. ONLY when the user is bad enough to act on.** A normal-reputation user makes the policy return `False`. Verified by `inspect.getsource(ReputationPolicy.passes)` on the deployed `authentik-server-1` container (Authentik 2026.2.2, tak-10 2026-05-11): `passing = score <= self.threshold`. **Therefore any PolicyBinding that uses ReputationPolicy as a brute-force gate on an authentication flow MUST set `negate=True`.** Without negate, the binding result for every normal user is `False`, the flow becomes non-applicable, and LDAP binds return `49` regardless of password correctness — the exact symptom that broke `tak-10` after the v0.9.12 LDAP outpost recreate cleared its `bind_mode: cached` results. We shipped `negate=False` from v0.9.2 through v0.9.12-rc; the bug only surfaced once the outpost cache no longer masked the misconfig. Fix landed in v0.9.12-alpha as `negate=True` on both the create-path (`_authentik_setup_reputation_policy`) and the idempotent retro-fix migration (`_startup_fix_reputation_policy_drift`), with the upstream source quoted verbatim in `app.py` and `docs/RELEASE-v0.9.12-alpha.md § B8`. **Per `.cursor/rules/consult-upstream-docs.mdc` — `inspect.getsource()` against the running container is the canonical truth; do not infer policy semantics from blog posts.**
+
+NEVER restart the LDAP outpost in a migration unless it is provably broken. ALWAYS use the correct double-underscore env var name `AUTHENTIK_WEB__WORKERS` (single underscore is silently ignored per Authentik 2026.x docs). **NEVER set idle_in_transaction_session_timeout below 300s — sub-2k-IOPS disks will exceed it during Django startup migrations and crash-loop the server forever (v0.8.8 bug #2 was 30s, killed migrations mid-flight, left stale advisory locks).** Caddy is a request shaper for the LDAP outpost — direct routing to authentik-server-1:9000 exposes the upstream Authentik 2026.2.2 LDAP-flow regression. ALWAYS verify env var changes via `docker exec authentik-worker-1 ak dump_config` and `docker top authentik-server-1` — never trust .env alone (the v0.8.2 → v0.8.7 silent-ignore bug taught us why). NEVER ship `evaluate_on_plan=true` AND `re_evaluate_policies=true` on the same stage binding — that's the v0.8.8 recursion combo; use `evaluate_on_plan=false, re_evaluate_policies=true` (matches default-authentication-flow). **ALWAYS set `AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128` in `~/authentik/.env` — without it Authentik records the Docker bridge gateway IP (172.18.0.1) for every login event instead of the real client IP (v0.8.9 fleet-wide silent bug). The v0.8.9 migration handles this automatically; for any new Authentik deploy verify with `ak dump_config | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('listen',{}).get('trusted_proxy_cidrs','NOT SET'))"`.** READ UPSTREAM DOCS FIRST before chasing CPU/perf symptoms — see `.cursor/rules/consult-upstream-docs.mdc`. **SLOW-DISK BOXES ARE QA GOLD — they expose race-conditioned bugs hiding behind sub-millisecond fsync. Treat any "this box is slow" report as a chance to find another fleet-wide latent bug.**
+
+VALIDATED in field on 2026-04-29 across tak-10 (heavy DataSync/Node-RED), ssdnodes (medium streaming), and responder (medium-light): all three on v0.8.5-alpha, all three on FQDN routing, all three with GUNICORN_CMD_ARGS=--timeout=120, all three at SIGABRT=0 / outpost recursion=0 / Postgres idle-in-trans=0 over 30+ min of real bind load (1.5–2.4 binds/sec sustained per box). Azure tak-test-3 validated on 2026-04-29: clean Authentik deploy in ~4 min, LDAP SA bind verified via Docker log fallback on attempt 2, all four v0.8.6 fixes confirmed working. Apr 30 2026 tak-10 v0.8.7 validation: 4 gunicorn workers running (was 2), `ak dump_config` shows cache=600s + log_level=warning (were defaults), 3-min CPU soak with 351 real binds → server p50 2.1%, postgres p50 0.0% (was 99%/94% under same load on v0.8.6). May 1 2026 tak-10 + responder v0.8.9 validation: `ak dump_config` confirms `trusted_proxy_cidrs: 172.16.0.0/12,127.0.0.1/32,::1/128`; `ak shell Event.objects.filter(action='login_failed').first().client_ip` returns real WAN IP `174.244.110.118` (not 172.18.0.1); overnight soak both boxes `idempotent-noop` + verifier `pass`.
+
+Bursty CPU on heavy-DataSync boxes is NORMAL, not a regression: tak-10 swings server CPU 100%+ → 7% → 1% over 60s windows because DataSync clients re-authenticate per HTTP request and Node-RED engine flows fire clock-aligned bind clusters. The `--timeout=120` gunicorn fix absorbs these bursts; SIGABRT count = 0 is the proof. Don't chase low CPU as a goal on Mission API / DataSync / Node-RED boxes. If a previously-healthy box shows SUSTAINED high CPU (p50 > 50% for hours), check `docker top authentik-server-1 | grep -c 'gunicorn: worker'` and `ak dump_config` first — the v0.8.7 verifier should catch silent-ignore regressions, but always re-confirm.
+
+See "April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal", "April 2026 — v0.8.5 hardening", "April 2026 — v0.8.5 fleet validation", "April 2026 — v0.8.6 Azure/NAT deploy reliability", "April 2026 — v0.8.7 SILENT-IGNORE env var name bug", "April 2026 — v0.8.7 band-aids that were built then DELETED before ship", "April 2026 — v0.8.8 LDAP FLOW STAGE-BINDING RECURSION FIX", and "May 2026 — v0.8.9 TRUSTED PROXY CIDRS FIX" sections for full incident details and rules.
 Use docs/HANDOFF-LDAP-AUTHENTIK.md as the single source of truth for what's done and what to do next.
 ```
 
 ---
 
+## TAK Server Authentication Paths — Visual Reference
+
+The diagram below (credit: mytecknet.com) shows the three certificate authentication paths in TAK Server side by side. Key takeaways for the infra-TAK / Authentik setup:
+
+- **Manual cert generation (top):** `makeCert.sh` creates the cert; `certmod -g __ANON__` places the user in the flat file under the ANON group. Group can be changed with subsequent `certmod` calls.
+- **Certificate enrollment — Flat File (middle):** Client presents username/password → TAK Server validates against `UserAuthenticationFile.xml` → issues cert. User was pre-created in Manage Users.
+- **Certificate enrollment — AD/LDAP (bottom):** Client presents username/password → TAK Server sends the challenge to the AD/LDAP source (Authentik LDAP outpost in infra-TAK) → if validated, TAK Server issues the cert. The cert is always TAK Server-signed; Authentik handles identity validation in the middle of the flow. The user is **not** added to the flat file via this path.
+
+![TAK Server Authentication Diagrams](TAK-SERVER-AUTH-DIAGRAMS.png)
+
+---
+
+## LDAP vs flat-file and `webadmin` (8446) — why infra-TAK strips one XML row
+
+**What we abandoned:** Deleting or emptying `UserAuthenticationFile.xml` wholesale, or expecting it to stay gone — TAK Server can **rewrite** that file on restart, so that approach was brittle.
+
+**What we validated in the field:** With **LDAP as the default auth** in `CoreConfig.xml` (`default="ldap"` and a proper `<ldap …/>` block toward Authentik), normal 8446 password auth goes through **LDAP**, not “mystery fallback” to flat-file for users who exist only in LDAP.
+
+**Why `_remove_webadmin_from_userauth()` still exists (surgical, not global):** The painful bug was **duplicate identity**: the same username **`webadmin`** present in **both** `UserAuthenticationFile.xml` (e.g. from an old `UserManager.jar usermod`) **and** Authentik/LDAP. In that situation TAK can check the flat-file entry for `webadmin` and ignore the LDAP password you expect — wrong password / “shadowing” symptoms. See `docs/WORKFLOW-8446-WEBADMIN.md` for the table and flow.
+
+**What the code does:** It does **not** remove the `<File …/>` provider from CoreConfig by default. It **only removes the `<user identifier="webadmin" …>` element** from `UserAuthenticationFile.xml` when Authentik is in use, after sync — minimal change so there is no second password store for that one account. Optional: TAK Server page **flat-file auth toggle** if you want to disable the File provider entirely.
+
+**Complexity tradeoff:** Extra moving parts in exchange for a **narrow** fix (one user, one file) instead of fighting TAK’s file lifecycle or over-disabling flat-file for everyone.
+
+---
+
+## April 2026 — LDAP outpost thundering herd (v0.8.0 regression → v0.8.2 fix)
+
+**Incident summary:** v0.8.0 introduced a correct fix (LDAP outpost `AUTHENTIK_HOST` pointed at `https://<fqdn>` instead of `http://authentik-server-1:9000`, causing `tls: internal error` on fresh installs). The fix was correct. The post-update migration was not: it patched the compose file and **restarted the LDAP outpost unconditionally on all existing installs**, including healthy ones.
+
+**What restarting the LDAP outpost does:** The outpost's `bind_mode: cached` holds all active bind sessions in memory. A restart wipes every cached session. With active TAK clients, every client re-authenticates simultaneously. Each bind drives the full Authentik flow executor (3 HTTP round-trips + heavy Django ORM queries against Postgres). On a box with many clients, 50–100+ concurrent flow executor requests saturate Authentik's 2 default server workers, causing request queuing. Each worker processes one request at a time; requests queue and take 100–200 seconds each. The LDAP outpost has an HTTP timeout shorter than this queue depth, so it returns EOF. TAK Server retries the bind. The retry creates more concurrent requests. The system locks into a death spiral that does not self-resolve without intervention.
+
+**Postgres symptom:** `max_connections` (default 300) is exhausted because each queued flow executor request holds a Postgres connection for its entire 100–200 second duration. Postgres logs show hundreds of `FATAL: terminating connection due to administrator command` or idle-session timeout kills.
+
+**Recovery:**
+1. Restart Authentik (`docker compose restart`) to kill all queued requests and Postgres connections.
+2. Scale workers: add `AUTHENTIK_WEB_WORKERS=4` to `~/authentik/.env`, then `docker compose restart server` (NOT ldap — do not clear bind caches again).
+3. Wait 3–5 minutes for runtimes to drop to under 1000ms. Caches rebuild automatically.
+
+**v0.8.1 fix:** Migration made conditional — checks LDAP outpost websocket connection and TLS error state before patching. Skips entirely if outpost is healthy.
+
+**v0.8.2 fix:** Post-update migration automatically sets `AUTHENTIK_WEB_WORKERS=4` if not already ≥ 4, then restarts only the server container. LDAP outpost is never touched. This runs on every Update Now and requires no operator action.
+
+**Verified resolution:** Flow executor runtimes dropped from 200,000ms to under 7,000ms immediately after the server restarted with 4 workers.
+
+**v0.8.3 fix:** Discovered a separate Postgres exhaustion vector: Authentik 2026.2.2's enterprise license check opens a DB transaction on every flow executor request and does not commit it cleanly, leaving `idle in transaction` connections that accumulate until the pool (max 300) is exhausted. On the dev box (tak-10) with 8 workers this produced 228 `idle in transaction` connections, Postgres at 500–800% CPU, and 4.6GB RAM usage. Reduced `idle_in_transaction_session_timeout` from `120s` to `30s` in the PostgreSQL command-line args in `docker-compose.yml`. The post-update migration (`_apply_authentik_pg_tuning`) now force-recreates the postgresql container when args change (required — command-line args need a full container recreate, not just a config reload). **Note:** 10s was tried first and caused a crash-loop: Authentik's migration lifecycle holds a transaction open for the full startup sequence (module loading has idle-in-transaction gaps of 10–20s), so any timeout below ~20s will kill the startup connection. 30s is the safe minimum.
+
+### Rules established by this incident
+
+- **NEVER restart the LDAP outpost in a post-update migration unless the outpost is provably broken.** Test: check `docker logs authentik-ldap-1 --tail=60` for `successfully connected websocket` (healthy) and absence of `remote error: tls: internal error`. If healthy, skip migration entirely.
+- **NEVER restart `docker compose restart` (all services) to fix LDAP issues on a live box.** Restarting the LDAP outpost on a live active deployment causes a guaranteed thundering herd. Restart only `server` and `worker` if capacity is the issue. Only restart `ldap` if the outpost is provably broken (TLS error, not connected).
+- **`AUTHENTIK_WEB_WORKERS` must be set to 4 or higher on any install with more than ~10 active TAK clients.** Default is 2 workers, which is insufficient to handle bind storms after any restart. The v0.8.2 migration sets this automatically on update.
+- **The LDAP outpost bind cache is your most important performance asset.** A cached session costs zero Postgres queries. An uncached bind costs 3+ HTTP round-trips and multiple ORM queries. On a box with 50 active clients, losing the cache means 50 simultaneous full-cost flow executions hitting the server at once.
+- **Post-update migrations that touch running containers must be gated by a health check.** The pattern: check health first → if healthy, skip → if broken, patch + restart. No exceptions.
+
+---
+
+## April 2026 — v0.8.0 → v0.8.4 LDAP outpost routing reversal (the real upstream story)
+
+**Headline:** v0.8.0's URL change from `https://<fqdn>` (Caddy hop) to `http://authentik-server-1:9000` (direct Docker network) was the *only* meaningful infra-TAK change between v0.7.9 and v0.8.0. Operators who were running fine for months reported their boxes melting after the v0.8.0 update. Field operator (Amos's Samsung Azure VM) reported the same on v0.7.5, v0.8.0, and v0.8.2 — eliminating "infra-TAK version" as the variable. Comparing tak-10 (broken) and responder (healthy) showed identical Authentik configuration, identical roles, identical flow stage bindings, identical LDAP provider config — both on Authentik 2026.2.2.
+
+**The actual variable:** **LDAP request volume crossing the spiral threshold.** Streaming-only Node-RED (responder) generates almost no LDAP traffic — one cert auth per long-lived TLS connection. Mission API / DataSync clients (tak-10) re-authenticate per HTTP request and produce continuous LDAP volume. With the v0.8.0 direct-internal routing, parallel unbounded HTTP/1.1 connections from the LDAP outpost slam Authentik's slow `policybindingmodel` flow evaluation simultaneously, exhaust Postgres `max_connections`, and the outpost panics on `EOF` from the choked server, wiping the bind cache and cascading into the spiral.
+
+**The Caddy hop was acting as a pressure valve we didn't realize we needed.** HTTP/2 multiplexing serializes requests over a small number of connections; connection pooling caps the parallelism Authentik sees. The v0.8.0 fix removed it.
+
+**Verified live on tak-10 (April 2026):**
+
+| Metric | v0.8.0+ direct internal URL | v0.8.4 reversed via Caddy |
+|---|---|---|
+| Postgres `active` queries | 200+ on `policybindingmodel` | **1** |
+| LDAP outpost errors / minute | hundreds (`Result Code 50` / nil pointer / EOF) | **0** |
+| Authentik flow latency | 100–135 seconds | low (cache rebuilds) |
+
+The change took effect within seconds of `docker compose up -d --no-deps --force-recreate ldap` with the new compose. The bind cache rebuilds naturally over the next minutes. Server `unhealthy` state lingered for a couple minutes while it digested the queued requests but resolved without intervention.
+
+**v0.8.4 fix:** New post-update migration (`_apply_authentik_ldap_routing_repair`) detects the spiral and reverses the routing. Strict gates:
+
+1. LDAP service must currently be on `http://authentik-server-1:9000` (skip otherwise — leaves boxes that were correctly on FQDN alone).
+2. Outpost log must show ≥2 spiral markers (`Result Code 50`, `nil pointer`, `failed to execute flow`, `EOF`, `502`, `503`, `exceeded stage recursion depth`). Healthy outposts skip.
+3. `https://<fqdn>/-/health/live/` must respond from inside the LDAP container (probe via `docker exec wget`). If Caddy isn't ready or the FQDN doesn't resolve, skip — don't migrate boxes onto a broken FQDN path.
+4. After rewriting compose and recreating LDAP, validate within 30s: outpost must show `successfully connected websocket` and no `tls:` / `502` / `503` errors. On failure, restore backup and recreate LDAP back on internal URL.
+
+The v0.8.0+ migration that enforces internal URL is preserved for genuine `tls: internal error` cases (fresh installs where Caddy isn't ready). The two migrations are mutually exclusive by design: v0.8.0+ fires only when on FQDN and broken, v0.8.4 fires only when on internal and broken. Healthy boxes skip both.
+
+**The upstream Authentik 2026.2.2 regression itself is not fixed by infra-TAK.** Per Amos's data, `policybindingmodel` evaluation jumped from sub-second (older Authentik) to 100+ seconds (2026.2.2). We're working around it by keeping Caddy in the path. Once Authentik ships a fix in 2026.3+, this workaround can stay (it's not harmful) or be revisited.
+
+### Rules added by this incident
+
+- **Caddy is a required hop for the LDAP outpost on busy installs.** Direct internal routing (`http://authentik-server-1:9000`) only works on light-load installs and fresh installs without Caddy. Active installs with Mission API / DataSync clients must route through `https://<fqdn>` for request shaping.
+- **Spiral signature in LDAP outpost logs = "provably broken"** for the cardinal-rule purposes. The HANDOFF gate says don't restart LDAP unless provably broken; finding ≥2 of [`Result Code 50`, `nil pointer`, `EOF`, `503`, `502`, recursion depth] in `--tail 200` qualifies.
+- **Routing migrations must validate before committing.** Any compose change that targets the LDAP service must (a) backup, (b) recreate, (c) validate within 30s, (d) auto-rollback on failure. The new function follows this pattern; future migrations should as well.
+- **`idle_in_transaction_session_timeout` detection must be value-agnostic.** v0.8.4 generalized `needs_pg_update` to catch any value other than `30s` (was previously hardcoded list of `300s/10s/120s`, missing operator manual values like `15s`).
+- **The `AUTHENTIK_HOST=https://<fqdn>` value in `~/authentik/.env` is the canonical FQDN source of truth.** Other env vars (`AUTHENTIK_COOKIE_DOMAIN`) derive from it. Migrations that need the FQDN should read it from there, not from settings or Caddyfile.
+
+---
+
+## April 2026 — v0.8.5 hardening: dual-signal detection + periodic monitor
+
+**Why v0.8.5 was needed.** Field testing of v0.8.4 on `tak-10`, `responder`, and `ssdnodes` exposed two real-world failure modes in the v0.8.4 routing-repair migration:
+
+1. **Detection blind spot from high bind volume.** v0.8.4 sampled `docker logs authentik-ldap-1 --tail 200` for ≥2 spiral markers. On busy boxes (Mission API / DataSync / many CoT clients), normal `Bind request` lines accumulate at thousands per minute and push the spiral markers off the visible 200-line window. On `ssdnodes` during testing, full-log `bash grep` showed 14 spiral markers; the v0.8.4 sample showed 0 → migration logged "0/2 markers — leaving alone" while the box was actively spiraling.
+2. **One-shot timing.** The migration only runs once, immediately after Update Now. A spiral that manifests 30 minutes later (after traffic ramps, after a clock-aligned Mission API poll, after a Caddy bounce) gets no second chance — the operator has to notice the CPU spike and re-run Update Now. The v0.8.4 promise of "easy update no hit this or that" silently breaks.
+
+**v0.8.5 fix #1 — dual-signal detection with two-tier markers (`_detect_authentik_ldap_spiral`):**
+
+The repair function now confirms the spiral via **either** signal:
+
+| Signal | Threshold | Why it works |
+|---|---|---|
+| LDAP outpost log — **spiral-specific** markers (`result code 50`, `nil pointer`, `exceeded stage recursion`, `502 bad gateway`, `503 service unavailable`) | ≥**1** in last 1000 lines | Faster check; catches early-stage spirals before Postgres congestion. These markers do NOT appear on healthy boxes |
+| LDAP outpost log — **general** markers (`failed to execute flow`, `EOF`) | tracked, never trip alone | These appear on every healthy box (user typo → `failed to execute flow`; normal LDAP client disconnect → `EOF`). Recorded for forensics only |
+| Postgres `idle in transaction` from `application_name LIKE '%authentik%'` | **≥30** | Durable signal — survives LDAP container recreates (which wipe outpost log) and can't be drowned out by high bind volume. Healthy boxes sit at 0–3; spiraling boxes at 50–200+ |
+
+The Postgres signal is the breakthrough: it's the same metric Amos's report (Samsung Azure VM) used to identify the spiral originally, and the same metric we used to confirm the fix worked on `tak-10` (200+ → 1 idle-in-trans within seconds of routing reversal).
+
+**Why the two-tier marker design (v0.8.5 dev testing on tak-10):** Initial v0.8.5 used "≥2 unique markers" as the outpost signal (treating all 7 markers equally). Field testing on a healthy tak-10 immediately after the v0.8.5 update tripped the detector with 2 unique markers (transient `failed to execute flow` + `EOF` from the LDAP container restart cycle) even though `idle-in-trans=0` and the box was perfectly healthy. The repair gate caught it ("already on FQDN — skipping") so no harm done, but the threshold was clearly wrong. The two-tier split eliminates restart-artifact false positives while still catching real spirals within seconds — `nil pointer` / `exceeded stage recursion` / `result code 50` / 502/503 simply do not appear on healthy boxes.
+
+**v0.8.5 fix #2 — periodic monitor (`_authentik_spiral_monitor`):**
+
+A daemon thread inside the console runs every 10 minutes, calls the dual-signal detector, and if a spiral is confirmed, runs the same idempotent `_apply_authentik_ldap_routing_repair` function. Same gates, same Caddy probe, same auto-rollback. Fully automatic; no operator action.
+
+Safeguards:
+- **Single-instance lock** (`/tmp/takwerx-spiral-monitor.lock`, PID-checked) — gunicorn runs N workers; only one runs the monitor. Steals the lock if the holder PID is dead so restarts always have a live monitor.
+- **Repair rate limit**: max 1 repair attempt per 6 hours (recorded in `settings.json` under `authentik_spiral_last_repair`). Prevents thrashing on pathological boxes (spiral confirmed but Caddy unreachable — repair would skip every 10 min anyway, but cap the noise).
+- **No-op on healthy boxes** — most boxes will see the monitor wake every 10 min, find nothing, sleep again. One log line at startup, then silent.
+
+**v0.8.5 fix #3 — granular gate logging.** Every early-return in the routing repair now logs *why* it skipped, all under the `routing repair: ...` prefix so operators can grep one stream. The diagnostic gap that hid the `ssdnodes` issue (logged "0/2 markers" without saying which 0/2 it sampled or how big the window was) is now closed.
+
+**v0.8.5 fix #4 — spiral repair forensics in `settings.json`.** Every repair attempt persists `{ts, outcome, evidence, outpost_markers}` under `authentik_spiral_last_repair`. Used for the rate limit; also useful when an operator reports "I think it spiraled and recovered last night" — the timestamp + evidence is right there.
+
+**v0.8.5 fix #5 (added during responder field test) — PROACTIVE routing migration (`_ensure_authentik_ldap_outpost_on_fqdn`).** Field-testing on `responder` exposed a case the reactive detector cannot catch: a TAK-installed box on internal direct routing (`http://authentik-server-1:9000`) where the cached `adm_ldapservice` session was masking all outpost failures. There was no spiral signature in the outpost log because the only client successfully binding was the cached SA. The bug was invisible until `webadmin` (no cache) attempted a fresh bind, which immediately recursed and threw "exceeded stage recursion depth". By the time the operator hit "Resync LDAP" the box was already broken; reactive detection was correctly NOT firing, but the box was one fresh-bind away from spiraling.
+
+The proactive function migrates the LDAP outpost to FQDN routing **without waiting for a spiral**, gated only on the box's load profile:
+
+| Precondition | Why |
+|---|---|
+| `~/authentik/docker-compose.yml` + `.env` exist | Authentik installed |
+| Outpost is currently on `http://authentik-server-1:9000` | Migration target is internal direct routing |
+| `.env` has `AUTHENTIK_HOST=https://<fqdn>` | FQDN configured (no migration target otherwise) |
+| `https://<fqdn>/-/health/live/` reachable from inside the LDAP container | Caddy is up; if down we'd brick the box |
+| `/opt/tak` exists | TAK Server installed = heavy LDAP load profile that exposes the bug |
+
+When ALL hold: backup compose → rewrite to FQDN + `extra_hosts:host-gateway` → `docker compose up -d --no-deps --force-recreate ldap` → 30s validation → restore on failure. Idempotent — no-op on FQDN-routed boxes, on light-load boxes (no `/opt/tak`), on Caddy-not-ready boxes.
+
+**Triggers:**
+1. Authentik deploy / reconfigure completion
+2. TAK Server deploy completion (catches the Authentik-then-TAK install order)
+3. Post-update migration after every Update Now
+4. Periodic spiral monitor (every 10 min, runs the proactive pass before the reactive pass)
+
+The reactive `_apply_authentik_ldap_routing_repair` still runs second as a fallback for boxes where the proactive preconditions weren't met (e.g. Caddy temporarily down) but the box has already started spiraling.
+
+**v0.8.5 fix #6 (added during tak-10 dev testing) — gunicorn worker timeout 30s → 120s (`_ensure_authentik_gunicorn_timeout`).** With FQDN routing already correct on tak-10 (≈3.5 LDAP binds/sec sustained, 1000+ in 5 min), Caddy logs still showed periodic upstream `EOF` (translated to 502) at 70-90 ms request lifetimes, and outpost logs still showed brief `exceeded stage recursion depth` bursts. Authentik server logs explained why: `[CRITICAL] WORKER TIMEOUT (pid:N) → [ERROR] Worker (pid:N) was sent SIGABRT! → [INFO] Booting worker with pid:N+1`. Authentik 2026.2.2's flow planner under heavy LDAP-bind load occasionally exceeds gunicorn's upstream default 30s worker timeout (we observed flow plans completing in 124-136 s with status 200). Gunicorn assumes a worker silent for >30s is hung, SIGABRTs it, drops every in-flight TCP connection in that worker mid-response. Caddy sees connection-reset, returns 502 to the LDAP outpost. The outpost retries; the retry hits "exceeded stage recursion depth" inside the same flow.
+
+The fix is the smallest possible change: append `GUNICORN_CMD_ARGS=--timeout=120` to `~/authentik/.env` and recreate only the server container (`docker compose up -d --no-deps --force-recreate server`). Worker / postgresql / redis / ldap untouched. Validated post-restart via `docker exec authentik-server-1 printenv GUNICORN_CMD_ARGS`. Outcome persisted to `settings.json` under `authentik_gunicorn_timeout_migration`.
+
+Why 120 s: 124-136 s slow plans complete with status 200 under 120 s with margin; the 200 s+ outliers are queued requests waiting for an unblocked worker, not a single 200 s request. 120 s catches the slow-plan case without leaving workers hung indefinitely on a genuinely-stuck request.
+
+Why this is safe to ship to all boxes (not gated on load profile like the routing migration): the timeout never fires on healthy/fast boxes (typical request 50-200 ms), so behavior is unchanged. On heavy-load boxes it absorbs slow plans without dropping connections. Idempotent — never overwrites an existing `GUNICORN_CMD_ARGS` (operator override / future Authentik defaults survive).
+
+**Triggers:** Authentik deploy completion, TAK Server deploy completion, post-update migration. **Deliberately NOT** hooked into the periodic spiral monitor — this is one-shot config, not a hot fix to re-apply. If the operator manually unsets the env var, the periodic monitor must not re-set it.
+
+**v0.8.5 fix #7 (added during responder field test) — verifier hardening (`_test_ldap_bind_dn_verdict`).** The responder operator hit `WebAdmin: Authentik API 400: {"username":["This field must be unique."]}` on every Resync LDAP. Root cause: `_test_ldap_bind_dn` returned `False` when ldapsearch was missing on the host AND the outpost log showed `exceeded stage recursion depth` (the spiral signature, not a credential failure). Caller `_ensure_authentik_webadmin` interpreted this as "bind confirmed-failed, recreate webadmin" and ran DELETE+POST. The DELETE silently failed (race / async), the POST returned 400. Repeat forever.
+
+The fix:
+- `_test_ldap_bind_dn_verdict` returns tri-state `'ok' | 'fail' | 'inconclusive'`. Inconclusive = ldapsearch unavailable AND/OR outpost log shows recursion/EOF/nil-pointer (spiral signature, not credential failure).
+- `_test_ldap_bind_dn` is preserved as a backward-compatible wrapper (returns True only on `'ok'`); read-only callers don't change.
+- `_ensure_authentik_webadmin` now: on `'ok'` → success; on `'inconclusive'` → return success WITHOUT destructive recovery, but kick off `_ensure_authentik_ldap_outpost_on_fqdn` (the inconclusive verdict often *is* the responder spiral); on `'fail'` → DELETE, then **re-query** to confirm the user is gone before POST. If the DELETE didn't take, skip the recreate and surface a clear error instead of triggering the 400.
+- `_test_ldap_bind_dn_verdict` calls `_ensure_ldapsearch()` once at the top — so the inconclusive case is rare on Debian/RHEL hosts.
+
+### Operator-visible diagnostics
+
+```bash
+# Postgres spiral signal — should be 0–3 on healthy boxes, ≥30 means spiraling
+docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc \
+  "SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction' AND application_name LIKE '%authentik%';"
+
+# Last reactive spiral repair attempt (if any)
+jq '.authentik_spiral_last_repair // "no spiral repair attempts recorded"' /opt/takwerx/settings.json 2>/dev/null \
+  || jq '.authentik_spiral_last_repair // "no spiral repair attempts recorded"' ~/.config/settings.json
+
+# Last proactive routing migration (if any)
+jq '.authentik_proactive_routing_migration // "no proactive migration recorded"' /opt/takwerx/settings.json 2>/dev/null \
+  || jq '.authentik_proactive_routing_migration // "no proactive migration recorded"' ~/.config/settings.json
+
+# Last gunicorn timeout migration (if any) — should show value=120 once applied
+jq '.authentik_gunicorn_timeout_migration // "no gunicorn timeout migration recorded"' /opt/takwerx/settings.json 2>/dev/null \
+  || jq '.authentik_gunicorn_timeout_migration // "no gunicorn timeout migration recorded"' ~/.config/settings.json
+
+# Current LDAP outpost routing — should be FQDN on TAK-installed boxes, internal on console-only
+grep -A0 'AUTHENTIK_HOST:' ~/authentik/docker-compose.yml | head -5
+
+# Current gunicorn worker timeout — should be 120 on all v0.8.5+ boxes with Authentik
+docker exec authentik-server-1 printenv GUNICORN_CMD_ARGS
+# → --timeout=120 (or empty if migration hasn't run yet — re-trigger via Update Now or Authentik deploy)
+
+# Worker SIGABRT cascade — should be 0 on a v0.8.5 box that previously hit it
+docker logs authentik-server-1 --since 1h 2>&1 | grep -cE "WORKER TIMEOUT|SIGABRT"
+
+# Monitor + migration activity (one line at startup, then silent on healthy boxes)
+sudo journalctl -u takwerx-console --since "1 hour ago" | grep -E "spiral monitor|routing repair|proactive routing|gunicorn timeout"
+```
+
+### Rules added by v0.8.5
+
+- **Two-signal detection beats one-signal detection for spiral diagnosis.** Outpost log is fast but maskable; Postgres idle-in-trans is durable and unmaskable. Use both. (Generalizes to any future Authentik failure mode that produces a Postgres state signature.)
+- **One-shot post-update migrations are insufficient for self-healing.** Anything that fixes a runtime drift (spiral, cache wipe, Caddy bounce, network blip) must run on a periodic schedule, not just at update time. The operator promise is "the update fixes it"; that means the update fixes it the first time *and* keeps fixing it as conditions change.
+- **Background threads in gunicorn must hold a single-instance PID-checked lock.** N workers means N copies of every module-load thread. Without a lock, monitors thrash; with a stale lock, restarts have no monitor. The `os.kill(pid, 0)` pattern (used by `_post_update_auto_deploy` and the spiral monitor) is the standard.
+- **Every gate-skip in a migration must log why.** Silent skips hide bugs (the `ssdnodes` `0/2 markers` case). The `routing repair: <reason> — skipping (<context>)` format is the standard.
+- **Reactive detection is necessary but not sufficient — proactive precondition migrations come first.** Some bugs are silently latent (responder's misroute hidden by the cached SA session) and never produce a reactive signal until the operator's first fresh bind, which is also the first failed bind they see. Configurations that are known to fail under heavy load (`/opt/tak` installed) must be migrated proactively when preconditions are safe — don't wait for proof of failure.
+- **Probe verdicts must be tri-state when the negative result feeds destructive recovery.** Boolean `True/False` conflates "confirmed failure" with "couldn't determine", which is fine for read-only display but a critical bug for any DELETE+POST recreate path. Use `'ok' | 'fail' | 'inconclusive'` and gate destructive paths on confirmed-fail only. (See `_test_ldap_bind_dn_verdict`.)
+- **DELETE before POST must re-query before POSTing.** If your recovery path deletes a uniquely-keyed record and then creates a fresh one, the DELETE can race or silently fail. Always re-query for the unique key after DELETE; if the record still exists, do not POST a duplicate (Authentik API returns `400 username must be unique`). Skip and surface the error.
+- **Don't change passwords if the error is about stages.** "exceeded stage recursion depth" / `LDAP Result Code 50` / `nil pointer dereference` / `EOF` are flow-execution errors. They don't mean the password is wrong, they mean the flow itself can't run. Recreating users or resetting passwords does not help — fix the routing, the cache, or the flow planner instead.
+- **`authentication: none` on the LDAP `ldap-authentication-flow` is required.** Setting it to anything else makes the flow planner refuse to issue a plan to anonymous bind requests. Don't change.
+- **Don't put `password_stage` on the identification stage AND a `password` stage in the flow** — that causes recursion. The identification stage's `password_stage` field should be cleared; let the password stage binding in the flow do the work.
+- **Don't set `configure_flow` on the password stage.** That redirects the flow into a password-change subflow, which recurses.
+- **`bind_mode: cached` hides issues.** Healthy boxes can sit on a stale cached SA bind for hours while every fresh bind fails. Test with a non-cached client periodically (or just check `/api/v3/outposts/instances/<pk>/health/`).
+- **The LDAP outpost gets `bind_flow_slug` from the provider's `authorization_flow` — not `authentication_flow`.** Setting the latter does nothing for LDAP binds.
+- **The cardinal "never restart LDAP unless it's provably broken" rule has two qualifying conditions now (v0.8.5):** (1) reactive — spiral signature in outpost log OR ≥30 idle-in-trans; (2) proactive — outpost on internal direct routing AND `/opt/tak` exists AND FQDN configured AND Caddy reachable. Both qualify; everything else is hands-off.
+- **NEVER restart Authentik with the upstream-default 30s gunicorn timeout on heavy-LDAP-load boxes.** Authentik 2026.2.2's flow planner exceeds 30s under sustained 3+ binds/sec, gunicorn SIGABRTs the worker, in-flight connections drop, Caddy returns 502, outpost retries, recursion. The `_ensure_authentik_gunicorn_timeout` migration sets `--timeout=120` automatically; never lower it below 90s. Operator override of `GUNICORN_CMD_ARGS` is allowed (the migration won't overwrite) but values <90s on a TAK-installed box are a known regression.
+- **Server-only restart is safe; full-stack restart is not.** When applying any Authentik server config change (workers, gunicorn timeout, env vars), use `docker compose up -d --no-deps --force-recreate server` — never `docker compose restart` (which restarts ldap and clears bind caches). The server-only path takes ~10-30s of API unavailability with cached LDAP service-account sessions surviving; the full-stack path triggers the v0.8.0 thundering herd.
+- **One-shot config migrations must not be wired into periodic monitors.** Things like `_ensure_authentik_gunicorn_timeout` apply once and then hand control to the operator. If a monitor re-applies them every 10 min, an operator override can never stick. Routing repairs are different — they're hot fixes for runtime drift and should re-run as needed.
+
+---
+
+## April 2026 — v0.8.5 fleet validation (post-release verification)
+
+**Date:** 2026-04-29 (within hours of v0.8.5-alpha tag on main).
+
+**Three-box matrix.** Validation snapshot taken after Update Now on all three production boxes (responder + ssdnodes via Update Now; tak-10 via the dev-branch one-shot Python invocation that pre-dated the tag).
+
+| Metric | tak-10 | ssdnodes | responder |
+|---|---|---|---|
+| infra-TAK version | 0.8.5-alpha | 0.8.5-alpha | 0.8.5-alpha |
+| LDAP routing | `https://tak.test12.taktical.net` | `https://tak.test8.taktical.net` | `https://tak.test6.takwerx.com` |
+| Gunicorn timeout | `--timeout=120` | `--timeout=120` | `--timeout=120` |
+| Postgres idle-in-trans | 0 | 0 | 0 |
+| Server SIGABRT (last 30 min) | 0 | 0 | 0 |
+| Outpost recursion / 502 / nil-pointer (last 30 min) | 0 | 0 | 0 |
+| Bind volume (last 5 min) | 706 (~2.4/sec) | 464 (~1.5/sec) | 473 (~1.6/sec) |
+| Server CPU (1s snapshot) | 104% (burst) → 7% → 1% over 60s | 10% | 1.8% |
+| Postgres CPU (1s snapshot) | 51% (burst) → 2% → 0.3% over 60s | 1.9% | 0.2% |
+| Server mem | 575 MiB stable | 401 MiB | 692 MiB |
+| Spiral monitor cadence | every 10 min, "already on FQDN — skipping" | every 10 min, same | every 10 min, same |
+| `authentik_gunicorn_timeout_migration` | success @ ts 1777481628 | success @ ts 1777485606 | success @ ts 1777485595 |
+| `authentik_proactive_routing_migration` | (not recorded — already on FQDN) | (not recorded — already on FQDN) | (not recorded — already on FQDN) |
+| `authentik_spiral_last_repair` | (not recorded — never spiraled) | (not recorded — never spiraled) | (not recorded — never spiraled) |
+
+**Interpretation rules established by this validation:**
+
+- **`*_migration: (not recorded)` is a SUCCESS signal, not a gap.** The migration functions only persist a `success` record on an *actual* migration. When the box is already in the desired state (FQDN routing already configured, GUNICORN_CMD_ARGS already set), the function hits its idempotent skip gate and returns without writing. Reading "not recorded" on a healthy box means "no work needed at this trigger" — confirmed via the per-tick `[spiral monitor] proactive routing: outpost already on FQDN — skipping (already correct)` journalctl line. (The `gunicorn_timeout_migration` IS recorded on all three because all three crossed the gate from "no env var" → "env var added" exactly once. The `proactive_routing_migration` is NOT recorded on any of them because all three were on FQDN before v0.8.5 even shipped — tak-10 from earlier-version routing, responder from the manual fix, ssdnodes from always being correct.)
+
+- **Update Now triggers the migrations within seconds.** ssdnodes and responder fired their gunicorn timeout migrations 11 seconds apart (`1777485595` vs `1777485606`), matching the user clicking Update Now on both boxes back-to-back. The post-update migration block correctly runs the new `_ensure_authentik_gunicorn_timeout` after the proactive routing function, even though the routing function found "already correct" and short-circuited.
+
+- **Bursty CPU on heavy-DataSync boxes is the EXPECTED healthy steady state**, not a regression. tak-10's server CPU swung 104% → 17% → 7% → 1% over 90 s; postgres swung 51% → 33% → 2% → 0.3%. Memory locked at 575 MiB (no leak). PIDs locked at 39 (no worker thrashing). Block I/O frozen at 283 MB write (no disk pressure). The pattern is: idle ... idle ... clock-aligned DataSync poll + ArcGIS engine refresh + Mission API client fires → cluster of 50+ binds in 1-2 sec → Authentik flow planner crunches → server CPU spikes → drops. With `--timeout=120` the bursts complete cleanly; without it they would have been the SIGABRT cascade we just fixed. **Cardinal rule: do NOT chase low CPU on Mission API / DataSync / Node-RED boxes. Burst-and-idle is the design target. The metric that matters is SIGABRT count over 30+ min — that should be 0.**
+
+- **Spiral monitor "already correct — skipping" tick every 10 min is the healthy fleet signature.** Each box shows exactly one heartbeat per 10 min from a single PID (single-instance lock holding). If you see two PIDs on one box's `[spiral monitor]` lines, the lock is broken (file a bug). If you see no heartbeats for >15 min, the monitor died (also a bug). Six consecutive `already on FQDN` ticks across an hour is the steady state.
+
+**Field test artifacts:** the diagnostic block `infra-TAK v0.8.5 cross-box metric snapshot` (in agent-transcripts) captures all the queries used. Re-run on any box to validate the same matrix.
+
+---
+
+## April 2026 — v0.8.6 Azure / NAT deploy reliability
+
+**Date:** 2026-04-29 (same day as v0.8.5 fleet validation — immediately post-release Azure test).
+
+**Test box:** tak-test-3 — Azure Standard_D8as_v5, Ubuntu 22.04, East US, P10 64 GiB OS disk, ~145 MB/s sync write (`dd oflag=dsync`), 8 vCPUs from AMD EPYC 7763. First Azure deployment attempted from scratch on v0.8.5-alpha. Four bugs surfaced.
+
+### Bug 1 — Authentik containers never started (`elif needs_pg_update:` scope bug)
+
+**Symptom:** Step 7 ("Pulling Images & Starting Containers") printed correctly, but Step 8 ("Waiting for Authentik API") ran for 900 seconds and timed out. `docker ps` showed no Authentik containers. Operator had to SSH in and run `docker compose up -d` manually; containers came up and the API responded immediately.
+
+**Root cause:** In `_authentik_deploy()`, the `docker compose up -d` call (Step 7), all subsequent container health waits, and the network patch were nested inside an `elif needs_pg_update:` block. On a fresh deploy `needs_pg_update` is always `False` (no existing PostgreSQL container to check). So the `elif` body was never entered; `docker compose up -d` was never called; the API poll started polling for containers that had never been launched.
+
+**Fix:** Un-indented 121 lines out of the `elif` guard so the compose bring-up, healthchecks, and network patch execute unconditionally on every deploy path.
+
+**Impact:** All fresh Authentik deploys on any disk speed now work. Deploy time on Azure: 900 s (broken) → ~4 minutes (fixed).
+
+**Rules added:**
+- The `elif needs_pg_update:` guard exists ONLY to re-pull images and apply PG config changes to an existing install. It MUST NOT contain any unconditional first-deploy logic (bring-up, network patch, container starts). Any code inside it is skipped on fresh installs.
+- When adding new steps to `_authentik_deploy()`: if the step must always run (fresh or update), place it at the top-level of the function, not inside any conditional.
+
+### Bug 2 — `start.sh` showed private IP on Azure / AWS NAT
+
+**Symptom:** Azure VMs have private IPs (10.0.x.x) from `hostname -I`. `start.sh` printed `Access: https://10.0.0.4:5001` — unreachable from the operator's browser.
+
+**Fix:** Added `curl -s --max-time 3 https://api.ipify.org` to detect public IP. When public ≠ private, both lines are displayed. Single-line output preserved on non-NAT VPS.
+
+### Bug 3 — Dashboard disk I/O showed cached speed (998 MB/s) instead of real sync speed (145 MB/s)
+
+**Symptom:** Azure console dashboard showed "998 MB/s write" while `start.sh` correctly reported "145 MB/s — potentially slow" and Guard Dog's CSV showed the same ~145 MB/s. Operators use the dashboard number to assess VPS health; the inflated cached number gave a false "all good" signal.
+
+**Root cause:** Dashboard used `vmstat` output. `vmstat`'s block I/O columns show Linux buffer/cache throughput (i.e. how fast Linux is moving data to/from the page cache in RAM), not the underlying disk. On a mostly-idle box with warm cache, this can read as 998 MB/s when the actual disk does 145 MB/s.
+
+**Fix:**
+- When Guard Dog is installed: read latest sync write speed from `/var/lib/takguard/diskio_history.csv` (Guard Dog already benchmarks with `oflag=dsync` every 15 min — no extra I/O, no performance impact).
+- When Guard Dog is not installed: fall back to vmstat but label it `"(vmstat, cached)"` so the source is explicit.
+- Manual disk speed test button: changed from `oflag=direct` to `oflag=dsync` to match `start.sh` and Guard Dog methodology.
+- vmstat-only line is now hidden entirely when source is cached (it's always 0.00 on idle boxes — noise with a scary label).
+
+### Bug 4 — LDAP SA bind check: always reported failure even when LDAP was working
+
+**Symptom:** After a successful Authentik deploy, "Final check: LDAP SA bind" ran all 24 attempts and reported failure. LDAP container logs showed `"authenticated from session"` for every attempt from #2 onward — the SA was authenticating correctly, the check just couldn't detect it.
+
+**Root cause — Bug A (wrong ldapsearch search base):**
+`_test_ldap_bind_dn_verdict` searched `dc=takldap` with base scope. Authentik does not publish a root object at the base DN. ldapsearch got LDAP error 32 ("no such object") on the search portion regardless of bind outcome, so its exit code was always non-zero. The `if lr.returncode == 0` fast-path never fired for 24 × 3 = 72 consecutive ldapsearch invocations.
+
+**Root cause — Bug B (timing race on Docker log check):**
+The inner loop slept 2 seconds after triggering the ldapsearch bind, then checked `docker logs --since 45s`. On Azure's ~145 MB/s disk, the log entry for the bind was written at the same second as our `docker logs` command. The entry was consistently either just-written-but-not-flushed or just-barely-within the 45s window boundary.
+
+**Fix — ldapsearch:** Search `ou=users,dc=takldap` with one-level scope for `cn=adm_ldapservice`. This returns an actual LDAP result when the bind works, making the exit-code check reliable.
+
+**Fix — timing:** `sleep(2)` → `sleep(5)`, `--since 45s` → `--since 90s`.
+
+**Fix — fallback:** `_authentik_deploy_final_verify_ldap_sa` now directly checks Docker logs for `"authenticated from session"` + `"adm_ldapservice"` as an independent fallback path that bypasses ldapsearch entirely. Confirmed on tak-test-3:
+```
+Final check: LDAP SA bind (1/24)...   ← attempt 1: flow ran, recursion on first bind (session cached)
+Final check: LDAP SA bind (2/24)...   ← attempt 2: fallback Docker log check fires
+✓ LDAP SA bind verified via Docker log (authenticated from session). Safe to proceed.
+✓ Deploy complete.
+```
+
+**Why the recursion on attempt 1 is expected:** The first bind attempt goes through the authentication flow; the flow errors on the login stage with "exceeded stage recursion depth" (the `password_stage` fix removes the recursion, but this is attempt 1 before that fix has been re-applied). The session is cached by the outpost before the flow error lands. Attempt 2 hits the cache → `"authenticated from session"` → success. This is the known-good behavior for all Authentik LDAP SA binds under the current flow configuration.
+
+**Rules added by v0.8.6:**
+- **Never search `dc=<base>` with base scope in ldapsearch against Authentik LDAP.** Authentik doesn't publish a root object there. Always search `ou=users,dc=<base>` or `ou=groups,dc=<base>` with an appropriate scope and filter.
+- **`sleep(2)` is a race on slow-disk VMs.** Any Docker log check that reads log entries written by a just-triggered action needs at least `sleep(5)` on 100-150 MB/s disk. Consider `sleep(5)` the default minimum for log-read-after-trigger patterns.
+- **Build Docker-log fallbacks for bind checks.** ldapsearch exit codes are unreliable against Authentik LDAP (LDAP error 32 on search, error 49 on some edge cases). The definitive ground truth is `docker logs authentik-ldap-1` — `"authenticated from session"` / `"bind failed"` are unambiguous. ldapsearch is a fast-path; Docker logs are the authoritative fallback.
+- **The first SA bind always produces a flow-recursion error; the second uses cached session.** This is expected behavior, not a bug. The check must survive one failure and verify the second attempt.
+
+---
+
+## Fresh-deploy expectations (Azure / new boxes)
+
+For deploying v0.8.6-alpha onto a brand-new VPS (Azure, ssdnodes, etc.) the migrations fire automatically at the right points. Operator never has to call them manually.
+
+**Recommended deploy order (matches what the migrations are gated on):**
+
+1. **Caddy first** — set FQDN, save Domains. This makes `https://<fqdn>/-/health/live/` reachable later, which is precondition #4 for the proactive routing migration.
+2. **Authentik** — `Authentik → Deploy`. At deploy completion, two migrations fire:
+   - `_ensure_authentik_ldap_outpost_on_fqdn` — checks if `/opt/tak` exists; if NOT (likely on a fresh box at this point), logs "TAK Server not installed — leaving outpost on internal routing (light-load profile)" and exits. Internal routing is fine for console-only / pre-TAK boxes.
+   - `_ensure_authentik_gunicorn_timeout` — fires unconditionally (it's safe everywhere). Adds `GUNICORN_CMD_ARGS=--timeout=120` to `~/authentik/.env`, recreates the server container only.
+3. **TAK Server** — `TAK Server → Deploy`. At deploy completion, the SAME two migrations re-fire:
+   - `_ensure_authentik_ldap_outpost_on_fqdn` — now `/opt/tak` exists, all 5 preconditions are met → migrates outpost to FQDN routing. This is the canonical path on a fresh deploy.
+   - `_ensure_authentik_gunicorn_timeout` — already set from step 2, so no-op skip ("GUNICORN_CMD_ARGS already set in .env — skipping (idempotent)"). One log line.
+4. **Spiral monitor** starts at console boot via the module-load thread. Heartbeats every 10 min, runs proactive routing pass first, reactive spiral pass second. On a fresh healthy box it sits silently except for the heartbeat.
+
+**Post-deploy verification block (run once after step 3):**
+
+```bash
+# 1. Version
+grep '^VERSION' ~/infra-TAK/app.py
+
+# 2. Routing — should be FQDN
+grep AUTHENTIK_HOST ~/authentik/docker-compose.yml | grep -A0 ldap -B0
+# Expected: AUTHENTIK_HOST: https://<your-fqdn>
+
+# 3. Gunicorn timeout — should be 120
+docker exec authentik-server-1 printenv GUNICORN_CMD_ARGS
+# Expected: --timeout=120
+
+# 4. Health signals — all zero
+docker exec authentik-postgresql-1 psql -U authentik -d authentik -tAc \
+  "SELECT count(*) FROM pg_stat_activity WHERE state='idle in transaction' AND application_name LIKE '%authentik%';"
+docker logs authentik-server-1 --since 10m 2>&1 | grep -cE "WORKER TIMEOUT|SIGABRT"
+docker logs authentik-ldap-1 --since 10m 2>&1 | grep -cE "exceeded stage recursion|502 bad gateway|nil pointer"
+
+# 5. Migrations recorded
+python3 -c "
+import json
+s = json.load(open('/home/takwerx/infra-TAK/.config/settings.json'))
+for k in ['authentik_proactive_routing_migration', 'authentik_gunicorn_timeout_migration']:
+    print(f'{k}: {s.get(k) or \"(not recorded)\"}')"
+# Expected on a fresh TAK-installed deploy:
+#   authentik_proactive_routing_migration: { ts, outcome:success, fqdn:<fqdn> }   ← recorded once on TAK Server deploy completion
+#   authentik_gunicorn_timeout_migration:  { ts, outcome:success, value:120 }     ← recorded once on Authentik deploy completion
+
+# 6. Spiral monitor alive
+sudo journalctl -u takwerx-console --since "15 min ago" | grep "spiral monitor"
+# Expected: at least one "[spiral monitor] PID <N> acquired monitor lock — starting" line
+```
+
+**Azure-specific notes (updated for v0.8.6):**
+
+- Azure VMs sometimes hit DNS propagation delays for new FQDNs. The proactive routing migration probes `https://<fqdn>/-/health/live/` from inside the LDAP container; if Caddy hasn't finished fetching its LE cert OR DNS isn't fully propagated, the probe fails and the migration logs "cannot reach https://<fqdn> from LDAP container — skipping (Caddy/DNS not ready; retry later)" and exits cleanly. The spiral monitor will retry every 10 min until preconditions are met. **No manual action needed; just wait for the next monitor tick after DNS+Caddy are confirmed working.**
+- Azure NSG / firewall must allow inbound 443 (Caddy LE), 8089 (TAK Server CoT TLS), 8443 (TAK Portal HTTPS), 8446 (TAK Server cert enrollment), 5001 (infra-TAK console — restrict to your IP), 389/636 (LDAP outpost — restrict to localhost / TAK-Server-only).
+- If you provisioned the VM with a small instance type, watch memory: Authentik server is ~700 MiB after warm-up, postgres ~200 MiB, LDAP outpost ~15 MiB, plus the rest of the stack. Below 4 GB total RAM, you may OOM under bind storms. 8 GB is comfortable, 16+ GB is generous.
+- **v0.8.6 confirmed working on Azure:** Standard_D8as_v5, P10 64 GiB OS disk, ~145 MB/s sync write. Clean Authentik deploy in ~4 minutes. LDAP SA bind verified on attempt 2. All four v0.8.6 fixes active. This is now the validated reference config for Azure single-server deployments.
+- **Azure OS disk throughput is ~145 MB/s sync write regardless of disk tier** (Azure caps OS disk I/O). This is acceptable for infra-TAK. The dashboard now correctly shows the real sync speed (from Guard Dog CSV) instead of the cached vmstat value. Don't mistake the cached vmstat speed (which can show 998 MB/s) for real disk performance.
+- **`hostname -I` returns the private IP on Azure.** `start.sh` (v0.8.6+) detects this and also shows the public IP. The console backdoor is at `https://<public-IP>:5001`.
+
+---
+
+## April 2026 — v0.8.7 SILENT-IGNORE env var name bug (the discovery that should have come first)
+
+### The smoking gun
+
+After hours of chasing "runtime state drift" theories on tak-10, an operator pushed back: "is there any info on the internet about optimizing authentik? I feel like we are doing all this half-ass shit when we should not have to." That question prompted reading the **official Authentik configuration docs** for the first time.
+
+The very first sentence of [docs.goauthentik.io/install-config/configuration/](https://docs.goauthentik.io/install-config/configuration/):
+
+> **The double-underscores are intentional**, as all these settings are translated to YAML internally, and a double-underscore indicates the next level (a subsetting).
+
+We've been writing **`AUTHENTIK_WEB_WORKERS=4`** (single underscore) to `~/authentik/.env` since the v0.8.2 release in late April 2026. The correct name is **`AUTHENTIK_WEB__WORKERS`** (double underscore). The single-underscore name has been silently ignored by Authentik 2026.x on every box in the fleet for five releases.
+
+Verification on tak-10 (Apr 30 2026):
+
+```bash
+$ grep AUTHENTIK_WEB ~/authentik/.env
+AUTHENTIK_WEB_WORKERS=4
+
+$ docker top authentik-server-1 -o pid,cmd | grep gunicorn
+gunicorn: master [authentik.root.asgi:application]
+gunicorn: worker [authentik.root.asgi:application]   ← worker 1
+gunicorn: worker [authentik.root.asgi:application]   ← worker 2
+                                                    ← TWO workers, not four
+```
+
+**Two gunicorn workers running, despite the `.env` saying 4.** The `ak dump_config` output also revealed every cache setting at defaults (300s/300s/300s) and `log_level: info` (default) — every official optimization the docs recommend was sitting unused.
+
+### Why we never noticed for five releases
+
+1. **No verification.** The v0.8.2 migration wrote to `.env` and restarted the server, then... assumed it worked. Never ran `ak dump_config` to confirm.
+2. **The fleet "worked" enough.** With 2 workers, responder coped fine because its workload was light. Tak-10 melted at p50 140%+ but we attributed it to "runtime state drift" — the truth was "2 workers can't service tak-10's bind storm."
+3. **Documentation wasn't read.** The official docs are the first place to look. We chased postgres bloat, autovacuum tuning, ASGI WebSocket loops, periodic recreates — band-aids on top of a config that wasn't even being applied.
+
+### What v0.8.7 fixes
+
+Three new functions in `app.py`:
+
+#### 1. `_authentik_apply_official_tunings(plog)`
+
+Idempotent migration that:
+
+- **Removes** `AUTHENTIK_WEB_WORKERS=N` lines from `.env` (single-underscore — was being ignored).
+- **Adds** `AUTHENTIK_WEB__WORKERS=4` (correct double-underscore name; doubles capacity from default 2).
+- **Adds** `AUTHENTIK_CACHE__TIMEOUT_FLOWS=600` (2x default 300s — flows rarely change; reduces DB pressure).
+- **Adds** `AUTHENTIK_CACHE__TIMEOUT_POLICIES=600` (2x default 300s — policies rarely change; reduces DB pressure).
+- **Adds** `AUTHENTIK_LOG_LEVEL=warning` (down from default `info` — reduces log overhead on busy boxes).
+
+Only adds keys that are missing. **Never overwrites operator-set values.** Records outcome to `settings.authentik_official_tunings`.
+
+#### 2. `_authentik_verify_runtime_config(plog)`
+
+Closes the audit loop. Runs `docker exec authentik-worker-1 ak dump_config`, parses the JSON output, and confirms:
+
+- `cache.timeout_flows == 600` (server-side YAML config)
+- `cache.timeout_policies == 600` (server-side YAML config)
+- `log_level == "warning"` (server-side YAML config)
+- `gunicorn worker count == 4` (via `docker top authentik-server-1` — `web.workers` is consumed by the launcher script and doesn't appear in `dump_config`)
+
+Persists pass/fail to `settings.authentik_runtime_config_check` for operator audit. Runs on every console startup.
+
+#### 3. Hooked into both startup and post-update paths
+
+- `_startup_migrations` calls `_authentik_apply_official_tunings` on every console startup. The function is self-gating (returns False if no changes needed), so the recreate only fires once per box.
+- `_post_update_auto_deploy` superseded the v0.8.2 migration block — now delegates to the same function for fresh deploys.
+
+### Operator gotcha (must add to runbook)
+
+- **NEVER trust `.env` to mean Authentik is using those settings.** Always verify with `docker exec authentik-worker-1 ak dump_config 2>/dev/null | python3 -c "import json,sys; out=sys.stdin.read(); print(json.loads(out[out.find('{'):]))"`.
+- **The double-underscore is intentional** in Authentik env var names. Single-underscore is silently ignored.
+- **The v0.8.2 migration code is preserved as `_authentik_apply_official_tunings`** — but renamed and corrected. Never re-add a `AUTHENTIK_WEB_WORKERS` (single-underscore) write path.
+
+### Field expectations after v0.8.7 lands
+
+On every existing box:
+
+1. Console restart triggers `_startup_migrations`.
+2. `_authentik_apply_official_tunings` runs once, writes the correct env vars, returns True.
+3. `_recreate_authentik_server_worker` fires (10-15s blip).
+4. Server comes back with **4 workers** (verifiable via `docker top authentik-server-1`).
+5. Cache TTLs at 600s. Log level warning.
+6. Verifier records pass to `settings.authentik_runtime_config_check`.
+
+Expected behavior change on tak-10: server CPU under bind load should drop further from the post-recreate baseline (3.3% → likely sub-5% steady-state with 2x worker capacity + cache TTL relief). Postgres CPU should drop similarly (less flow re-evaluation under load).
+
+---
+
+## April 2026 — v0.8.7 band-aids that were built then DELETED before ship
+
+Earlier drafts of v0.8.7 (before the env var bug was found) shipped three additional pieces:
+
+1. **`_authentik_periodic_restart_monitor`** — a daemon thread that auto-recreated `server`+`worker` daily at 04:00 box-local with a 12h floor and a "is admin actively working?" safety gate.
+2. **`_detect_authentik_asgi_websocket_loop`** — a reactive trigger that recreated `server`+`worker` when `Expected ASGI message` errors hit ≥5/60s in the logs.
+3. **`_authentik_admin_api_recently_active`** — the safety gate that protected (1) from clobbering admin work mid-form-submit.
+
+All three were **removed** once the silent-ignore env var bug was identified as the actual root cause. With 4 workers actually running and `cache.timeout_*=600`, the chronic CPU climb that motivated the daily restart never recurs, and the ASGI loops we'd seen on tak-10 (which were a downstream symptom of worker starvation) stopped happening.
+
+**The recreate function `_recreate_authentik_server_worker(plog, reason)` was kept.** It's still used legitimately — when `_authentik_apply_official_tunings` actually changes `.env`, gunicorn won't pick the new vars up until containers are recreated. That's the only remaining caller (plus the deploy/reconfigure paths).
+
+**Lesson encoded as Cursor rule:** `.cursor/rules/consult-upstream-docs.mdc` (alwaysApply). Read official docs before chasing symptoms. Never trust `.env` to mean the runtime is using it. Always verify with the project's introspection command. **Five releases of band-aids would have been one PR if we'd read the docs first.**
+
+### Verifier-bug followup (same day as v0.8.7 ship)
+
+The runtime verifier (`_authentik_verify_runtime_config`) initially used `docker top authentik-server-1 -o pid,cmd` to count gunicorn workers. The `-o pid,cmd` flag reformats the CMD column on some Linux distros and the grep for `'gunicorn: worker'` returned 0 even though 4 workers were live. Verified on tak-10 — `docker top authentik-server-1 | grep -c 'gunicorn: worker'` returns 4 (correct), the `-o pid,cmd` form returned 0 (false-negative). Fixed by dropping the `-o pid,cmd` flag and parsing the default output in Python.
+
+This is exactly the kind of ad-hoc shell pipeline issue the Cursor rule warns against. The verifier itself is the right idea (closes the audit loop on env var changes), but the pipeline was fragile.
+
+A second verifier hardening followed during the responder spot-check: on slower disks the verifier ran while the freshly-recreated server container was up but gunicorn hadn't yet forked its workers. `docker top` returned 0, so the verifier wrote `last_outcome=fail` even though the runtime stabilized seconds later. Fixed by adding a 6-attempt × 5s retry loop (max 30s) before declaring genuine failure. Validated on Alex's slow-disk Dell R3930 (the first box where the race was tight enough to fail without retry) and on a slow-disk SSDNodes box (whose v0.8.7 verifier had persisted a stale `fail` from before the retry landed; manual `_authentik_verify_runtime_config()` re-run with the current code wrote `pass`).
+
+---
+
+## April 2026 — v0.8.8 LDAP FLOW STAGE-BINDING RECURSION FIX
+
+**Incident summary:** Apr 30 2026, after v0.8.7-alpha shipped, a buddy's Dell-class box on SSDNodes pulled main and reported "Authentik still screaming." `runtime_config_check.last_outcome=pass` (4 workers, cache=600s, log_level=warning — all v0.8.7 fixes in). LDAP bind volume **0.36/sec** (essentially idle workload). Yet `docker stats` showed Postgres CPU **1297% / 1085% / 782% / 619% / 165% / 766%** — averaging ~900% sustained, with multiple 1000%+ spikes. Server CPU 200-350%. 119 idle-in-transaction Postgres connections (oldest 2s — churning, not stuck).
+
+**Disk and steal-time forensics:** `fio` random-write 4k IOPS = **1795** (between spinning rust and slow SATA SSD; NVMe is 50k-200k+). p99 write latency **105ms**, p99.5 168ms, p99.9 270ms. CPU steal time **0.00%** — host wasn't oversold on CPU; it was oversold on storage. So the box's underlying storage was bursty-throttled, but that alone doesn't explain CPU at 1000%+ — slow disk causes I/O wait, not pure CPU burn.
+
+**Smoking gun:** `pg_stat_activity` showed **5 backends running the same query for 86 seconds each**:
+
+```
+SELECT "authentik_policies_policybindingmodel"."pbm_uuid", ...
+```
+
+Five backends, same query, 86 seconds, on a box with 0.36 binds/sec. That is a recursive loop, not slow-disk noise.
+
+**Root cause:** All three stage bindings on `ldap-authentication-flow` had **both** `evaluate_on_plan=true` AND `re_evaluate_policies=true`:
+
+```
+ldap-authentication-flow | order=10 | evaluate_on_plan=t | re_evaluate_policies=t
+ldap-authentication-flow | order=15 | evaluate_on_plan=t | re_evaluate_policies=t
+ldap-authentication-flow | order=20 | evaluate_on_plan=t | re_evaluate_policies=t
+```
+
+That combo causes a cascading policy re-evaluation on every step of every authentication plan. Authentik 2025.10+ removed Redis and uses Postgres for cache + channels + tasks (no more separate cache backend). Combined with `policybindingmodel` having only the PK as an index, every cascading lookup is a sequential scan. On fast disks the entire cascade per bind completes in microseconds — invisible. On slow disks it explodes.
+
+`grep` of `app.py` revealed we ourselves had been shipping `evaluate_on_plan: true` and `re_evaluate_policies: true` in the LDAP blueprint since the LDAP feature shipped:
+
+- Two YAML copies (the initial deploy blueprint and the post-update healing reimport) — three bindings each
+- The healing function `_ensure_ldap_flow_authentication_none()` line ~24548
+
+Compare to `default-authentication-flow` which has `evaluate_on_plan=false, re_evaluate_policies=true` — that flow has zero recursion and works fine on every box. The fix is to match.
+
+**The proof:**
+
+```sql
+UPDATE authentik_flows_flowstagebinding SET evaluate_on_plan = false
+WHERE target_id IN (SELECT flow_uuid FROM authentik_flows_flow
+                    WHERE slug = 'ldap-authentication-flow');
+-- UPDATE 3
+```
+
+Then `docker restart authentik-server-1` (server only — cardinal rule, ldap outpost untouched). 60 seconds later:
+
+| Metric | Before | After |
+|---|---|---|
+| Postgres CPU samples | 1297, 1085, 782, 619, 165, 766 | 23, 0.7, 0.6, 0.8, 0.03, 32, 0.3, 4.4 |
+| Postgres CPU avg | ~900% | **~7.8%** (~115x reduction) |
+| Long-running policy queries (>5s) | 5 × 86s | **0** |
+| Server CPU | 200-350% sustained | 100-250% (normal) |
+| LDAP outpost StartedAt | (preserved) | (preserved — server-only restart honored cardinal rule) |
+
+### v0.8.8 fix (this release)
+
+Three pieces shipped:
+
+1. **Blueprint YAML — six occurrences of `evaluate_on_plan: true` flipped to `false`** on the three `ldap-authentication-flow` stage bindings, in both YAML copies (initial deploy + healing reimport). `re_evaluate_policies: true` preserved (matches default flow, not part of the recursion combo).
+
+2. **`_ensure_ldap_flow_authentication_none()` line ~24548** — same `evaluate_on_plan: True → False` fix on the healing path so post-update healing doesn't re-introduce the bug on already-fixed boxes.
+
+3. **NEW idempotent self-healing migration `_authentik_fix_ldap_flow_recursion(plog)`** in `app.py`. Hooked into `_startup_migrations` (every console start) and `_post_update_auto_deploy` (after every update). Behavior:
+   - Probes for `authentik-postgresql-1`. If not running, skip.
+   - Counts bindings on `ldap-authentication-flow` with `evaluate_on_plan=true` via SQL.
+   - If `count == 0`: persists `last_outcome='idempotent-noop'` and returns. (Cost on a healthy box: one COUNT query + one settings.json write.)
+   - If `count > 0`: idempotent UPDATE setting them to false; restarts `authentik-server-1` ONLY (server alone — `docker restart`, NOT `--no-deps server worker`, NOT touching LDAP outpost) so the in-memory flow plan cache rebuilds; persists `last_outcome='fixed'` + `last_bad_count=N`.
+
+Persists outcome to `settings.authentik_ldap_flow_recursion_fix` for operator audit.
+
+### Why `docker restart authentik-server-1` and not `_recreate_authentik_server_worker`
+
+The v0.8.7 `_recreate_authentik_server_worker` runs `docker compose up -d --force-recreate --no-deps server worker`. That recreates BOTH server and worker containers, takes 30-60s on slow disks, and is needed when env vars change (gunicorn re-reads `.env` only at process startup). For v0.8.8's flow recursion fix, we only need to clear the in-memory flow plan cache that the **server** holds. The worker doesn't cache flow plans. A simple `docker restart authentik-server-1` is faster (~5-10s on slow disks), gentler on Postgres connection state, and equally effective. The cardinal rule (LDAP outpost untouched) holds either way.
+
+### Validation across the fleet
+
+- **The slow-disk SSDNodes box (where bug surfaced):** Manually fixed via SQL during live debugging. Postgres CPU dropped 115x. After v0.8.8 lands the migration will be `idempotent-noop` (DB state already correct), validating the no-op path.
+- **tak-10 / responder / ssdnodes-validated / Alex's R3930:** Currently all on v0.8.7-alpha and **all** still have the latent recursion bug (fast-disk masking). After they pull v0.8.8, migration fires once: count=3, UPDATE, server restart (~5-10s), audit `last_outcome='fixed'`, `last_bad_count=3`. Their CPU samples should show measurable drops — less dramatic than ssdnodes (their disks were hiding more), but real.
+
+### Rules established by this incident
+
+- **NEVER ship `evaluate_on_plan=true` AND `re_evaluate_policies=true` on the same stage binding.** That's the recursion combo. Match the default-authentication-flow pattern: `evaluate_on_plan=false, re_evaluate_policies=true`. If you have a custom flow that genuinely needs eager evaluation (rare), set `evaluate_on_plan=true, re_evaluate_policies=false` so there's no recursion.
+- **Slow-disk boxes are the canary, not the outlier.** Fast-disk boxes hide policy bugs and cascading queries because each lookup completes in microseconds. Latent recursion bugs ALWAYS exist on every box with the bug; only the symptom presence depends on disk speed.
+- **`pg_stat_activity` with `now() - query_start > 60s` is the fastest forensic** for any "Authentik feels slow" report. If you see ≥2 backends on the same query for tens of seconds, you have a recursion or missing index, not a slow-disk problem. CPU steal time + `fio` IOPS are the next two checks.
+- **`fio` for random-write 4k IOPS** beats `dd` sequential for diagnosing Postgres-relevant disk speed. Postgres needs sub-millisecond fsync latency; `fio` p99 latency >10ms is a "your storage is too slow for production Postgres" signal.
+
+---
+
+## April 2026 — Update Now, Git recovery, TAK Portal TLS (v0.4.0 → v0.4.2)
+
+**Structured digest (tables + checklist):** [OPERATOR-FINDINGS-2026-04-UpdateNow-Portal-TLS.md](OPERATOR-FINDINGS-2026-04-UpdateNow-Portal-TLS.md)  
+**Customer-facing release + skip-upgrade notes:** [RELEASE-v0.4.2-alpha.md](RELEASE-v0.4.2-alpha.md)  
+**SSH recovery (canonical repo, not stale `origin`):** [README — Universal recovery (SSH)](../README.md#universal-recovery-ssh)
+
+### Update Now / `git` (v0.4.0, v0.4.1)
+
+- **Symptom:** **`would clobber existing tag`** on **Update Now**; sometimes unwanted ref updates alongside tag fetch.
+- **Cause (part 1):** Old path used **`git fetch --tags`** (or equivalent bulk tag sync). Local tags that didn’t match GitHub caused hard failure.
+- **Fix v0.4.0:** Resolve latest tag from **GitHub API**, fetch **only** `+refs/tags/<tag>:refs/tags/<tag>`.
+- **Cause (part 2):** Git still applies **`remote.origin.fetch`** together with explicit refspecs → extra refs/tags could still move → clobber could persist.
+- **Fix v0.4.1:** Run those fetches with **`git -c remote.origin.fetch=`** so only the intended refspec runs (main fallback uses the same isolation).
+- **README / field recovery:** **`git fetch origin main`** is unsafe if **`origin`** points at a **fork** or wrong URL — **`origin/main`** stays ancient. Recovery must use **`https://github.com/takwerx/infra-TAK.git`** (see README one-liner).
+- **Process:** **[TESTING-UPDATES.md](TESTING-UPDATES.md)** before pushing a **tag** (tag drives “Update Available”).
+
+### TAK Portal `TAK_URL` — IP vs FQDN (v0.4.2)
+
+- **Symptom:** Portal **not “connected”** to TAK; **QR / enrollment** → **identity could not be verified**; **`TAK_URL`** showed **VPS IP** instead of **`takserver.<fqdn>`**.
+- **Cause:** **`_takportal_build_settings_dict()`** preferred **`server_ip`** for Docker→host reachability, but TAK’s cert is for a **hostname**. Node TLS hostname verification fails on **`https://<ip>:8443/Marti`**.
+- **Fix v0.4.2:** When **`fqdn`** is set, prefer **`_get_takserver_host()`** for the `TAK_URL` host; IP fallback for no-domain installs.
+- **Operator action:** After upgrading the console, **TAK Portal → Update config** (🔄) **required** — the container’s **`settings.json`** does not update by itself. Fresh portal **deploy** already runs the builder. Optional: **Sync TAK Server CA**.
+- **Slack TL;DR:** Upgrade to **v0.4.2** → **Authentik Update config** once → **TAK Portal Update config** once → **Resync LDAP** if 8446 odd. IN/OUT group UI oddities may clear when Portal↔TAK is healthy (collateral, not a separate marketed fix).
+
+### Authentik (unchanged track, still required for big jumps)
+
+- v0.3.9+ behavior remains: **Update config** clears Postgres tuning drift, LDAP/webadmin/8446 hardening, etc. See **RELEASE-v0.4.2** for the skip-upgrade summary.
+
+### TAK Server port 8089 — scary red `ERROR` lines
+
+- **Symptom:** **`NotSslRecordException`**, **`PEER_DID_NOT_RETURN_A_CERTIFICATE`**, random **remote IPs** on **local port 8089**.
+- **Cause:** **Public CoT/TLS** port; **internet scanners** send non-TLS or wrong TLS. Normal noise.
+- **Impact:** Usually **none**; real clients show **INFO** subscriptions. Worry only about **disk** (unbounded logs) or **DDoS** scale.
+
+### Guard Dog — `8089 unhealthy` restarts every ~15–20 min
+
+- **Symptom:** **`restarts.log`** → **`restart | 8089 unhealthy`** on a timer; TAK keeps restarting though clients sometimes work.
+- **Cause:** Old **`tak-8089-watch.sh`** treated a **slightly full** TCP accept queue as failure (**`Recv-Q >= Send-Q-5`**). Scanner traffic on public **8089** fills the queue partway → **false positive** → restart → grace period → repeat.
+- **Fix:** Updated script uses **≥95%** queue saturation and **5** failures; **↻ Update Guard Dog** to install the new script. See **OPERATOR-FINDINGS** §8089 / **GUARDDOG.md**.
+
+### Version line (for handoff search)
+
+| Tag | What |
+|-----|------|
+| **v0.4.0** | API latest tag; single-tag fetch (partial clobber fix). |
+| **v0.4.1** | `remote.origin.fetch=` isolation (clobber fix complete). |
+| **v0.4.2** | TAK Portal `TAK_URL` FQDN; release notes + operator digest. |
+| **v0.4.3** | Guard Dog **8089**, **Authentik** probe + retry, **Auto-VACUUM** logging; **↻ Update Guard Dog** after console upgrade. |
+| **v0.4.4** | Guard Dog **8089** TCP connect probe replaces queue-depth (stops restart loops); **↻ Update Guard Dog** after console upgrade. |
+| **v0.7.3** | `ldap-authentication-login` `session_duration=seconds=120` — password propagation fix. |
+
+---
+
+## April 2026 — LDAP Cached Bind / Password Propagation (v0.7.3)
+
+### Problem
+
+Users who reset their password via TAK Portal could not log in with the new password for up to 24 hours. Old credentials continued to authenticate on iTAK/ATAK during that window.
+
+### Root Cause
+
+Authentik's LDAP outpost runs `bind_mode: cached`. When a user successfully authenticates, Authentik creates a session and caches the successful bind result for the lifetime of that session. Future bind attempts for the same user are served from cache without re-validating against the user store.
+
+TAK Portal resets passwords by calling Authentik's `POST /api/v3/core/users/{id}/set_password/` directly. This updates the stored credential but **does not invalidate existing sessions or cached binds**. The LDAP outpost continues to honour the cached session until it expires.
+
+The expiry is controlled by `session_duration` on the User Login stage bound to the LDAP flow (`ldap-authentication-login`). It was set to `seconds=0`, which Authentik interprets as "use the system default browser session duration" — effectively ~24 hours for LDAP cached binds.
+
+### Why Not `bind_mode: direct`?
+
+TAK Server is extremely chatty on LDAP — bind+search cycles on the order of every ~2 seconds while any client is connected (confirmed by Christian Elsen, AWS). `bind_mode: direct` re-executes the full authentication flow on every single bind request. At scale (hundreds of users, active sessions) this drives Authentik worker CPU and PostgreSQL connections to unsustainable levels. Cached mode is the correct architecture; the cache lifetime just needed to be bounded.
+
+### What Was Tried (and Why It Didn't Work)
+
+`token_validity` on the LDAP provider was patched to `minutes=2`. Authentik silently ignores this field on LDAP providers — it only applies to OAuth/proxy providers for cookie session duration. The API accepted the PATCH but the field had no effect on LDAP bind caching. Confirmed by reading the field back after PATCH: it returned `null`.
+
+### Fix (v0.7.3)
+
+Set `session_duration: seconds=120` on the `ldap-authentication-login` User Login stage. This bounds the cached bind session to 2 minutes. After a password reset, the old credential will be rejected within 2 minutes as the cache expires.
+
+**API verification:**
+```bash
+TOKEN=$(grep AUTHENTIK_BOOTSTRAP_TOKEN ~/authentik/.env | cut -d= -f2)
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:9090/api/v3/stages/user_login/?search=ldap' | \
+  python3 -c "import sys,json; r=json.loads(sys.stdin.read())['results']; [print(f'name={s[\"name\"]} session_duration={s.get(\"session_duration\")}') for s in r]"
+# Expected: name=ldap-authentication-login session_duration=seconds=120
+```
+
+**Manual patch (emergency, without console Resync):**
+```bash
+TOKEN=$(grep AUTHENTIK_BOOTSTRAP_TOKEN ~/authentik/.env | cut -d= -f2)
+STAGE_PK=$(curl -s -H "Authorization: Bearer $TOKEN" \
+  'http://127.0.0.1:9090/api/v3/stages/user_login/?search=ldap' | \
+  python3 -c "import sys,json; print(json.loads(sys.stdin.read())['results'][0]['pk'])")
+curl -s -X PATCH \
+  -H "Authorization: Bearer $TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"session_duration": "seconds=120"}' \
+  "http://127.0.0.1:9090/api/v3/stages/user_login/${STAGE_PK}/"
+```
+
+### How It's Automated
+
+`_ensure_ldap_flow_authentication_none()` (called by **Resync LDAP to TAK Server**) now unconditionally looks up `ldap-authentication-login` by name and patches `session_duration=seconds=120` on every run. This means:
+- Existing deployments: self-heal after one Resync
+- Fresh deploys: blueprint YAML sets `seconds=120` at creation time
+- Future console updates: Resync run during auto-update re-applies the value idempotently
+
+### Scope / Boundaries
+
+infra-TAK does not control TAK Portal's password reset flow. TAK Portal calls Authentik's `set_password` API directly without session invalidation. That is a TAK Portal upstream limitation. The infra-TAK fix works around it by ensuring the cache window is short enough to be operationally acceptable (2 minutes vs 24 hours).
+
+---
+
 ## 0. Current Session State (Last Updated: 2026-03-16) — v0.2.6-alpha
+
+**NOTE (2026-04):** For **current** Update Now / recovery / TAK Portal TLS context, read **“April 2026 — Update Now…”** above and [OPERATOR-FINDINGS-2026-04-UpdateNow-Portal-TLS.md](OPERATOR-FINDINGS-2026-04-UpdateNow-Portal-TLS.md). Section 0 below is **historical** (v0.2.6 era) and has not been fully rewritten.
 
 **This section is the single source of truth.** Update it when server state changes. This doc is a living handoff between machines -- only describe what is true right now.
 
@@ -352,7 +1074,7 @@ cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.servic
 - **Web editor service:** `mediamtx-webeditor.service` is created and enabled/started **only when** `/opt/mediamtx-webeditor/mediamtx_config_editor.py` exists. If clone fails and no local fallback, we skip creating the service (no restart loop). Pip deps and enable/start for webeditor are also gated on that file.
 
 **TAK Server packages:**
-- Deploy and upgrade use `<install_path>/uploads/` (e.g. `/root/infra-TAK/uploads/`). You can rsync or scp the .deb there before running deploy or upgrade.
+- Deploy and upgrade use `<install_path>/uploads/` (e.g. `/home/takwerx/infra-TAK/uploads/`). You can rsync or scp the .deb there before running deploy or upgrade.
 
 **COMMANDS.md:**
 - **Pull then restart (two steps):** Separate code blocks for `git fetch/checkout/pull` and `sudo systemctl restart takwerx-console`.
@@ -919,6 +1641,21 @@ The `ldap-authentication-flow` is defined in `tak-ldap-setup.yaml` blueprint wit
 - **Why**: With `state: created`, Authentik only applies the user model once. But `state: present` or blueprint reconciliation could overwrite the API-set password with a hashed version of the env var, causing LDAP bind failures. The password is set exclusively via the Authentik API (`/api/v3/core/users/{pk}/set_password/`) after user creation.
 - **CRITICAL LESSON**: Never set password in blueprints for service accounts that need to authenticate via LDAP. The password must be set via API to ensure proper hashing.
 
+### 4.15 Authentik-first deploy ordering (CRITICAL)
+
+- **Decision**: Setting `adm_ldapservice` password via API must run regardless of TAK Server install state.
+- **Root cause found on test10**: In local Authentik deploy flow, service-account password setup was accidentally gated under `if webadmin_pass:`. `webadmin_pass` is only set when `/opt/tak` exists, so Authentik-first deploys skipped service-account password initialization entirely.
+- **Symptom**:
+  - 8446 login succeeds but lands in WebTAK instead of AdminUI even when `webadmin` is superuser and in `tak_ROLE_ADMIN` in Authentik.
+  - LDAP bind checks fail: `ldap_bind: Invalid credentials (49)` for `cn=adm_ldapservice,ou=users,dc=takldap`.
+- **Why this causes WebTAK**: TAK Server uses service account bind to resolve group membership (`adminGroup="ROLE_ADMIN"`). If service-account bind fails, role resolution fails and users are treated as non-admin.
+- **Fix implemented**: Moved `adm_ldapservice` create/get + `set_password` block out of the `webadmin_pass` gate so it always runs (Auth-only, TAK-only, and combined deployments).
+- **Validation protocol**:
+  1. Verify service-account bind succeeds:
+     `ldapsearch -x -H ldap://127.0.0.1:389 -D "cn=adm_ldapservice,ou=users,dc=takldap" -w "$LDAP_PASS" -b "dc=takldap" -s base "(objectClass=*)"`
+  2. Confirm `webadmin` in Authentik has superuser + `tak_ROLE_ADMIN`.
+  3. Restart TAK Server and retest 8446 in an incognito window.
+
 ---
 
 ## 5. Problems Encountered During Development
@@ -956,6 +1693,9 @@ The `ldap-authentication-flow` is defined in `tak-ldap-setup.yaml` blueprint wit
 | 29 | **MediaMTX External Sources UI corruption (infra-TAK only)** | **Stale `mediamtx_ldap_overlay.py` on server had legacy JS injectors (`vis-badge`, `_visCache`, `_makeShareBtn`) duplicating badges/buttons** | **`mediamtx_recovery()` always syncs current overlay from repo to `/opt/mediamtx-webeditor/` before restart. Click Patch web editor.** |
 | 30 | **Guard Dog Updates monitor stays red** | **`takupdatesguard.timer` never created on older installs; `guarddog_update()` only refreshed scripts, not units** | **`guarddog_update()` now writes + enables `.service` + `.timer`, daemon-reload. Click Update Guard Dog.** |
 | 31 | **Update Now causes rebase conflicts (v0.2.4, v0.2.5)** | **`git pull --rebase --autostash` + tag checkout on field installs with detached HEAD / stale git state** | **Rewrote to `fetch --tags` + `checkout --force <tag>`. No pull/rebase/merge. See `docs/TESTING-UPDATES.md`.** |
+| 32 | **Auth-only then TAK deploy leads to WebTAK (not AdminUI) despite correct Authentik groups** | **`adm_ldapservice` password API setup was wrongly nested under `if webadmin_pass` (which is false when `/opt/tak` is missing)** | **Run service-account password setup unconditionally in Authentik deploy flow; verify with `ldapsearch` bind (`result: 0 Success`)** |
+| 33 | **LDAP outpost created but token injection failed with timeout** | **Outpost create request timeout too low (10s) during first-run bootstrap load** | **Increase outpost create API timeout to 30s; token capture and compose injection complete reliably** |
+| 34 | **Step 8 API timeout warning on fresh Authentik deploys** | **First-run migrations exceeded 450s wait window on smaller VPS** | **Increase API wait attempts from 90 to 150 (~750s) to avoid false timeout warnings** |
 
 ---
 
@@ -994,6 +1734,9 @@ Before publishing a new tag, temporarily set `VERSION` in `app.py` to an older v
 ### 6.11 Overlay convergence on recovery
 When a per-module patch file (like `mediamtx_ldap_overlay.py`) exists both in the repo and on the server, recovery/patch actions should always sync repo → server before restarting the service. This guarantees convergence regardless of what stale version is on disk.
 
+### 6.12 Secret extraction from `.env` (critical shell detail)
+When reading secrets from `.env`, always use `cut -d= -f2-` (not `-f2`). Several generated secrets can include `=`; truncating them causes false `Invalid credentials (49)` and misleading LDAP debugging.
+
 ---
 
 ## 7. Known Limitations and Technical Debt
@@ -1007,7 +1750,8 @@ When a per-module patch file (like `mediamtx_ldap_overlay.py`) exists both in th
 
 ### MEDIUM
 
-- LDAP `bind_mode: cached` and `search_mode: cached` -- cache behavior during outpost recreation poorly understood. Cache masks flow execution bugs until it expires.
+- **No rollback capability** — Update Now pulls latest and restarts; no way to return to the previous working version without SSH and manual git commands. Planned for v0.8.7 as the headline feature (see `docs/PLAN-v0.8.7.md`).
+- LDAP `bind_mode: cached` and `search_mode: cached` — cache behavior during outpost recreation poorly understood. Cache masks flow execution bugs until it expires.
 - Hardcoded LDAP base DN `DC=takldap` and group prefix `tak_`
 - Inline HTML/JS/CSS in Python strings
 - systemd service still named `takwerx-console`
@@ -1024,6 +1768,13 @@ When a per-module patch file (like `mediamtx_ldap_overlay.py`) exists both in th
 - **MediaMTX External Sources UI corruption** — Fixed in v0.2.5-alpha. `mediamtx_recovery()` syncs overlay from repo.
 - **Guard Dog Updates monitor stays red** — Fixed in v0.2.5-alpha. `guarddog_update()` writes + enables systemd timer.
 
+### RESOLVED (previously HIGH) — v0.8.6
+
+- **Authentik deploy fails on slow-disk VMs (Azure)** — `elif needs_pg_update:` scope bug caused `docker compose up -d` to be skipped on fresh deploys; API poll timed out after 900 s. Fixed: un-indented 121 lines so bring-up is unconditional.
+- **LDAP SA bind check always reported failure** — Two bugs: ldapsearch searched wrong base DN (always LDAP error 32), and `sleep(2)` Docker log check was a timing race on slow disk. Fixed: correct search base, `sleep(5)`, `--since 90s`, Docker log fallback.
+- **Dashboard disk I/O showed cached speed instead of real sync speed** — `vmstat` reported buffer-cache throughput. Fixed: Guard Dog CSV read first; vmstat fallback labeled "(vmstat, cached)"; vmstat-only line hidden (always 0.00 on idle boxes).
+- **`start.sh` showed private IP on Azure/AWS NAT** — Fixed: `curl api.ipify.org` with graceful fallback, both IPs shown when they differ.
+
 ---
 
 ## 8. Configuration and Setup Instructions
@@ -1032,7 +1783,7 @@ When a per-module patch file (like `mediamtx_ldap_overlay.py`) exists both in th
 
 ```bash
 git clone --depth 1 -b dev https://github.com/takwerx/infra-TAK.git ~/infra-TAK
-cd ~/infra-TAK && chmod +x start.sh && sudo ./start.sh
+cd ~/infra-TAK && sudo ./start.sh
 ```
 
 ### Deployment Order (Authentik-first, verified 2026-02-23)
@@ -1077,6 +1828,12 @@ cd ~/infra-TAK && chmod +x start.sh && sudo ./start.sh
 - **NEVER use `git pull --rebase` in `update_apply()` or any automated update flow.** Field installs have unpredictable git state (detached HEAD, stale rebase, local divergence). Always use `fetch + checkout --force`. See problem #31.
 - **MediaMTX overlay on disk can be stale.** If the MediaMTX External Sources UI looks broken (duplicated badges/buttons) on an infra-TAK install but fine on vanilla MediaMTX, the overlay file on the server is outdated. Run Patch web editor or `mediamtx_recovery()`. See problem #29.
 - **Guard Dog Updates timer may not exist on older installs.** If the Updates monitor is red, click Update Guard Dog. `guarddog_update()` now ensures the systemd timer unit exists. See problem #30.
+- **NEVER restart the LDAP outpost in a migration unless it is provably broken.** A restart wipes all cached bind sessions. On an active deployment this causes every TAK client to re-authenticate simultaneously (thundering herd), saturating Authentik workers and Postgres connections. Gate every migration that touches the LDAP container with a health check: read logs for `successfully connected websocket` + absence of `remote error: tls: internal error`. See April 2026 thundering herd incident above.
+- **`AUTHENTIK_WEB_WORKERS` defaults to 2 — this is insufficient for active deployments.** Set to 4+ for any install with more than ~10 active TAK clients. The v0.8.2 post-update migration sets this automatically. When debugging slow runtimes (flow executor > 5s), check this first before any other change.
+- **Thundering herd recovery sequence (live broken box):** (1) `cd ~/authentik && docker compose restart` to drain queued requests and free Postgres connections, (2) add `AUTHENTIK_WEB_WORKERS=4` to `~/authentik/.env`, (3) `docker compose restart server` only — do NOT restart ldap again, (4) wait 3–5 min for bind caches to repopulate. Running Update Now on v0.8.2+ automates steps 2–3.
+- **`AUTHENTIK_HOST` in the LDAP outpost must point to the internal Docker network URL**, not the public FQDN or Caddy. Use `http://authentik-server-1:9000`. Routing LDAP→Caddy→Authentik fails with `tls: internal error` when Caddy has no valid cert yet (cold start, cert rotation). This also creates an unnecessary external network round-trip inside the same host.
+- **`idle_in_transaction_session_timeout` must be `30s` or higher — never lower.** Authentik's migration lifecycle opens a transaction at startup and holds it open during module loading (several minutes total, with idle gaps of 10–20s). Any timeout below ~20s kills this connection, crashing the worker and server into a restart loop. The current shipped value is `30s` (in the `command:` line of the `postgresql` service in `docker-compose.yml`). If Postgres is at 500–800% CPU with hundreds of `idle in transaction` connections all querying `django_postgres_cache_cacheentry` for `goauthentik.io/enterprise/license`, this is Authentik's license check leak — reduce the timeout but stay at or above `30s`. Diagnosis: `docker compose exec -T postgresql psql -U authentik -d authentik -c "SELECT state, wait_event_type, query FROM pg_stat_activity WHERE state='idle in transaction' LIMIT 5;"`.
+- **Changing PostgreSQL command-line args requires a container force-recreate**, not just a config reload. `ALTER SYSTEM` + `pg_reload_conf()` cannot override command-line parameters (command-line takes highest precedence). To apply a new value: edit the `command:` line in `docker-compose.yml` then run `docker compose up -d --force-recreate postgresql`. The `_apply_authentik_pg_tuning()` function now does this automatically when it detects the args changed.
 
 ### Edge-Case Logic That Must Not Be Removed
 
@@ -1092,6 +1849,10 @@ cd ~/infra-TAK && chmod +x start.sh && sudo ./start.sh
 - `update_apply()`: Must use `fetch --tags` + `checkout --force` only. NO `git pull`, NO `git rebase`, NO `git merge`. Any merge-like operation will break on customer installs.
 - `mediamtx_recovery()`: Must copy `mediamtx_ldap_overlay.py` from repo to `/opt/mediamtx-webeditor/` before restarting the web editor service. If this step is removed, old overlay code will persist on server.
 - `guarddog_update()`: Must write + enable `takupdatesguard.timer` systemd unit (not just refresh scripts). If this is removed, the Updates monitor will stay red on installs where the timer was never created.
+- **LDAP post-update migration health gate (v0.8.1+):** Must check `authentik-ldap-1` logs for `successfully connected websocket` and absence of `remote error: tls: internal error` before patching compose and restarting LDAP. If the gate returns healthy, migration must skip. **Removing or weakening this gate will unconditionally restart LDAP on every update and cause thundering herd on every active install.** See April 2026 incident.
+- **`AUTHENTIK_WEB_WORKERS=4` migration (v0.8.2+):** Must only restart the `server` container, never `ldap`. Only upgrades workers if current value < 4 (idempotent). If changed to restart `ldap`, it will wipe all bind caches on every update.
+- **`_apply_authentik_pg_tuning()` force-recreate (v0.8.3+):** When `_ensure_authentik_compose_patches()` returns `True` (compose file changed), `_apply_authentik_pg_tuning()` must run `docker compose up -d --force-recreate postgresql`. This is the only way to apply new command-line args — a config reload is insufficient. Do not remove or short-circuit the `if compose_changed:` branch. `ALTER SYSTEM RESET ALL` must also run before the recreate to clear any manual overrides that would shadow the command-line value.
+- **`idle_in_transaction_session_timeout` floor is 30s (v0.8.3+):** The `needs_pg_update` trigger list in both migration paths must include `10s` and `120s` as old values to upgrade FROM, but must NOT include `30s` (the target). If you change the target value, update the trigger list accordingly. Never set the value below `30s` — see gotcha above.
 
 ### Authentik LDAP Flow Architecture (MUST understand to debug)
 

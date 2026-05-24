@@ -1,0 +1,46 @@
+---
+description: How to respond when the operator asks for the "test and evaluation procedure" / "T&E" / soak validation before a release
+alwaysApply: true
+---
+
+# Test & Evaluation Procedure routing
+
+When the operator says any of:
+
+- "perform the test and evaluation procedure"
+- "run T&E" / "do the T&E"
+- "soak it" / "validate dev" / "run the soak"
+- "validate this for release" / "ready to ship?"
+- any phrasing that asks the agent to validate a candidate before a release
+
+→ The agent reads `docs/TEST-AND-EVALUATION-PROCEDURE.md` **end-to-end** and executes it step-by-step. That doc is the single source of truth for the procedure. Do not re-derive the steps; do not skip Step 3's 60-min soak; do not validate on a single box.
+
+## Role split — agent does NOT pull on test boxes
+
+T&E is a two-actor protocol. Agent ≠ operator. The split (from the procedure doc § "Roles"):
+
+- **Operator does** the `git fetch origin dev` / `git checkout -B dev origin/dev` / `sudo systemctl restart takwerx-console` on every test box. This is the customer-facing operator-action code path; running it manually catches pull-path failures (clobber, shallow clone, merge conflict) under operator eyes and prevents the agent from silently soaking the wrong SHA on the wrong box.
+- **Agent does** Step 0 (pick candidate), Step 1 (read-only pre-flight), Step 2 verification (SHA match + console up + migration log check — read-only), Step 3 soak (wait), Step 4 health-check matrix (read-only probes), Step 5 release-specific checks (flag operator-action paths), Step 6 PASS/FAIL gate and ship prompt.
+
+**The agent must NEVER `git pull`, `git checkout`, or `systemctl restart takwerx-console` on a test box on its own initiative — including via SSH, including "just to verify it took".** If a verification check fails, the agent reports what it sees and asks the operator. If the operator explicitly says "go ahead and pull on test8" the agent can, but the default is the operator does it.
+
+When the operator says "perform T&E" without first having pulled, the agent's response includes the exact pull command for each box (with the dynamic `WorkingDirectory=` resolution from `memory-bank/techContext.md`) and then waits for the operator to confirm before starting the soak clock.
+
+## Hard invariants the procedure enforces (do NOT shortcut these)
+
+1. **≥3 dev boxes from the active fleet** (currently `test6` / `test8` / `test12`). One-box validation is forbidden by `.cursor/rules/fleet-uniform-config.mdc`.
+2. **No operator overrides on validation boxes.** Pre-flight (Step 1) checks `~/infra-TAK/.config/settings.json` for override keys. If found, either clear them or drop the box from the quorum.
+3. **Operator does the pull + restart on every box** (per the role split above). Agent verifies the pull took, does not perform it.
+4. **≥60 min soak per box on the candidate SHA**, clock starts after the operator's pull is verified across all boxes. New commit mid-soak → operator re-pulls → clock resets per box. No exceptions, no "looks fine after 20 min."
+5. **All boxes the same SHA** at end of soak (Step 4e cross-box convergence check).
+6. **`ak dump_config` is mandatory** on any release touching Authentik env vars — per `.cursor/rules/consult-upstream-docs.mdc`, double-underscore env vars must be verified at runtime, not just at write time.
+7. **After T&E green: present the ship prompt and STOP.** Per `.cursor/rules/no-main-merge-no-tag-without-permission.mdc`, the agent does not merge to `main` / tag / push without explicit operator authorization. T&E green ≠ permission to ship.
+
+## What "perform T&E" produces
+
+The agent's output at the end of T&E is the Step 6 PASS/FAIL checklist from the procedure doc, filled in, plus either:
+
+- **All green** → the ship prompt from `.cursor/rules/no-main-merge-no-tag-without-permission.mdc`, then wait for the operator.
+- **Any red** → state which box(es) and metric(s) failed, capture forensics per the procedure's "Failure handling" section, and propose the next debug step on `dev`. Do NOT propose to ship.
+
+If the procedure doc itself looks stale (boxes retired, new failure class not represented, etc.), say so and ask before updating it — don't silently edit gates.

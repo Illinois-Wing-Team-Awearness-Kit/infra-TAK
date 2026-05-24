@@ -1,10 +1,12 @@
 # Pull and restart on VPS
 
+**Broken version / Update Now / git errors:** use one place — [README → Universal recovery (SSH)](../README.md#universal-recovery-ssh) (copy-paste block). This doc adds **dev**/**main**-by-branch steps and **shallow-clone** fixes.
+
 Run each command separately (one line at a time). Do not combine commands.
 
 ## Find the correct directory first
 
-The service might not run from `/root/infra-TAK`. **Always check first:**
+The service might not run from `/home/takwerx/infra-TAK`. **Always check first:**
 
 ```bash
 grep WorkingDirectory /etc/systemd/system/takwerx-console.service
@@ -12,36 +14,83 @@ grep WorkingDirectory /etc/systemd/system/takwerx-console.service
 
 Use whatever path that returns. Example output:
 ```
-WorkingDirectory=/root/infra-TAK/infra-TAK
+WorkingDirectory=/home/takwerx/infra-TAK/infra-TAK
 ```
 
-## Simple dev pull (separate commands)
+## Pull latest dev and restart
 
 ```bash
 cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
-git pull origin dev
+git fetch origin dev
+git checkout -B dev origin/dev
 sudo systemctl restart takwerx-console
 ```
 
-## Dev branch (explicit flow)
+## After pulling dev: redeploy Node-RED (Configurator / new flow tabs)
+
+Changes under `nodered/` (new tabs such as **PulsePoint**, `build-flows.js`, `configurator.html`) only affect the running **Docker** stack after you redeploy. Use the **same repo directory** as above:
 
 ```bash
 cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
-git fetch origin
-git checkout dev
-git pull --ff-only origin dev
-sudo systemctl restart takwerx-console
+bash nodered/deploy.sh
 ```
 
-## Main branch (stable)
+What **`nodered/deploy.sh`** does: runs **`git pull`** on your current branch (unless you pass **`--no-pull`**), runs **`build-flows.js`** inside the **`nodered`** container, copies **`flows.json`** and static assets, tries to preserve TLS/TCP settings from the running container, then **`docker restart nodered`**.
+
+If you **just** finished a manual `git fetch` / `git checkout` and do not want another pull:
 
 ```bash
 cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
-git fetch origin
-git checkout main
-git pull --ff-only origin main
+bash nodered/deploy.sh --no-pull
+```
+
+Then:
+
+1. Open the **Node-RED** editor → click **Deploy** once if new tabs appear (TLS/TCP checklist: **[NODERED-DEPLOY.md](NODERED-DEPLOY.md)**).
+2. Open the **Configurator** (default: **`http://<host>:1880/configurator`**, or your Authentik/Caddy URL) to test feeds. If something is missing after a restart, **TAK Settings** → **Save** can restore flow context (see deploy script header comments).
+
+**No `grep -oP`?** `cd` to the path from `grep WorkingDirectory /etc/systemd/system/takwerx-console.service`, then run `bash nodered/deploy.sh`.
+
+**Maintainers:** full deploy smoke steps — **[TESTING-NODERED-DEPLOYS.md](TESTING-NODERED-DEPLOYS.md)**.
+
+## Pull latest main (stable) and restart
+
+Prefer fetching **canonical** **`main`** (official repo). **`git fetch origin main`** only works if **`git remote -v`** points at **`takwerx/infra-TAK`**; otherwise **`origin/main`** can stay years out of date.
+
+```bash
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
+git fetch https://github.com/takwerx/infra-TAK.git main
+git checkout --force -B main FETCH_HEAD
+grep '^VERSION' app.py
 sudo systemctl restart takwerx-console
 ```
+
+If **`origin`** is already correct, **`git fetch origin main`** and **`git checkout -B main origin/main`** is equivalent.
+
+## Shallow clone fix (one-time)
+
+If `git fetch` fails with `'origin/dev' is not a commit`, run this once:
+
+```bash
+git remote set-branches origin '*'
+```
+
+Then retry the pull commands above. This only happens on VPS installs that used `--depth 1`.
+
+## `checkout` / `git pull` blocked: local changes to `nodered/flows.json`
+
+After **`nodered/deploy.sh`** (or copying flows from the container), **`git status`** may show **`nodered/flows.json`** modified. **`git checkout dev`** or **`git pull`** then aborts with *would be overwritten*.
+
+If you do **not** need to keep those working-tree edits (you will rebuild flows on deploy anyway):
+
+```bash
+cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service)
+git restore nodered/flows.json
+```
+
+Older Git: **`git checkout -- nodered/flows.json`**. Then retry **Pull latest dev** (or **`git pull`**) and **`bash nodered/deploy.sh`**.
+
+To keep a copy first: **`cp nodered/flows.json /tmp/flows.json.bak`** then restore as above.
 
 ## Upgrading to v0.2.0+
 

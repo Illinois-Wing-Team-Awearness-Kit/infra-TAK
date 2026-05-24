@@ -1,0 +1,73 @@
+---
+description: Fleet-uniform configuration — never let operator overrides silently outlive incidents, and never validate a release on an operator-tuned box.
+alwaysApply: true
+---
+
+# Fleet-uniform configuration (do not fracture the fleet)
+
+infra-TAK ships to many customers. The codebase MUST produce the same operational state on every box — either a fleet-uniform constant OR a value computed from observable signals on that box (deterministic auto-tune). **What it must NEVER do is preserve a number an operator once typed during a fire and let that override silently outlive the incident.** That creates a fleet where every customer has a personal config based on their personal incident history, and "tested on box X" tells us nothing about anyone else's box.
+
+## The v0.9.26 fleet-fracture cautionary tale (2026-05-17)
+
+`_ensure_authentik_pgbouncer_pool_size` used `max(cur, target)` to "never lower an operator override." That semantic — praised as a feature in the v0.9.26 release notes — caused this exact failure:
+
+1. tak-10 had been manually bumped to `250/50` during yesterday's troubleshooting.
+2. v0.9.26 codified `target = 75/15`. Migration ran `max(250, 75) = 250` → tak-10 stayed at 250/50.
+3. Same migration on test8 (no operator override) applied `75/15` literally.
+4. I validated tak-10 for 65 min, saw it healthy, shipped v0.9.26 to `main`.
+5. test8 pulled v0.9.26, ran at codified 75/15, hit the same Channels-eater wall tak-10 had hit yesterday → unhealthy in ~5 min.
+6. **The release shipped to `main` was validated on a config that doesn't exist in the codebase.** tak-10's `250/50` was the operator override; the codebase ships `75/15`. They are not the same release.
+
+## Anti-patterns (do not introduce these)
+
+```python
+# ❌ BAD — operator override silently outlives the incident, fracturing the fleet
+new_default = max(cur_default, target_default)
+
+# ❌ BAD — same trap with a friendlier name
+if 'pool_override' in settings:
+    new_default = settings['pool_override']
+
+# ❌ BAD — per-customer "size" tiers, same trap as discrete buckets
+new_default = SIZES[settings.get('install_tier', 'small')]
+```
+
+## Approved patterns
+
+```python
+# ✅ Fleet constant — every box converges to the same value, period
+DEFAULT_POOL_SIZE = 250  # field-validated on tak-10 under Channels-class load
+target_default = DEFAULT_POOL_SIZE
+# always write target — no max(cur, target)
+
+# ✅ Deterministic auto-tune — same logic on every box → same load produces same config
+peak = read_observed_peak_from(pgbouncer_show_pools, pg_stat_activity)
+target_ceiling = max(MIN_CEILING, peak * SAFETY_FACTOR)
+target_ceiling = min(target_ceiling, PG_MAX_CONN * 0.6)
+target_default = target_ceiling * 5 // 6
+target_reserve = target_ceiling - target_default
+# autotune decision recorded in settings.json.<knob>_autotune for audit
+# always write target — no max(cur, target)
+```
+
+If a customer hits a load class that exceeds the autotuner's safety margin → that's a **code fix** (raise the safety factor or the ceiling cap), pushed to the entire fleet. **Not** a per-box override.
+
+## Validation gate (release engineering)
+
+**Never validate a release on an operator-tuned box.** If `tak-10` has manual pool/threshold overrides, validating v0.X stability on `tak-10` proves the override works — NOT that the codified default works. Validation MUST happen on a box where:
+
+1. The runtime config is **exactly** what the codebase computes (no manual edits to `~/authentik/docker-compose.yml`, `~/infra-TAK/.config/settings.json`, or other knobs).
+2. **All three of the active test boxes** (currently: tak-10, test8, responder/infratak-vps) hit the validation gate together. One-box validation is forbidden for any change that ships fleet-wide configuration.
+3. Soak window ≥ 60 min on each box with zero `query_wait_timeout`, zero watchdog ALERT fires, all containers `(healthy)`.
+
+If no such box exists, **create one** (or revert the candidate box's overrides first) — do not skip the gate.
+
+## Practical checklist before merging dev → main
+
+- [ ] No `max(cur, target)` or equivalent override-preservation in any config migration touched by this release
+- [ ] Every config knob the release modifies has either a fleet constant or an autotune output backing it
+- [ ] At least 3 test boxes pulled the release from `dev` and ran ≥ 60 min stable WITHOUT any manual config edits
+- [ ] Operator overrides on test boxes are explicitly cleared before validation (or autotune is expected to overwrite them — verify it did)
+- [ ] Release notes name the validation boxes, the soak window, and the absence of overrides
+
+If any box on dev shows a config that differs from what `app.py` would compute on that same box → that's a bug, not "operator preference." Fix it before merging.

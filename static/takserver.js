@@ -1,3 +1,4 @@
+if(typeof initLogToolbar==='function'){initLogToolbar('deploy-log');initLogToolbar('upgrade-log');initLogToolbar('db-migrate-log');initLogToolbar('server-log');}
 async function resyncLdap(){
     if(!confirm("Resync will restart the Authentik worker and re-apply the LDAP blueprint. The TAK Portal user list may take a short moment to repopulate.\\n\\nContinue?")){return;}
     var btn=document.getElementById('resync-ldap-btn');
@@ -58,7 +59,7 @@ async function setWebadminPassword(){
     try{
         var r=await fetch('/api/takserver/webadmin-password',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
         var d=await r.json();
-        if(d.success){msgEl.textContent='Saved. Click Sync webadmin to Authentik to push to 8446.';msgEl.style.color='var(--green)';pwEl.value='';confirmEl.value='';}
+        if(d.success){msgEl.textContent=d.message||'Saved.';msgEl.style.color='var(--green)';pwEl.value='';confirmEl.value='';}
         else{msgEl.textContent=d.error||d.message||'Save failed';msgEl.style.color='var(--red)';}
     }catch(e){msgEl.textContent='Error: '+e.message;msgEl.style.color='var(--red)';}
     if(btn)btn.disabled=false;
@@ -129,6 +130,8 @@ async function checkLdapDrift(){
         }else{banner.style.display='none';}
     }catch(e){banner.style.display='none';}
 }
+function _sleep(ms){ return new Promise(function(resolve){ setTimeout(resolve, ms); }); }
+
 async function loadServices(){
     var el=document.getElementById('services-list');
     if(!el)return;
@@ -184,7 +187,7 @@ if(document.getElementById('tak-remote-metrics-bar')){loadTakRemoteMetrics();set
 if(document.getElementById('webadmin-superuser-status')){loadWebadminSuperuserStatus();}
 if(document.getElementById('tak-cert-password-inline')){loadTakCertPassword();}
 if(document.getElementById('ldap-drift-banner')){checkLdapDrift();}
-if(document.getElementById('cot-db-size')){refreshCotSize();}
+if(document.getElementById('cot-db-size')){refreshCotSize();fetch('/api/takserver/vacuum/status').then(function(r){return r.json();}).then(function(d){if(d.running){_vacuumSetUI(true,d.full,d.elapsed_secs||0);_pollVacuumStatus();}}).catch(function(){});}
 if(document.getElementById('cert-expiry-info')){loadCertExpiry();}
 if(document.getElementById('rotate-ca-info')){loadCAInfo();}
 function refreshTakServerCAState(){
@@ -204,17 +207,17 @@ async function loadGroups(){
     var r=await fetch('/api/takserver/groups');var d=await r.json();
     if(d.error&&(!d.groups||!d.groups.length)){el.innerHTML='<span style="color:var(--red)">'+d.error+'</span> <button type="button" onclick="loadGroups()" style="margin-left:8px;padding:4px 12px;background:rgba(59,130,246,0.1);color:var(--accent);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer">Retry</button>';return;}
     if(!d.groups||d.groups.length===0){el.innerHTML='<span style="color:var(--text-dim)">No groups found. Groups are created in the TAK Server WebGUI or via LDAP.</span>';return;}
-    var h='<div style="display:grid;grid-template-columns:1fr auto auto auto;gap:4px 16px;align-items:center">';
-    h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;padding-bottom:4px">GROUP</div>';
+    var h='<div style="display:grid;grid-template-columns:auto auto auto 1fr;gap:4px 16px;align-items:center">';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;text-align:center;padding-bottom:4px">READ</div>';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;text-align:center;padding-bottom:4px">WRITE</div>';
     h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;text-align:center;padding-bottom:4px">BOTH</div>';
+    h+='<div style="color:var(--text-dim);font-size:11px;font-weight:600;padding-bottom:4px">GROUP</div>';
     for(var i=0;i<d.groups.length;i++){
       var g=d.groups[i],n=g.name,safe=n.replace(/"/g,'&quot;');
-      h+='<div style="color:var(--text-secondary);padding:4px 0">'+n+'</div>';
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-read" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--cyan)" onchange="ccGroupChanged(this,\'read\')"></div>';
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-write" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--cyan)" onchange="ccGroupChanged(this,\'write\')"></div>';
       h+='<div style="text-align:center"><input type="checkbox" class="cc-grp-both" data-group="'+safe+'" style="width:16px;height:16px;accent-color:var(--accent)" onchange="ccGroupChanged(this,\'both\')"></div>';
+      h+='<div style="color:var(--text-secondary);padding:4px 0">'+n+'</div>';
     }
     h+='</div>';
     el.innerHTML=h;
@@ -238,15 +241,25 @@ async function createClientCert(){
   var result=document.getElementById('cc-result');
   var name=(nameEl?nameEl.value:'').trim();
   if(!name){if(msg){msg.textContent='Enter a client name.';msg.style.color='var(--red)';}return;}
-  var groupsIn=[],groupsOut=[];
-  document.querySelectorAll('.cc-grp-read:checked').forEach(function(c){var g=c.getAttribute('data-group');if(groupsOut.indexOf(g)<0)groupsOut.push(g);});
-  document.querySelectorAll('.cc-grp-write:checked').forEach(function(c){var g=c.getAttribute('data-group');if(groupsIn.indexOf(g)<0)groupsIn.push(g);});
-  if(groupsIn.length===0&&groupsOut.length===0){if(msg){msg.textContent='Select at least one group with read or write permission.';msg.style.color='var(--red)';}return;}
+  var groupsIn=[],groupsOut=[],groupsBoth=[];
+  document.querySelectorAll('.cc-grp-both:checked').forEach(function(c){
+    var g=c.getAttribute('data-group');
+    if(groupsBoth.indexOf(g)<0)groupsBoth.push(g);
+  });
+  document.querySelectorAll('.cc-grp-read:checked').forEach(function(c){
+    var g=c.getAttribute('data-group');
+    if(groupsBoth.indexOf(g)<0&&groupsOut.indexOf(g)<0)groupsOut.push(g);
+  });
+  document.querySelectorAll('.cc-grp-write:checked').forEach(function(c){
+    var g=c.getAttribute('data-group');
+    if(groupsBoth.indexOf(g)<0&&groupsIn.indexOf(g)<0)groupsIn.push(g);
+  });
+  if(groupsIn.length===0&&groupsOut.length===0&&groupsBoth.length===0){if(msg){msg.textContent='Select at least one group with read, write, or both permission.';msg.style.color='var(--red)';}return;}
   if(btn)btn.disabled=true;
   if(msg){msg.textContent='Creating certificate...';msg.style.color='var(--text-dim)';}
   if(result)result.style.display='none';
   try{
-    var r=await fetch('/api/takserver/create-client-cert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,groups_in:groupsIn,groups_out:groupsOut})});
+    var r=await fetch('/api/takserver/create-client-cert',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,groups_in:groupsIn,groups_out:groupsOut,groups_both:groupsBoth})});
     var d=await r.json();
     if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
     if(msg){msg.textContent='';msg.style.color='var(--text-dim)';}
@@ -558,8 +571,11 @@ function pollRootRotateLog(){
   }).catch(function(){setTimeout(pollRootRotateLog,2000);});
 }
 
-async function refreshCotSize(){var el=document.getElementById('cot-db-size');if(!el)return;el.textContent='...';el.style.color='';try{var r=await fetch('/api/takserver/cot-db-size');var d=await r.json();if(d.error){el.textContent=d.error;}else{el.textContent=d.size_human||'-';var b=d.size_bytes;if(typeof b==='number'){var gb25=25*1024*1024*1024;var gb40=40*1024*1024*1024;if(b<gb25)el.style.color='var(--green)';else if(b<gb40)el.style.color='var(--yellow)';else el.style.color='var(--red)';}}}catch(e){el.textContent='Error';}}
-async function runVacuum(full){var msg=document.getElementById('vacuum-msg');var out=document.getElementById('vacuum-output');var btnA=document.getElementById('vacuum-analyze-btn');var btnF=document.getElementById('vacuum-full-btn');if(full&&!confirm("VACUUM FULL locks the CoT tables. Run when TAK Server is not running. Continue?"))return;if(msg){msg.textContent=full?'Running VACUUM FULL (may take a long time)...':'Running VACUUM ANALYZE...';msg.style.color='var(--text-dim)';}if(out){out.style.display='none';out.textContent='';}if(btnA){btnA.disabled=true;}if(btnF){btnF.disabled=true;}try{var r=await fetch('/api/takserver/vacuum',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({full:full})});var d=await r.json();if(d.success){if(msg){msg.textContent='Done.';msg.style.color='var(--green)';}if(out&&d.output){out.textContent=d.output;out.style.display='block';}if(document.getElementById('cot-db-size')){refreshCotSize();}}else{if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}if(out&&d.error){out.textContent=d.error;out.style.display='block';}}}catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}}if(btnA){btnA.disabled=false;}if(btnF){btnF.disabled=false;}}
+async function refreshCotSize(){var el=document.getElementById('cot-db-size');if(!el)return;el.textContent='...';el.style.color='';var mc=document.getElementById('cot-msg-count');var dt=document.getElementById('cot-dead-tuples');try{var r=await fetch('/api/takserver/cot-db-size');var d=await r.json();if(d.error){el.textContent=d.error;}else{el.textContent=d.size_human||'-';var b=d.size_bytes;if(typeof b==='number'){var gb25=25*1024*1024*1024;var gb40=40*1024*1024*1024;if(b<gb25)el.style.color='var(--green)';else if(b<gb40)el.style.color='var(--yellow)';else el.style.color='var(--red)';}}if(mc){mc.textContent=typeof d.message_count==='number'?d.message_count.toLocaleString():'-';}if(dt){var dtv=d.dead_tuples;dt.textContent=typeof dtv==='number'?dtv.toLocaleString():'-';if(typeof dtv==='number'){dt.style.color=dtv>1000000?'var(--red)':dtv>100000?'var(--yellow)':'var(--green)';}}}catch(e){el.textContent='Error';}}
+function _vacuumSetUI(running,full,secs){var msg=document.getElementById('vacuum-msg');var btnA=document.getElementById('vacuum-analyze-btn');var btnF=document.getElementById('vacuum-full-btn');var btnR=document.getElementById('reindex-btn');[btnA,btnF,btnR].forEach(function(b){if(b){b.disabled=running;b.style.opacity=running?'0.4':'1';b.style.pointerEvents=running?'none':'auto';}});if(running&&msg){var elapsed='';if(secs>0){var m=Math.floor(secs/60);elapsed=m>0?' ('+m+'m '+secs%60+'s)':' ('+secs+'s)';}msg.textContent=(full?'Running VACUUM FULL':'Running VACUUM ANALYZE')+'...'+elapsed;msg.style.color='var(--text-dim)';}}
+async function _pollVacuumStatus(){var msg=document.getElementById('vacuum-msg');var out=document.getElementById('vacuum-output');try{var r=await fetch('/api/takserver/vacuum/status');var d=await r.json();if(d.running){_vacuumSetUI(true,d.full,d.elapsed_secs||0);setTimeout(_pollVacuumStatus,5000);}else{if(d.error){if(msg){msg.textContent=d.error;msg.style.color='var(--red)';}if(out){out.textContent=d.error;out.style.display='block';}}else if(d.result!==null){if(msg){msg.textContent='Done.';msg.style.color='var(--green)';}if(out&&d.result){out.textContent=d.result;out.style.display='block';}refreshCotSize();}_vacuumSetUI(false,false,0);}}catch(e){setTimeout(_pollVacuumStatus,10000);}}
+async function runVacuum(full){var msg=document.getElementById('vacuum-msg');var out=document.getElementById('vacuum-output');if(full&&!confirm("VACUUM FULL locks the CoT tables. Run when TAK Server is not running. Continue?"))return;if(out){out.style.display='none';out.textContent='';}_vacuumSetUI(true,full,0);try{var r=await fetch('/api/takserver/vacuum',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({full:full})});var d=await r.json();if(d.success||d.status==='running'){_pollVacuumStatus();}else{if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}_vacuumSetUI(false,false,0);}}catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}_vacuumSetUI(false,false,0);}}
+async function runReindex(){var msg=document.getElementById('vacuum-msg');var out=document.getElementById('vacuum-output');var btn=document.getElementById('reindex-btn');if(!confirm('Rebuild all indexes on the CoT database? This is safe while running but may take a while on large databases.'))return;if(msg){msg.textContent='Running REINDEX (may take a while)...';msg.style.color='var(--text-dim)';}if(out){out.style.display='none';out.textContent='';}if(btn){btn.disabled=true;}try{var r=await fetch('/api/takserver/reindex',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({})});var d=await r.json();if(d.success){if(msg){msg.textContent='Done.';msg.style.color='var(--green)';}if(out&&d.output){out.textContent=d.output;out.style.display='block';}}else{if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}if(out&&d.error){out.textContent=d.error;out.style.display='block';}}}catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}}if(btn){btn.disabled=false;}}
 
 var serverLogOffset=0;
 async function pollServerLog(){
@@ -647,7 +663,7 @@ async function setTakHeapCustom(){
     var msgEl=document.getElementById('set-heap-msg');
     if(!input){return;}
     var gb=parseInt(input.value,10);
-    if(isNaN(gb)||gb<2||gb>32){if(msgEl){msgEl.style.color='var(--red)';msgEl.textContent='Enter a value between 2 and 32 GB';}return;}
+    if(isNaN(gb)||gb<2||gb>64){if(msgEl){msgEl.style.color='var(--red)';msgEl.textContent='Enter a value between 2 and 64 GB';}return;}
     _setHeapBtnsDisabled(true);
     if(msgEl)msgEl.textContent='Setting '+gb+' GB…';
     try{
@@ -813,6 +829,9 @@ async function connectLdap(){
         var split=document.getElementById('dep_mode_split');
         if(single)single.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
         if(split)split.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
+        var extdb=document.getElementById('dep_mode_external_db');
+        if(extdb)extdb.addEventListener('change',function(){toggleTwoServerPanel();updateUploadHint();updateDeployModeFirstHint();});
+        loadTakDeploymentConfig();
         fetch('/api/upload/takserver/existing').then(r=>r.json()).then(d=>{
             var hasAny=(d.packages&&d.packages.length)||d.gpg_key||d.policy;
             if(hasAny){
@@ -820,9 +839,11 @@ async function connectLdap(){
                 if(d.gpg_key)uploadedFiles.gpg_key=d.gpg_key;
                 if(d.policy)uploadedFiles.policy=d.policy;
                 var pa=document.getElementById('progress-area');
-                (d.packages||[]).forEach(function(p){pa.insertAdjacentHTML('beforeend','<div class="progress-item"><div style="display:flex;justify-content:space-between;align-items:center"><span style="font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary)">'+p.filename+' ('+p.size_mb+' MB)</span><span style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--green)">\u2713 uploaded</span></div><div class="progress-bar-outer"><div class="progress-bar-inner" style="width:100%;background:var(--green)"></div></div></div>')});
+                var mode=getTakDeploymentMode();
+                (d.packages||[]).forEach(function(p){var eid='existing-'+p.filename.replace(/[^a-zA-Z0-9]/g,'_');var nl=p.filename.toLowerCase();var isSplit=nl.indexOf('-database')!==-1||nl.indexOf('-core')!==-1;var wrong=mode!=='two_server'&&isSplit;var statusColor=wrong?'var(--yellow)':'var(--green)';var statusText=wrong?'\u26a0 wrong package for one-server':'\u2713';pa.insertAdjacentHTML('beforeend','<div class="progress-item" id="'+eid+'"><div style="display:flex;justify-content:space-between;align-items:center"><span style="font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary)">'+p.filename+' ('+p.size_mb+' MB)</span><span style="font-family:JetBrains Mono,monospace;font-size:12px;color:'+statusColor+'">'+statusText+' <span class="remove-upload-btn" data-fn="'+p.filename+'" data-elid="'+eid+'" style="color:var(--red);cursor:pointer;margin-left:4px" title="Remove">\u2717</span></span></div><div class="progress-bar-outer"><div class="progress-bar-inner" style="width:100%;background:'+statusColor+'"></div></div></div>')});
                 if(d.gpg_key){pa.insertAdjacentHTML('beforeend','<div class="progress-item"><div style="display:flex;justify-content:space-between;align-items:center"><span style="font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary)">'+d.gpg_key.filename+'</span><span style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--green)">\u2713 uploaded</span></div><div class="progress-bar-outer"><div class="progress-bar-inner" style="width:100%;background:var(--green)"></div></div></div>')}
                 if(d.policy){pa.insertAdjacentHTML('beforeend','<div class="progress-item"><div style="display:flex;justify-content:space-between;align-items:center"><span style="font-family:JetBrains Mono,monospace;font-size:13px;color:var(--text-secondary)">'+d.policy.filename+'</span><span style="font-family:JetBrains Mono,monospace;font-size:12px;color:var(--green)">\u2713 uploaded</span></div><div class="progress-bar-outer"><div class="progress-bar-inner" style="width:100%;background:var(--green)"></div></div></div>')}
+                pa.querySelectorAll('.remove-upload-btn').forEach(function(btn){btn.onclick=function(ev){ev.stopPropagation();removeFile(btn.getAttribute('data-fn'),btn.getAttribute('data-elid'))}});
                 var a=document.getElementById('upload-area');if(a){a.style.maxHeight='120px';a.style.padding='20px';var ic=a.querySelector('.upload-icon');if(ic)ic.style.display='none'}
                 updateUploadSummary();
                 applyUploadsModeDetection();
@@ -935,10 +956,10 @@ function uploadFile(file){
             if(d.gpg_key)uploadedFiles.gpg_key=d.gpg_key;if(d.policy)uploadedFiles.policy=d.policy;
             var mode=getTakDeploymentMode();
             function allowed(p){var n=(p.filename||'').toLowerCase();var hasCore=n.indexOf('core')!==-1;var hasDb=n.indexOf('database')!==-1;if(mode==='two_server')return hasCore||hasDb;return !hasCore&&!hasDb;}
-            function reject(msg){bar.style.background='var(--red)';pc.style.color='var(--red)';pc.textContent=msg;}
+            function reject(msg,fn){bar.style.background='var(--red)';pc.style.color='var(--red)';pc.textContent=msg;var xBtn=document.createElement('span');xBtn.textContent=' \u2717';xBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px;opacity:0.7';xBtn.title='Dismiss';xBtn.onclick=function(ev){ev.stopPropagation();var row=document.getElementById(id);if(row)row.remove()};pc.appendChild(xBtn);if(fn){fetch('/api/upload/takserver/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:fn})}).catch(function(){})}}
             var added=0;
-            if(d.packages&&d.packages.length){d.packages.forEach(function(p){if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'One-server deploy: only the single takserver .deb accepted.');return;}if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push(p);added++;}});}
-            else if(d.package){var p=d.package;if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'One-server deploy: only the single takserver .deb accepted.');}else if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push({filename:p.filename,filepath:p.filepath,size_mb:p.size_mb});added++;}}
+            if(d.packages&&d.packages.length){d.packages.forEach(function(p){if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'Wrong package — this is a split package (database/core only). Upload the single takserver .deb instead.',p.filename);return;}if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push(p);added++;}});}
+            else if(d.package){var p=d.package;if(!allowed(p)){reject(mode==='two_server'?'Split deploy: only core and database .deb accepted.':'Wrong package — this is a split package (database/core only). Upload the single takserver .deb instead.',p.filename);}else if(!uploadedFiles.packages.some(function(x){return x.filename===p.filename})){uploadedFiles.packages.push({filename:p.filename,filepath:p.filepath,size_mb:p.size_mb});added++;}}
             if(added>0||(d.gpg_key||d.policy)){bar.style.background='var(--green)';pc.style.color='var(--green)';var rBtn=document.createElement('span');rBtn.textContent=' \u2717';rBtn.style.cssText='color:var(--red);cursor:pointer;margin-left:8px';rBtn.title='Remove';rBtn.onclick=function(ev){ev.stopPropagation();removeFile(file.name,id)};pc.textContent='\u2713 ';pc.appendChild(rBtn);updateUploadSummary();applyUploadsModeDetection();}
         }
         else{bar.style.background='var(--red)';pc.textContent='\u2717';pc.style.color='var(--red)'}
@@ -960,13 +981,14 @@ function cancelUpload(id){
 function updateUploadSummary(){
     const r=document.getElementById('upload-results');const fl=document.getElementById('upload-files-list');r.style.display='block';
     let h='';
-    (uploadedFiles.packages||[]).forEach(function(p){h+='<div style="margin-bottom:8px">✓ <span style="color:var(--green)">'+p.filename+'</span> <span style="color:var(--text-dim)">('+p.size_mb+' MB)</span></div>'});
-    if(uploadedFiles.gpg_key)h+='<div style="margin-bottom:8px">✓ <span style="color:var(--green)">'+uploadedFiles.gpg_key.filename+'</span> <span style="color:var(--text-dim)">(GPG key)</span></div>';
-    if(uploadedFiles.policy)h+='<div style="margin-bottom:8px">✓ <span style="color:var(--green)">'+uploadedFiles.policy.filename+'</span> <span style="color:var(--text-dim)">(policy)</span></div>';
+    (uploadedFiles.packages||[]).forEach(function(p){var sid='sum-'+p.filename.replace(/[^a-zA-Z0-9]/g,'_');h+='<div id="'+sid+'" style="margin-bottom:8px;display:flex;align-items:center;gap:8px">✓ <span style="color:var(--green)">'+p.filename+'</span> <span style="color:var(--text-dim)">('+p.size_mb+' MB)</span><span class="sum-remove-btn" data-fn="'+p.filename+'" data-sid="'+sid+'" style="color:var(--red);cursor:pointer;font-size:14px" title="Remove file">\u2717</span></div>'});
+    if(uploadedFiles.gpg_key){var gid='sum-gpg';h+='<div id="'+gid+'" style="margin-bottom:8px;display:flex;align-items:center;gap:8px">✓ <span style="color:var(--green)">'+uploadedFiles.gpg_key.filename+'</span> <span style="color:var(--text-dim)">(GPG key)</span><span class="sum-remove-btn" data-fn="'+uploadedFiles.gpg_key.filename+'" data-sid="'+gid+'" style="color:var(--red);cursor:pointer;font-size:14px" title="Remove file">\u2717</span></div>'}
+    if(uploadedFiles.policy){var pid='sum-pol';h+='<div id="'+pid+'" style="margin-bottom:8px;display:flex;align-items:center;gap:8px">✓ <span style="color:var(--green)">'+uploadedFiles.policy.filename+'</span> <span style="color:var(--text-dim)">(policy)</span><span class="sum-remove-btn" data-fn="'+uploadedFiles.policy.filename+'" data-sid="'+pid+'" style="color:var(--red);cursor:pointer;font-size:14px" title="Remove file">\u2717</span></div>'}
     if(uploadedFiles.gpg_key&&uploadedFiles.policy)h+='<div style="margin-top:12px;color:var(--green)">🔐 GPG verification enabled</div>';
     else if(!uploadedFiles.gpg_key&&!uploadedFiles.policy)h+='<div style="margin-top:12px;color:var(--text-dim)">\u2139 No GPG key/policy - verification will be skipped</div>';
     else h+='<div style="margin-top:12px;color:var(--yellow)">\u26a0 Need both GPG key + policy for verification</div>';
     fl.innerHTML=h;
+    fl.querySelectorAll('.sum-remove-btn').forEach(function(btn){btn.onclick=function(ev){ev.stopPropagation();removeFile(btn.getAttribute('data-fn'),btn.getAttribute('data-sid'))}});
     if(uploadedFiles.packages&&uploadedFiles.packages.length)document.getElementById('deploy-btn-area').style.display='block';
 }
 
@@ -1000,12 +1022,11 @@ function showDeployConfig(){
       '<div class="form-field"><label>Issued cert validity (days)</label><input type="number" id="issued_cert_validity_days" placeholder="Same as intermediate" min="1" max="3652" style="width:120px"> <span style="font-size:11px;color:var(--text-dim)">Blank = same. Shorten anytime in Certificate signing.</span></div>',
       '</div>',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">Certificate password</div>',
-      '<div class="form-field" style="margin-bottom:8px"><label>Keystore / truststore password</label><input type="password" id="cert_password" placeholder="atakatak (default)" autocomplete="new-password" style="width:200px;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"> <span style="font-size:11px;color:var(--text-dim)">Leave blank to use default atakatak. Used for CA keystores and CoreConfig.</span></div>',
+      '<div class="form-field" style="margin-bottom:8px"><label>Keystore / truststore password</label><div style="position:relative;display:inline-block"><input type="password" id="cert_password" placeholder="atakatak (default)" autocomplete="new-password" style="width:240px;padding:8px 56px 8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"><button type="button" id="cert-password-toggle" onclick="toggleSinglePassword(\'cert_password\',\'cert-password-toggle\')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;font-family:JetBrains Mono,monospace">show</button></div> <span style="font-size:11px;color:var(--text-dim)">Leave blank to use default atakatak. Used for CA keystores and CoreConfig.</span></div>',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin:24px 0 20px;text-transform:uppercase;letter-spacing:1px;font-weight:600">WebTAK Options (Port 8446)</div>',
       '<div style="display:flex;flex-direction:column;gap:14px">',
       '<label style="display:flex;align-items:center;gap:10px;color:var(--text-secondary);cursor:pointer;font-size:14px"><input type="checkbox" id="enable_admin_ui" onchange="toggleWebadminPassword()" style="width:18px;height:18px;accent-color:var(--accent)"> Enable Admin UI <span style="color:var(--text-dim);font-size:12px">- Browser admin (no cert needed)</span></label>',
       '<label style="display:flex;align-items:center;gap:10px;color:var(--text-secondary);cursor:pointer;font-size:14px"><input type="checkbox" id="enable_webtak" style="width:18px;height:18px;accent-color:var(--accent)"> Enable WebTAK <span style="color:var(--text-dim);font-size:12px">- Browser-based TAK client</span></label>',
-      '<label style="display:flex;align-items:center;gap:10px;color:var(--text-secondary);cursor:pointer;font-size:14px"><input type="checkbox" id="enable_nonadmin_ui" style="width:18px;height:18px;accent-color:var(--accent)"> Enable Non-Admin UI <span style="color:var(--text-dim);font-size:12px">- Non-admin management</span></label>',
       '</div>',
       '<div id="webadmin-password-area" style="display:none;margin-top:20px;background:rgba(59,130,246,0.05);border:1px solid var(--border);border-radius:10px;padding:18px">',
       '<div style="font-family:\'JetBrains Mono\',monospace;font-size:12px;color:var(--text-dim);margin-bottom:12px">Set a password for <span style="color:var(--cyan)">webadmin</span> user on port 8446</div>',
@@ -1025,10 +1046,14 @@ function showDeployConfig(){
     initTakDeployModeUI(cd);
     var modeChosenOnPage=getTakDeploymentMode();
     loadTakDeploymentConfig().then(function(){
-      var single=document.getElementById('dep_mode_single');
-      var split=document.getElementById('dep_mode_split');
-      if(modeChosenOnPage==='two_server'&&split){split.checked=true;if(single)single.checked=false;}
-      else if(single){single.checked=true;if(split)split.checked=false;}
+      // Only force single/split if the user explicitly chose it before clicking Configure
+      // and the saved config doesn't override it. external_db is always restored from saved config.
+      var restoredMode=getTakDeploymentMode();
+      if(restoredMode==='single_server'&&modeChosenOnPage==='two_server'){
+        var single=document.getElementById('dep_mode_single');
+        var split=document.getElementById('dep_mode_split');
+        if(split){split.checked=true;if(single)single.checked=false;}
+      }
       toggleTwoServerPanel();
       updateUploadHint();
       updateDeployModeFirstHint();
@@ -1037,6 +1062,12 @@ function showDeployConfig(){
 }
 
 function toggleWebadminPassword(){const a=document.getElementById('webadmin-password-area');if(a)a.style.display=document.getElementById('enable_admin_ui').checked?'block':'none'}
+
+function toggleSinglePassword(inputId,toggleId){
+    var i=document.getElementById(inputId);var b=document.getElementById(toggleId);if(!i||!b)return;
+    if(i.type==='password'){i.type='text';b.textContent='hide';}
+    else{i.type='password';b.textContent='show';}
+}
 
 function toggleShowPassword(){const p=document.getElementById('webadmin_password');const c=document.getElementById('webadmin_password_confirm');const b=document.getElementById('pw-toggle');if(p.type==='password'){p.type='text';c.type='text';b.textContent='hide'}else{p.type='password';c.type='password';b.textContent='show'}}
 
@@ -1098,11 +1129,44 @@ function initTakDeployModeUI(rootEl){
       '<div id="two-server-runbook" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap"></div>',
       '</div>'
     ].join('');
-    card.insertAdjacentHTML('afterbegin',html);
+    // External / managed database panel
+    var extHtml=[
+      '<div id="external-db-config-panel" style="display:none;margin-bottom:20px;padding:16px;background:rgba(20,184,166,0.06);border:1px solid var(--border);border-radius:10px">',
+      '<div style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-dim);margin-bottom:12px;text-transform:uppercase;letter-spacing:1px;font-weight:600">External / Managed Database</div>',
+      '<div style="font-size:12px;color:var(--text-dim);margin-bottom:10px">TAK Server runs on this VM. PostgreSQL is hosted externally (AWS RDS, Azure Database, etc.). infra-TAK skips all Server One steps and points CoreConfig.xml at your endpoint.</div>',
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:12px">',
+      '<div class="form-field"><label>DB Endpoint (host / FQDN)</label><input type="text" id="edb_host" placeholder="mydb.xxx.rds.amazonaws.com"></div>',
+      '<div class="form-field"><label>Port</label><input type="number" id="edb_port" value="5432"></div>',
+      '<div class="form-field"><label>Database Name</label><input type="text" id="edb_name" value="cot"></div>',
+      '<div class="form-field"><label>Username</label><input type="text" id="edb_user" value="martiuser"></div>',
+      '</div>',
+      '<div class="form-field" style="margin-bottom:12px"><label>App User Password</label><div style="position:relative"><input type="password" id="edb_password" placeholder="DB user password (leave blank to auto-generate)" autocomplete="off" style="width:100%;padding:8px 48px 8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"><button type="button" id="edb-password-toggle" onclick="toggleSinglePassword(\'edb_password\',\'edb-password-toggle\')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;font-family:JetBrains Mono,monospace">show</button></div></div>',
+      '<div style="margin:14px 0 10px;padding:12px;background:rgba(99,102,241,0.06);border:1px solid rgba(99,102,241,0.2);border-radius:8px">',
+      '<div style="font-size:11px;color:var(--text-dim);margin-bottom:8px;text-transform:uppercase;letter-spacing:0.5px;font-weight:600">Provision Database — Admin Credentials</div>',
+      '<div style="font-size:11px;color:var(--text-dim);margin-bottom:10px">Used once to create the app user and grant permissions. Not stored.</div>',
+      '<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:10px">',
+      '<div class="form-field"><label>Admin Username</label><input type="text" id="edb_admin_user" value="postgres" autocomplete="off" style="width:100%;padding:8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"></div>',
+      '<div class="form-field"><label>Admin Password</label><div style="position:relative"><input type="password" id="edb_admin_pass" placeholder="RDS master password" autocomplete="off" style="width:100%;padding:8px 48px 8px 12px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:12px"><button type="button" id="edb-admin-pass-toggle" onclick="toggleSinglePassword(\'edb_admin_pass\',\'edb-admin-pass-toggle\')" style="position:absolute;right:10px;top:50%;transform:translateY(-50%);background:none;border:none;color:var(--text-dim);cursor:pointer;font-size:12px;font-family:JetBrains Mono,monospace">show</button></div></div>',
+      '</div>',
+      '<button type="button" onclick="provisionExternalDb()" id="edb_provision_btn" style="padding:8px 14px;background:rgba(99,102,241,0.2);color:#a5b4fc;border:1px solid rgba(99,102,241,0.3);border-radius:8px;font-size:12px;cursor:pointer">3. Provision Database (create user &amp; grants)</button>',
+      '<div id="external-db-provision-log" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap;color:var(--text-secondary)"></div>',
+      '</div>',
+      '<div style="display:flex;gap:10px;flex-wrap:wrap;margin-top:10px">',
+      '<button type="button" onclick="saveExternalDbConfig()" style="padding:8px 14px;background:rgba(20,184,166,0.15);color:var(--teal,#14b8a6);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">1. Save Config</button>',
+      '<button type="button" onclick="testExternalDbConnection()" style="padding:8px 14px;background:rgba(59,130,246,0.15);color:var(--accent);border:1px solid var(--border);border-radius:8px;font-size:12px;cursor:pointer">2. Test Connection</button>',
+      '<div style="font-size:11px;color:var(--text-dim);align-self:center">Then fill Certificate Information below and click Deploy TAK Server.</div>',
+      '</div>',
+      '<div id="external-db-msg" style="margin-top:10px;font-size:12px;color:var(--text-dim)"></div>',
+      '<div id="external-db-checks" style="display:none;margin-top:10px;background:#0c0f1a;border:1px solid var(--border);border-radius:8px;padding:12px;font-family:\'JetBrains Mono\',monospace;font-size:11px;white-space:pre-wrap"></div>',
+      '</div>'
+    ].join('');
+    card.insertAdjacentHTML('afterbegin',html+extHtml);
     var single=document.getElementById('dep_mode_single');
     var split=document.getElementById('dep_mode_split');
+    var extdb=document.getElementById('dep_mode_external_db');
     if(single)single.addEventListener('change',toggleTwoServerPanel);
     if(split)split.addEventListener('change',toggleTwoServerPanel);
+    if(extdb)extdb.addEventListener('change',toggleTwoServerPanel);
     toggleTwoServerPanel();
     toggleServerTwoLocal();
 }
@@ -1116,9 +1180,9 @@ function updateDeployModeFirstHint(){
     var el=document.getElementById('deploy-mode-first-hint');
     if(!el)return;
     var mode=getTakDeploymentMode();
-    el.textContent=(mode==='two_server')
-      ?'Split mode: upload both takserver-database and takserver-core packages (optional: .pol + .key).'
-      :'One server: upload the single takserver package (optional: .pol + .key).';
+    if(mode==='two_server')el.textContent='Split mode: upload both takserver-database and takserver-core packages (optional: .pol + .key).';
+    else if(mode==='external_db')el.textContent='External DB mode: upload the single takserver .deb — PostgreSQL is your managed cloud endpoint.';
+    else el.textContent='One server: upload the single takserver package (optional: .pol + .key).';
 }
 
 function packageHasDatabase(fn){return fn&&String(fn).toLowerCase().indexOf('database')!==-1;}
@@ -1145,8 +1209,10 @@ function validateUploadsForMode(){
     if(!hasBothSplitPackages())return{ok:false,message:'Split server requires both takserver-database and takserver-core packages. Upload both, or switch to One Server and upload the single takserver package.'};
     return{ok:true};
   }
+  // single_server and external_db both require the full combined package
   if(hasOnlySplitPackages()||pkg.some(function(p){return packageHasCore(p.filename)||packageHasDatabase(p.filename);})){
-    return{ok:false,message:'You chose One Server but uploaded split packages (core and/or database). For One Server upload the single takserver .deb/.rpm. Or switch to Split Server and upload both database and core.'};
+    var modeLabel=(mode==='external_db')?'External DB':'One Server';
+    return{ok:false,message:'You chose '+modeLabel+' but uploaded split packages (core and/or database). Upload the single combined takserver .deb/.rpm instead. Or switch to Split Server.'};
   }
   return{ok:true};
 }
@@ -1164,6 +1230,10 @@ function updateUploadHint(){
       if(ubuntu)html='<strong style="color:var(--text-secondary)">Split server (Ubuntu) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver-database_X.X_all.deb</span> and <span style="color:var(--cyan)">takserver-core_X.X_all.deb</span><br>Optional: <span style="color:var(--text-secondary)">deb_policy.pol</span> + <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
       else if(rocky)html='<strong style="color:var(--text-secondary)">Split server (Rocky/RHEL) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver-database</span> and <span style="color:var(--cyan)">takserver-core</span> .rpm<br>Optional: <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
       else html='<strong style="color:var(--text-secondary)">Split server:</strong><br>Required: <span style="color:var(--cyan)">takserver-database</span> and <span style="color:var(--cyan)">takserver-core</span> .deb or .rpm<br>Optional: .pol + .key'+line2;
+    }else if(mode==='external_db'){
+      if(ubuntu)html='<strong style="color:var(--text-secondary)">External DB (Ubuntu) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver_X.X_all.deb</span> (full package, not core/database split)<br>Optional: <span style="color:var(--text-secondary)">deb_policy.pol</span> + <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
+      else if(rocky)html='<strong style="color:var(--text-secondary)">External DB (Rocky/RHEL) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver-X.X.noarch.rpm</span> (full package)<br>Optional: <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
+      else html='<strong style="color:var(--text-secondary)">External DB:</strong><br>Required: full <span style="color:var(--cyan)">takserver</span> .deb or .rpm (not the split core/database packages)<br>Optional: .pol + .key'+line2;
     }else{
       if(ubuntu)html='<strong style="color:var(--text-secondary)">One server (Ubuntu) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver_X.X_all.deb</span><br>Optional: <span style="color:var(--text-secondary)">deb_policy.pol</span> + <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
       else if(rocky)html='<strong style="color:var(--text-secondary)">One server (Rocky/RHEL) — from tak.gov:</strong><br>Required: <span style="color:var(--cyan)">takserver-X.X.noarch.rpm</span><br>Optional: <span style="color:var(--text-secondary)">takserver-public-gpg.key</span>'+line2;
@@ -1174,13 +1244,15 @@ function updateUploadHint(){
 
 function toggleTwoServerPanel(){
     var mode=getTakDeploymentMode();
-    var panel=document.getElementById('two-server-config-panel');
+    var splitPanel=document.getElementById('two-server-config-panel');
+    var extPanel=document.getElementById('external-db-config-panel');
     var hint=document.getElementById('dep_mode_hint');
-    if(panel)panel.style.display=(mode==='two_server'?'block':'none');
+    if(splitPanel)splitPanel.style.display=(mode==='two_server'?'block':'none');
+    if(extPanel)extPanel.style.display=(mode==='external_db'?'block':'none');
     if(hint){
-      hint.textContent=(mode==='two_server')
-        ?'Split mode selected. Save config, run preflight, then apply Server One and Server Two steps in order.'
-        :'One server selected. This path is recommended up to ~500 concurrent users.';
+      if(mode==='two_server')hint.textContent='Split mode selected. Save config, run preflight, then apply Server One and Server Two steps in order.';
+      else if(mode==='external_db')hint.textContent='External DB mode selected. Configure your managed database endpoint, test the connection, then deploy TAK Server.';
+      else hint.textContent='One server selected. This path is recommended up to ~500 concurrent users.';
     }
     updateUploadHint();
 }
@@ -1237,6 +1309,13 @@ function collectTakDeploymentConfigFromForm(){
         name:(document.getElementById('ts_db_name')||{}).value||'cot',
         user:(document.getElementById('ts_db_user')||{}).value||'martiuser',
         password:(document.getElementById('ts_db_password')||{}).value||''
+      },
+      external_db:{
+        host:(document.getElementById('edb_host')||{}).value||'',
+        port:parseInt((document.getElementById('edb_port')||{}).value||'5432',10),
+        name:(document.getElementById('edb_name')||{}).value||'cot',
+        user:(document.getElementById('edb_user')||{}).value||'martiuser',
+        password:(document.getElementById('edb_password')||{}).value||''
       }
     };
 }
@@ -1246,6 +1325,8 @@ function populateTakDeploymentConfigForm(cfg){
     takDeploymentConfigCache=cfg;
     if(cfg.mode==='two_server'){
       var split=document.getElementById('dep_mode_split');if(split)split.checked=true;
+    }else if(cfg.mode==='external_db'){
+      var extdb=document.getElementById('dep_mode_external_db');if(extdb)extdb.checked=true;
     }else{
       var single=document.getElementById('dep_mode_single');if(single)single.checked=true;
     }
@@ -1271,6 +1352,13 @@ function populateTakDeploymentConfigForm(cfg){
     set('ts_db_password',cfg.database&&cfg.database.password);
     var pwHint=document.getElementById('ts_db_password_hint');
     if(pwHint){pwHint.textContent=(cfg.database&&cfg.database.password)?'✓ DB password saved (from step 4). Step 5 and Deploy TAK Server will use it.':'Step 4 reads this from Server One over SSH when it deploys. Paste here only if step 4 could not read it.';}
+    // External DB fields
+    var edb=cfg.external_db||{};
+    set('edb_host',edb.host);
+    set('edb_port',edb.port||5432);
+    set('edb_name',edb.name||'cot');
+    set('edb_user',edb.user||'martiuser');
+    set('edb_password',edb.password);
     toggleTwoServerAuthInputs('one');
     toggleTwoServerAuthInputs('two');
     toggleServerTwoLocal();
@@ -1287,18 +1375,86 @@ async function loadTakDeploymentConfig(){
 }
 
 async function saveTakDeploymentConfig(silent){
-    var msg=document.getElementById('two-server-msg');
+    var mode=getTakDeploymentMode();
+    var msg=document.getElementById(mode==='external_db'?'external-db-msg':'two-server-msg');
     try{
       var cfg=collectTakDeploymentConfigFromForm();
       var r=await fetch('/api/takserver/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
       var d=await r.json();
       if(!d.success)throw new Error(d.error||'Save failed');
       takDeploymentConfigCache=d.config;
-      if(msg&&!silent){msg.textContent='✓ Split config saved';msg.style.color='var(--green)';}
+      if(msg&&!silent){msg.textContent='✓ Config saved';msg.style.color='var(--green)';}
       return d.config;
     }catch(e){
       if(msg&&!silent){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
       throw e;
+    }
+}
+
+async function saveExternalDbConfig(silent){
+    return saveTakDeploymentConfig(silent);
+}
+
+async function testExternalDbConnection(){
+    var msg=document.getElementById('external-db-msg');
+    var out=document.getElementById('external-db-checks');
+    if(msg){msg.textContent='Testing connection…';msg.style.color='var(--cyan)';}
+    try{
+      var cfg=await saveExternalDbConfig(true);
+      if(out){out.style.display='block';out.textContent='Connecting…';}
+      var r=await fetch('/api/takserver/external-db/test-connection',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:cfg})});
+      var d=await r.json();
+      var lines=['External DB Connection Test ─ '+d.host+':'+d.port];
+      (d.checks||[]).forEach(function(c){
+        var icon=c.ok===null?'[SKIP] ':(c.ok?'[OK]   ':'[FAIL] ');
+        lines.push(icon+c.name+(c.detail?' — '+c.detail:''));
+      });
+      if(out)out.textContent=lines.join('\n');
+      if(msg){msg.textContent=d.success?'✓ Connection OK':'⚠ Connection check failed — review results above';msg.style.color=d.success?'var(--green)':'var(--yellow)';}
+    }catch(e){
+      if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
+      if(out){out.style.display='block';out.textContent=e.message;}
+    }
+}
+
+async function provisionExternalDb(){
+    var msg=document.getElementById('external-db-msg');
+    var logEl=document.getElementById('external-db-provision-log');
+    var btn=document.getElementById('edb_provision_btn');
+    var adminUser=(document.getElementById('edb_admin_user')||{}).value||'postgres';
+    var adminPass=(document.getElementById('edb_admin_pass')||{}).value||'';
+    if(!adminPass){if(msg){msg.textContent='✗ Admin password is required to provision';msg.style.color='var(--red)';}return;}
+    if(btn)btn.disabled=true;
+    if(msg){msg.textContent='Provisioning database user…';msg.style.color='var(--cyan)';}
+    if(logEl){logEl.style.display='block';logEl.textContent='Starting…';}
+    try{
+      var cfg=await saveExternalDbConfig(true);
+      var edb=(cfg&&cfg.external_db)||{};
+      var body={
+        db_host:edb.host||'',db_port:edb.port||5432,db_name:edb.name||'cot',
+        app_user:edb.user||'martiuser',app_pass:edb.password||'',
+        admin_user:adminUser,admin_pass:adminPass,config:cfg
+      };
+      var r=await fetch('/api/takserver/external-db/provision',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+      var d=await r.json();
+      if(logEl)logEl.textContent=(d.log||[]).join('\n');
+      if(d.success){
+        if(msg){msg.textContent='✓ Database provisioned — ready to Test Connection and Deploy';msg.style.color='var(--green)';}
+        // If server generated a password, fill it into the password field
+        if(d.generated_pass&&d.app_pass){
+          var pwEl=document.getElementById('edb_password');
+          if(pwEl)pwEl.value=d.app_pass;
+          if(logEl)logEl.textContent+=(logEl.textContent?'\n':'')+'\n  ↳ Auto-generated password filled into App User Password field — click Save Config.';
+          await saveExternalDbConfig(true);
+        }
+      }else{
+        if(msg){msg.textContent='✗ '+(d.error||'Provision failed');msg.style.color='var(--red)';}
+      }
+    }catch(e){
+      if(msg){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
+      if(logEl){logEl.style.display='block';logEl.textContent=e.message;}
+    }finally{
+      if(btn)btn.disabled=false;
     }
 }
 
@@ -1455,8 +1611,9 @@ async function startDeploy(){
     if(issVal!=null&&(isNaN(issVal)||issVal<1))issVal=null;
     var certPwEl=document.getElementById('cert_password');
     var certPw=certPwEl?(certPwEl.value||'').trim():'';
-    const cfg={cert_country:document.getElementById('cert_country').value.toUpperCase(),cert_state:document.getElementById('cert_state').value.toUpperCase(),cert_city:document.getElementById('cert_city').value.toUpperCase(),cert_org:document.getElementById('cert_org').value.toUpperCase(),cert_ou:document.getElementById('cert_ou').value.toUpperCase(),root_ca_name:document.getElementById('root_ca_name').value.toUpperCase(),intermediate_ca_name:document.getElementById('intermediate_ca_name').value.toUpperCase(),intermediate_ca_validity_days:intVal,issued_cert_validity_days:issVal!=null?issVal:'',cert_password:certPw||undefined,enable_admin_ui:document.getElementById('enable_admin_ui').checked,enable_webtak:document.getElementById('enable_webtak').checked,enable_nonadmin_ui:document.getElementById('enable_nonadmin_ui').checked,webadmin_password:aui?document.getElementById('webadmin_password').value:'',deployment_mode:deploymentMode};
+    const cfg={cert_country:document.getElementById('cert_country').value.toUpperCase(),cert_state:document.getElementById('cert_state').value.toUpperCase(),cert_city:document.getElementById('cert_city').value.toUpperCase(),cert_org:document.getElementById('cert_org').value.toUpperCase(),cert_ou:document.getElementById('cert_ou').value.toUpperCase(),root_ca_name:document.getElementById('root_ca_name').value.toUpperCase(),intermediate_ca_name:document.getElementById('intermediate_ca_name').value.toUpperCase(),intermediate_ca_validity_days:intVal,issued_cert_validity_days:issVal!=null?issVal:'',cert_password:certPw||undefined,enable_admin_ui:document.getElementById('enable_admin_ui').checked,enable_webtak:document.getElementById('enable_webtak').checked,webadmin_password:aui?document.getElementById('webadmin_password').value:'',deployment_mode:deploymentMode};
     document.getElementById('deploy-log-area').style.display='block';
+    if(typeof initLogToolbar==='function')initLogToolbar('deploy-log');
     try{const r=await fetch('/api/deploy/takserver',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(cfg)});const d=await r.json();if(d.success)pollDeployLog();else{document.getElementById('deploy-log').textContent='✗ '+d.error;btn.disabled=false;btn.textContent='🚀 Deploy TAK Server';btn.style.opacity='1';btn.style.cursor='pointer'}}
     catch(e){document.getElementById('deploy-log').textContent='✗ '+e.message}
 }
@@ -1834,3 +1991,306 @@ function pollMigrateLog(){
 }
 if(document.body.getAttribute('data-tak-migrating')==='true' && document.getElementById('db-migrate-log')){migrateLogIndex=0;pollMigrateLog();}
 if(document.getElementById('db-migrate-deb-panel')){refreshDbMigrateDebStatus();}
+
+/* ── Federation section ─────────────────────────────────────────────── */
+var _fedInfo=null;
+function loadFederationInfo(){
+  fetch('/api/takserver/federation-info',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    _fedInfo=d;
+    var dot=document.getElementById('fed-v2-status');
+    var lbl=document.getElementById('fed-v2-label');
+    var portLbl=document.getElementById('fed-v2-port-label');
+    if(d.v2_enabled){
+      if(dot)dot.style.background='var(--green)';
+      if(lbl)lbl.textContent='Enabled';
+      if(portLbl)portLbl.textContent='Port '+d.v2_port;
+    }else{
+      if(dot)dot.style.background='var(--red)';
+      if(lbl)lbl.textContent='Not enabled';
+      if(portLbl)portLbl.textContent=d.v2_port?'Port '+d.v2_port+' (disabled)':'Enable V2 in Web Admin → Federation';
+    }
+    var fwDot=document.getElementById('fed-fw-status');
+    var fwLbl=document.getElementById('fed-fw-label');
+    var fwBtn=document.getElementById('fed-fw-btn');
+    if(!d.v2_port){
+      if(fwDot)fwDot.style.background='var(--text-dim)';
+      if(fwLbl)fwLbl.textContent='No federation port detected';
+      if(fwBtn){fwBtn.disabled=true;fwBtn.textContent='N/A';}
+    }else if(d.firewall_open){
+      if(fwDot)fwDot.style.background='var(--green)';
+      if(fwLbl)fwLbl.textContent='Port '+d.v2_port+' open (accepting inbound)';
+      if(fwBtn){fwBtn.disabled=false;fwBtn.textContent='Close port '+d.v2_port;fwBtn.setAttribute('data-action','close');}
+    }else{
+      if(fwDot)fwDot.style.background='var(--yellow, #eab308)';
+      if(fwLbl)fwLbl.textContent='Port '+d.v2_port+' closed (no inbound)';
+      if(fwBtn){fwBtn.disabled=false;fwBtn.textContent='Open port '+d.v2_port;fwBtn.setAttribute('data-action','open');}
+    }
+    var caBtn=document.getElementById('fed-ca-download');
+    var caMsg=document.getElementById('fed-ca-msg');
+    if(!d.ca_exists){
+      if(caBtn)caBtn.style.opacity='0.4';
+      if(caMsg)caMsg.textContent='ca.pem not found — deploy TAK Server first';
+    }
+  }).catch(function(){});
+}
+function toggleFedFirewall(){
+  if(!_fedInfo||!_fedInfo.v2_port)return;
+  var btn=document.getElementById('fed-fw-btn');
+  var msg=document.getElementById('fed-fw-msg');
+  var action=btn?btn.getAttribute('data-action')||'open':'open';
+  if(btn)btn.disabled=true;
+  if(msg){msg.textContent=action==='open'?'Opening...':'Closing...';msg.style.color='var(--text-dim)';}
+  fetch('/api/takserver/federation-firewall',{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({port:_fedInfo.v2_port,action:action})}).then(function(r){return r.json();}).then(function(d){
+    if(!d.success){if(msg){msg.textContent=d.error||'Failed';msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+    if(msg){msg.textContent=action==='open'?'Port opened':'Port closed';msg.style.color='var(--green)';}
+    loadFederationInfo();
+  }).catch(function(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;});
+}
+if(document.getElementById('federation-body')){loadFederationInfo();}
+
+/* ── TAK Server Plugins ─────────────────────────────────────────────── */
+var _takPluginPendingFiles=[],_takPluginLogIdx=0,_takPluginLogInterval=null;
+
+function takTogglePlugins(){
+  var body=document.getElementById('tak-plugins-body');
+  var icon=document.getElementById('tak-plugins-toggle-icon');
+  if(!body)return;
+  var show=body.style.display==='none';
+  body.style.display=show?'block':'none';
+  if(icon)icon.style.transform=show?'rotate(180deg)':'';
+  if(show)loadPlugins();
+}
+
+function loadPlugins(){
+  var el=document.getElementById('tak-plugins-list');
+  if(!el)return;
+  el.textContent='Loading...';
+  fetch('/api/takserver/plugins/list',{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+    if(!d.plugins||!d.plugins.length){
+      el.innerHTML='<span style="color:var(--text-dim)">No plugins installed. Upload a .jar to get started.</span>';
+      return;
+    }
+    var rows=d.plugins.map(function(p){
+      var name=p.jar||p.classname||'Unknown';
+      var configLabel=p.has_config
+        ?'<span style="color:var(--green);font-size:11px">&#10003; config</span>'
+        :'<span style="color:var(--text-dim);font-size:11px">no config yet</span>';
+      var classKey=p.classname||'';
+      var jarKey=p.jar||'';
+      var configBtn=classKey
+        ?'<button type="button" onclick="takPluginToggleConfig(\''+classKey+'\')" style="padding:4px 10px;background:transparent;color:var(--cyan);border:1px solid var(--border);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Edit config</button>'
+        :'';
+      var removeBtn=jarKey
+        ?'<button type="button" onclick="takPluginRemove(\''+jarKey+'\')" style="padding:4px 10px;background:transparent;color:var(--red);border:1px solid rgba(239,68,68,0.3);border-radius:6px;font-size:11px;cursor:pointer;font-family:\'JetBrains Mono\',monospace">Remove</button>'
+        :'';
+      var configSection=classKey
+        ?'<div id="tak-plugin-cfg-'+classKey+'" style="display:none;margin-top:10px;padding:12px;background:rgba(6,182,212,0.04);border:1px solid var(--border);border-radius:8px">'
+          +'<div style="font-size:11px;color:var(--text-dim);margin-bottom:6px;font-family:\'JetBrains Mono\',monospace">'+classKey+'.yaml</div>'
+          +'<textarea id="tak-plugin-cfg-txt-'+classKey+'" style="width:100%;min-height:140px;background:#0a0e1a;border:1px solid var(--border);border-radius:6px;color:var(--text-primary);font-family:\'JetBrains Mono\',monospace;font-size:11px;padding:10px;box-sizing:border-box;resize:vertical" spellcheck="false"></textarea>'
+          +'<div style="display:flex;align-items:center;gap:10px;margin-top:8px">'
+          +'<button type="button" onclick="takPluginSaveConfig(\''+classKey+'\')" style="padding:6px 14px;background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff;border:none;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer">Save</button>'
+          +'<span id="tak-plugin-cfg-msg-'+classKey+'" style="font-size:11px;color:var(--text-dim)"></span>'
+          +'</div>'
+          +'</div>'
+        :'';
+      return '<div style="padding:10px 14px;background:rgba(6,182,212,0.03);border:1px solid var(--border);border-radius:8px;margin-bottom:8px">'
+        +'<div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">'
+        +'<div><span style="font-family:\'JetBrains Mono\',monospace;font-size:13px;color:var(--text-primary)">'+name+'</span> '+configLabel+'</div>'
+        +'<div style="display:flex;gap:6px">'+configBtn+' '+removeBtn+'</div>'
+        +'</div>'
+        +configSection
+        +'</div>';
+    });
+    el.innerHTML=rows.join('');
+  }).catch(function(){el.textContent='Could not load plugin list.';});
+}
+
+function takPluginToggleConfig(classname){
+  var panel=document.getElementById('tak-plugin-cfg-'+classname);
+  if(!panel)return;
+  var showing=panel.style.display==='block';
+  panel.style.display=showing?'none':'block';
+  if(!showing){
+    var txt=document.getElementById('tak-plugin-cfg-txt-'+classname);
+    var msg=document.getElementById('tak-plugin-cfg-msg-'+classname);
+    if(txt)txt.value='Loading...';
+    fetch('/api/takserver/plugins/config/'+encodeURIComponent(classname),{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      if(!txt)return;
+      if(d.exists){txt.value=d.content;}
+      else{txt.value='';if(msg){msg.textContent='Config will be generated on first run after restart';msg.style.color='var(--text-dim)';}}
+    }).catch(function(){if(txt)txt.value='';});
+  }
+}
+
+async function takPluginSaveConfig(classname){
+  var txt=document.getElementById('tak-plugin-cfg-txt-'+classname);
+  var msg=document.getElementById('tak-plugin-cfg-msg-'+classname);
+  if(!txt||!msg)return;
+  msg.textContent='Saving...';msg.style.color='var(--text-dim)';
+  try{
+    var r=await fetch('/api/takserver/plugins/config/'+encodeURIComponent(classname),{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:txt.value})});
+    var d=await r.json();
+    if(d.success){msg.textContent='\u2713 Saved — restart TAK Server to apply';msg.style.color='var(--green)';}
+    else{msg.textContent=d.error||'Save failed';msg.style.color='var(--red)';}
+  }catch(e){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}
+}
+
+function takPluginDrop(e){
+  e.preventDefault();
+  var area=document.getElementById('tak-plugin-upload-area');
+  if(area)area.classList.remove('dragover');
+  var files=e.dataTransfer&&e.dataTransfer.files;
+  if(files&&files.length)_takPluginSetFiles(Array.from(files));
+}
+
+function takPluginFileChange(e){
+  var files=e.target&&e.target.files;
+  if(files&&files.length)_takPluginSetFiles(Array.from(files));
+  if(e.target)e.target.value='';
+}
+
+function _takPluginSetFiles(incoming){
+  var msg=document.getElementById('tak-plugin-install-msg');
+  var btn=document.getElementById('tak-plugin-install-btn');
+  var listEl=document.getElementById('tak-plugin-upload-filelist');
+  var txtEl=document.getElementById('tak-plugin-upload-text');
+  var bad=incoming.filter(function(f){var n=(f.name||'').toLowerCase();return !n.endsWith('.jar')&&!n.endsWith('.yaml');});
+  if(bad.length){if(msg){msg.textContent='Only .jar and .yaml files are accepted';msg.style.color='var(--red)';}return;}
+  // Merge with existing queue (replace same-type duplicate)
+  incoming.forEach(function(f){
+    var t=(f.name||'').toLowerCase().endsWith('.jar')?'jar':'yaml';
+    _takPluginPendingFiles=_takPluginPendingFiles.filter(function(p){return p.type!==t;});
+    _takPluginPendingFiles.push({file:f,type:t});
+  });
+  // Render file list
+  if(listEl){
+    listEl.style.display='flex';
+    listEl.innerHTML=_takPluginPendingFiles.map(function(p){
+      return '<div style="display:flex;align-items:center;gap:8px">'
+        +'<span style="font-family:\'JetBrains Mono\',monospace;font-size:12px;color:var(--cyan)">'+p.file.name+'</span>'
+        +'<span style="font-size:10px;color:var(--text-dim);background:rgba(6,182,212,0.08);border:1px solid var(--border);border-radius:4px;padding:1px 6px">'+p.type+'</span>'
+        +'</div>';
+    }).join('');
+  }
+  if(txtEl)txtEl.style.display=_takPluginPendingFiles.length?'none':'block';
+  if(btn)btn.disabled=_takPluginPendingFiles.length===0;
+  if(msg){msg.textContent='';msg.style.color='';}
+}
+
+async function takPluginInstall(){
+  var btn=document.getElementById('tak-plugin-install-btn');
+  var msg=document.getElementById('tak-plugin-install-msg');
+  var logWrap=document.getElementById('tak-plugin-log-wrap');
+  var logEl=document.getElementById('tak-plugin-log');
+  if(!_takPluginPendingFiles.length){if(msg){msg.textContent='Select a file first';msg.style.color='var(--red)';}return;}
+  if(btn)btn.disabled=true;
+  // Sort: install YAML after JAR so config is present when JAR runs
+  var queue=_takPluginPendingFiles.slice().sort(function(a,b){return a.type==='jar'?-1:1;});
+  var jarDone=false;
+  for(var i=0;i<queue.length;i++){
+    var item=queue[i];
+    if(msg){msg.textContent='Uploading '+item.file.name+'…';msg.style.color='var(--text-dim)';}
+    try{
+      var fd=new FormData();
+      fd.append('file',item.file);
+      var r=await fetch('/api/upload/takserver-plugin',{method:'POST',credentials:'same-origin',body:fd});
+      var d=await r.json();
+      if(!d.success){if(msg){msg.textContent=d.error||'Upload failed';msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+      if(msg){msg.textContent='Installing '+item.file.name+'…';msg.style.color='var(--text-dim)';}
+      var installUrl=item.type==='jar'?'/api/takserver/plugins/install-jar':'/api/takserver/plugins/install-yaml';
+      var r2=await fetch(installUrl,{method:'POST',credentials:'same-origin',headers:{'Content-Type':'application/json'},body:JSON.stringify({filename:d.filename})});
+      var d2=await r2.json();
+      if(!d2.success){if(msg){msg.textContent=d2.error||'Install failed';msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+      if(item.type==='yaml'){
+        // YAML installs instantly — no log needed
+        if(i===queue.length-1&&!jarDone){
+          if(msg){msg.textContent='\u2713 Config file installed';msg.style.color='var(--green)';}
+          _takPluginShowRestartBanner();
+          if(btn)btn.disabled=false;
+          loadPlugins();
+        }
+      } else {
+        // JAR — poll log; after log completes, loop continues to install YAML if present
+        jarDone=true;
+        if(logWrap)logWrap.style.display='block';
+        if(logEl)logEl.textContent='Connecting...';
+        _takPluginLogIdx=0;
+        if(msg){msg.textContent='';msg.style.color='';}
+        await new Promise(function(resolve){
+          _takPluginPollLogOnce(resolve);
+        });
+      }
+    }catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}if(btn)btn.disabled=false;return;}
+  }
+  // All done
+  _takPluginPendingFiles=[];
+  var listEl=document.getElementById('tak-plugin-upload-filelist');
+  var txtEl=document.getElementById('tak-plugin-upload-text');
+  if(listEl){listEl.style.display='none';listEl.innerHTML='';}
+  if(txtEl)txtEl.style.display='block';
+  var allYaml=queue.every(function(p){return p.type==='yaml';});
+  if(allYaml){if(msg){msg.textContent='\u2713 Config file installed';msg.style.color='var(--green)';}}
+  else{if(msg){msg.textContent='\u2713 Plugin installed';msg.style.color='var(--green)';}}
+  _takPluginShowRestartBanner();
+  if(btn)btn.disabled=false;
+  loadPlugins();
+}
+
+function _takPluginPollLog(){
+  _takPluginPollLogOnce(null);
+}
+
+function _takPluginPollLogOnce(onDone){
+  var logEl=document.getElementById('tak-plugin-log');
+  var msg=document.getElementById('tak-plugin-install-msg');
+  var btn=document.getElementById('tak-plugin-install-btn');
+  function poll(){
+    fetch('/api/takserver/plugins/install/log?index='+_takPluginLogIdx,{credentials:'same-origin'}).then(function(r){return r.json();}).then(function(d){
+      if(d.entries&&d.entries.length){if(_takPluginLogIdx===0&&logEl)logEl.textContent='';if(logEl){logEl.textContent+=d.entries.join('\n')+'\n';logEl.scrollTop=logEl.scrollHeight;}_takPluginLogIdx=d.total;}
+      if(!d.running){
+        if(d.complete){
+          if(!onDone&&msg){msg.textContent='\u2713 Installed';msg.style.color='var(--green)';}
+          if(!onDone){_takPluginShowRestartBanner();loadPlugins();if(btn)btn.disabled=false;}
+        }else if(d.error){
+          if(msg){msg.textContent='Install failed';msg.style.color='var(--red)';}
+          if(!onDone&&btn)btn.disabled=false;
+        }
+        if(onDone)onDone();
+      }else{setTimeout(poll,800);}
+    }).catch(function(){setTimeout(poll,1500);});
+  }
+  poll();
+}
+
+function _takPluginShowRestartBanner(){
+  var banner=document.getElementById('tak-plugins-restart-banner');
+  if(banner)banner.style.display='flex';
+}
+
+async function takPluginRestartNow(btn){
+  if(!confirm('Restart TAK Server now to apply plugin changes?'))return;
+  if(btn){btn.disabled=true;btn.textContent='Restarting\u2026';}
+  try{
+    await fetch('/api/takserver/control',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({action:'restart',target:'core'})});
+    sessionStorage.setItem('tak_just_started','1');
+    window.location.reload();
+  }catch(e){
+    if(btn){btn.disabled=false;btn.textContent='\u21BB Restart Now';}
+    alert('Restart failed: '+e.message);
+  }
+}
+
+async function takPluginRemove(jarname){
+  if(!confirm('Remove '+jarname+' and its config file?\n\nTAK Server will need a restart.')){return;}
+  var msg=document.getElementById('tak-plugin-install-msg');
+  if(msg){msg.textContent='Removing...';msg.style.color='var(--text-dim)';}
+  try{
+    var r=await fetch('/api/takserver/plugins/remove/'+encodeURIComponent(jarname),{method:'POST',credentials:'same-origin'});
+    var d=await r.json();
+    if(d.success){
+      if(msg){msg.textContent='\u2713 Removed';msg.style.color='var(--green)';}
+      _takPluginShowRestartBanner();
+      loadPlugins();
+    }else{if(msg){msg.textContent=d.error||'Remove failed';msg.style.color='var(--red)';}}
+  }catch(e){if(msg){msg.textContent='Error: '+e.message;msg.style.color='var(--red)';}}
+}

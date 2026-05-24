@@ -44,6 +44,13 @@ Canonical links used when working on infra-TAK. Keep these so tooling and docs a
 - **Brands (official)** — https://docs.goauthentik.io/docs/brands/
 - **Custom CSS (official)** — https://docs.goauthentik.io/brands/custom-css/
 
+## Release validation
+
+- **Test & Evaluation Procedure (T&E)** — [docs/TEST-AND-EVALUATION-PROCEDURE.md](TEST-AND-EVALUATION-PROCEDURE.md) — single canonical soak/validation procedure (dev fleet, ≥60 min, health-check matrix, cross-box convergence, PASS/FAIL gate). Triggered by the operator saying **“perform the test and evaluation procedure”**. Component-specific deep dives plug into Step 4:
+  - [docs/TESTING-AUTHENTIK.md](TESTING-AUTHENTIK.md) — Authentik soak probes (idle-in-tx, SIGABRT, spiral markers, PgBouncer, `ak dump_config`).
+  - [docs/TESTING-UPDATES.md](TESTING-UPDATES.md) — separate Update Now / tag-fetch validation path; required before any tag push.
+  - [docs/TESTING-NODERED-DEPLOYS.md](TESTING-NODERED-DEPLOYS.md) — Node-RED Configurator-only smoke tests.
+
 ---
 
 *Add more sections (Caddy, etc.) as needed.*

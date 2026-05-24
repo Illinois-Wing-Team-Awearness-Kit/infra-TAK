@@ -1,0 +1,31 @@
+---
+description: Scope tasks before coding — mandatory pre-flight for app.py work
+alwaysApply: true
+---
+
+# Task Scoping Protocol
+
+## Pre-flight checklist before touching app.py
+Answer all three before the agent writes a single line of code:
+
+1. **Which route or function?** (e.g. `/api/nodered/deploy`, `deploy_nodered()`)
+2. **What exactly needs to change?** (1–2 sentences — bug description or desired behavior)
+3. **Approximate line range?** (run a Grep to anchor before reading)
+
+If you cannot answer all three → run a Grep/SemanticSearch first. Do NOT start with open-ended exploration in Agent mode.
+
+## If the task touches >3 functions, split it
+Large scope = large context = expensive and error-prone. Break into sub-tasks, write a brief plan, execute each in its own chat.
+
+## Prefer Grep over open-ended file reads
+- ❌ SemanticSearch "find where Node-RED context backup happens" (reads many chunks)
+- ✅ `Grep "nodered_context_backup" app.py` (immediate, zero context cost)
+
+## State the release version at the start of every chat
+infra-TAK is at **v0.8.9-alpha**. Always open by saying which version you're working against so the agent doesn't re-read the README to orient itself.
+
+## When reporting a bug, include the symptom + the log line
+- ❌ "The deploy is broken"
+- ✅ "Deploy fails at the context backup step — log shows `FileNotFoundError` on `/opt/tak/nodered-ctx-backup.json`"
+
+The difference is ~2,000 tokens of back-and-forth investigation vs. going straight to the fix.

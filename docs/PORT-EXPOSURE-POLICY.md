@@ -75,6 +75,9 @@ Examples: Server One PostgreSQL 5432 (reachable from Server Two only), Server On
 | CloudTAK MinIO S3 | 9000 | Tier 4 | Docker-internal (was Tier 1 pre-v0.9.11) |
 | CloudTAK events worker | 5003 | Tier 4 | Docker-internal |
 | Email Relay | 25 | Tier 4 (localhost-bound, native systemd) | Local Postfix |
+| WebODM webapp | 8765 (default, configurable) | Tier 3 | Caddy proxies + Authentik forward_auth — `127.0.0.1:{port}:8000` |
+| WebODM NodeODX (nodeodm) | 3000 (internal) | Tier 4 | Docker-internal — WebODM worker reaches it via Docker DNS `wo_nodeodm:3000`; no host port |
+| WebODM PostgreSQL / Redis | 5432 / 6379 (internal) | Tier 4 | Docker-internal — no host port |
 | Server One PostgreSQL | 5432 (default) | Tier 5 | Source: Server Two IP |
 | Server One Guard Dog health | 8080 | Tier 5 | Source: console IP (`settings.server_ip`) |
 | Remote Authentik LDAP outpost | 389 / 636 | Tier 5 | Source: console IP (`settings.server_ip`) |

@@ -13441,7 +13441,7 @@ def run_takportal_deploy():
             try:
                 import urllib.request as _urlreq
                 _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
-                _ak_url = 'http://127.0.0.1:9090'
+                _ak_url = _get_authentik_api_url(settings)
 
                 # Update brand domain
                 try:
@@ -13460,10 +13460,9 @@ def run_takportal_deploy():
                 except Exception as e:
                     plog(f"  \u26a0 Brand update: {str(e)[:80]}")
 
-                # Wait forever for authorization flow
+                # Wait up to 15 min for authorization flow (Authentik startup on fresh deploys)
                 flow_pk = None
-                attempt = 0
-                while True:
+                for attempt in range(180):
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
                         resp = _urlreq.urlopen(req, timeout=10)
@@ -13483,13 +13482,14 @@ def run_takportal_deploy():
                     else:
                         authentik_deploy_log.append(f"  ⏳ {attempt * 5 // 60:02d}:{attempt * 5 % 60:02d}")
                     time.sleep(5)
-                    attempt += 1
-                plog(f"  ✓ Got authorization flow")
+                if flow_pk:
+                    plog(f"  ✓ Got authorization flow")
+                else:
+                    plog(f"  ⚠ No authorization flow found after 15 min — proxy provider skipped")
 
-                # Wait forever for invalidation flow
+                # Wait up to 15 min for invalidation flow
                 inv_flow_pk = None
-                attempt = 0
-                while True:
+                for attempt in range(180):
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
                         resp = _urlreq.urlopen(req, timeout=10)
@@ -13504,8 +13504,10 @@ def run_takportal_deploy():
                     else:
                         authentik_deploy_log.append(f"  ⏳ {attempt * 5 // 60:02d}:{attempt * 5 % 60:02d}")
                     time.sleep(5)
-                    attempt += 1
-                plog(f"  ✓ Got invalidation flow")
+                if inv_flow_pk:
+                    plog(f"  ✓ Got invalidation flow")
+                else:
+                    plog(f"  ⚠ No invalidation flow found after 15 min — proxy provider skipped")
 
                 # Create proxy provider
                 provider_pk = None
@@ -17221,6 +17223,11 @@ smtp_generic_maps = hash:/etc/postfix/generic
 
 def _authentik_smtp_configured():
     """True if Authentik .env has email settings (SMTP was pushed by Configure Authentik or deploy)."""
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    if ak_cfg.get('target_mode') == 'remote':
+        # For remote deploys the .env lives on the remote host; we track state in settings
+        return bool(settings.get('authentik_smtp_configured_remote'))
     env_path = os.path.expanduser('~/authentik/.env')
     if not os.path.exists(env_path):
         return False
@@ -18191,6 +18198,102 @@ def webodm_uninstall():
     return jsonify({'success': True})
 
 
+def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, settings, plog=None):
+    """Remote-deploy variant: SSH to the Authentik host, patch .env with SMTP settings
+    pointing to the console server's Postfix, restart containers, set up recovery flow.
+    Returns a status message string. Raises on fatal error."""
+    import re as _re
+    _log = plog or (lambda msg: None)
+    host = (deploy_cfg.get('remote', {}).get('host') or '').strip()
+    if not host:
+        raise RuntimeError('Remote host not configured in Authentik deployment settings.')
+
+    _from = (from_addr or '').strip() or 'authentik@localhost'
+    # Email Relay (Postfix) runs on the console server — Authentik must connect to it over the network
+    console_ip = (settings.get('server_ip') or '').strip()
+    smtp_host = console_ip if console_ip and console_ip not in ('localhost', '127.0.0.1') else host
+
+    email_lines = '\n'.join([
+        '',
+        '# Email — use console server Email Relay (Postfix)',
+        f'AUTHENTIK_EMAIL__HOST={smtp_host}',
+        'AUTHENTIK_EMAIL__PORT=25',
+        'AUTHENTIK_EMAIL__USERNAME=',
+        'AUTHENTIK_EMAIL__PASSWORD=',
+        'AUTHENTIK_EMAIL__USE_TLS=false',
+        'AUTHENTIK_EMAIL__USE_SSL=false',
+        'AUTHENTIK_EMAIL__TIMEOUT=10',
+        f'AUTHENTIK_EMAIL__FROM={_from}',
+    ])
+
+    # Read current .env from remote, strip old email settings, append new ones
+    _ok, _env_out = _module_run(deploy_cfg, 'cat ~/authentik/.env 2>/dev/null || true', timeout=10)
+    env_lines = []
+    for line in (_env_out or '').splitlines():
+        if not line.strip().startswith('AUTHENTIK_EMAIL__'):
+            env_lines.append(line)
+    if env_lines and env_lines[-1].strip() != '':
+        env_lines.append('')
+    new_env = '\n'.join(env_lines) + email_lines + '\n'
+
+    # Write patched .env back to remote
+    import base64 as _b64
+    encoded = _b64.b64encode(new_env.encode()).decode()
+    _ok, _out = _module_run(deploy_cfg,
+        f"echo '{encoded}' | base64 -d > ~/authentik/.env", timeout=15)
+    if not _ok:
+        raise RuntimeError(f'Could not write .env on remote host: {_out}')
+    _log('  Wrote SMTP settings to remote Authentik .env')
+
+    # Open port 25 on the console server for the remote Authentik host
+    if host:
+        subprocess.run(f'ufw allow from {host} to any port 25 proto tcp 2>/dev/null; true',
+                       shell=True, capture_output=True)
+        subprocess.run('ufw reload 2>/dev/null; true', shell=True, capture_output=True)
+        _log(f'  UFW: allowed {host} → port 25 (console Postfix)')
+
+    # Restart Authentik containers on remote
+    _log('  Restarting Authentik containers on remote...')
+    _ok, _out = _module_run(deploy_cfg,
+        'cd ~/authentik && docker compose up -d --force-recreate 2>&1', timeout=120)
+    if not _ok:
+        raise RuntimeError(f'Authentik restart failed on remote: {(_out or "")[:300]}')
+    _log('  ✓ Authentik restarted')
+
+    # Retrieve bootstrap token from remote .env
+    _ok2, _tok_out = _module_run(deploy_cfg,
+        "grep '^AUTHENTIK_BOOTSTRAP_TOKEN=' ~/authentik/.env | head -1 | cut -d= -f2-",
+        timeout=10)
+    ak_token = (_tok_out or '').strip().strip('"').strip("'")
+
+    message = f'Authentik SMTP configured ({smtp_host}:25).'
+    if ak_token:
+        ak_url = f'http://{host}:9090'
+        ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+        _log('  Waiting for Authentik API...')
+        api_ready = _wait_for_authentik_api(ak_url, ak_headers, max_attempts=120, plog=_log)
+        if api_ready:
+            _log('  Setting up recovery flow...')
+            ok, recovery_msg, recovery_slug = _ensure_authentik_recovery_flow(ak_url, ak_headers)
+            if ok:
+                message += ' ' + recovery_msg
+                if recovery_slug:
+                    base = _get_authentik_base_url(settings)
+                    message += f' Direct recovery URL: {base}/if/flow/{recovery_slug}/.'
+            else:
+                message += f' Recovery flow issue: {recovery_msg}.'
+        else:
+            message += ' API not ready in time — recovery flow not set up.'
+    # Persist the configured state so the status badge shows correctly on next page load
+    try:
+        s = load_settings()
+        s['authentik_smtp_configured_remote'] = True
+        save_settings(s)
+    except Exception:
+        pass
+    return message
+
+
 def _configure_authentik_smtp_and_recovery(from_addr, plog=None):
     """Push SMTP settings into Authentik .env, restart containers, and set up recovery flow.
     Used by both the Email Relay deploy and the 'Configure Authentik' button.
@@ -18615,6 +18718,16 @@ def emailrelay_configure_authentik():
     relay = settings.get('email_relay') or {}
     if not relay.get('from_addr'):
         return jsonify({'success': False, 'error': 'Email Relay not configured. Deploy the relay first.'}), 400
+    deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    if not deploy_cfg.get('deployed'):
+        return jsonify({'success': False, 'error': 'Authentik is not installed.'}), 400
+    if deploy_cfg.get('target_mode') == 'remote':
+        try:
+            message = _configure_authentik_smtp_and_recovery_remote(
+                deploy_cfg, relay.get('from_addr', ''), settings)
+            return jsonify({'success': True, 'message': message})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)[:300]}), 500
     ak_dir = os.path.expanduser('~/authentik')
     if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
         return jsonify({'success': False, 'error': 'Authentik is not installed.'}), 400
@@ -19222,9 +19335,10 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
     return True
 
-def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None):
+def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, ak_url=None):
     """Create infra-TAK Console proxy providers (infratak + console) and applications in Authentik, add to embedded outpost.
-    When flow_pk/inv_flow_pk are provided (e.g. from Step 12), use them. Otherwise wait for flows (e.g. when called from Caddy save)."""
+    When flow_pk/inv_flow_pk are provided (e.g. from Step 12), use them. Otherwise wait for flows (e.g. when called from Caddy save).
+    ak_url overrides the default 127.0.0.1:9090 — pass the remote host URL for remote Authentik deployments."""
     if not fqdn or not ak_token:
         return False
     def log(msg):
@@ -19232,7 +19346,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
             plog(msg)
     import urllib.request as _urlreq
     _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
-    _ak_url = 'http://127.0.0.1:9090'
+    _ak_url = ak_url or 'http://127.0.0.1:9090'
 
     try:
         if not flow_pk or not inv_flow_pk:
@@ -26408,11 +26522,16 @@ if not key:
     sys.exit(5)
 with open("docker-compose.yml") as f:
     content = f.read()
-if "AUTHENTIK_TOKEN: placeholder" not in content:
-    print("ERROR: docker-compose.yml has no placeholder or already patched", file=sys.stderr)
-    sys.exit(6)
+import re as _re
 safe = key.replace("'", "''")
-content = content.replace("AUTHENTIK_TOKEN: placeholder", "AUTHENTIK_TOKEN: '" + safe + "'")
+# Replace placeholder OR an already-set (possibly wrong) token — either way inject the current key
+if "AUTHENTIK_TOKEN: placeholder" in content:
+    content = content.replace("AUTHENTIK_TOKEN: placeholder", "AUTHENTIK_TOKEN: '" + safe + "'")
+elif _re.search(r"AUTHENTIK_TOKEN: '.*'", content):
+    content = _re.sub(r"AUTHENTIK_TOKEN: '.*'", "AUTHENTIK_TOKEN: '" + safe + "'", content)
+else:
+    print("ERROR: docker-compose.yml has no AUTHENTIK_TOKEN line to patch", file=sys.stderr)
+    sys.exit(6)
 with open("docker-compose.yml", "w") as f:
     f.write(content)
 subprocess.run("docker compose stop ldap 2>/dev/null; docker compose rm -f ldap 2>/dev/null; docker compose up -d ldap", shell=True, timeout=90, cwd=os.path.expanduser("~/authentik"))
@@ -27077,6 +27196,15 @@ entries:
     plog("━━━ Step 5/8: Creating Docker Compose ━━━")
     _ak_latest = _get_authentik_target_release()
     plog(f"  Authentik version: {_ak_latest} (channel: {(load_settings().get('update_channel') or 'main')})")
+    _ram_ok, _ram_out = _module_run(deploy_cfg, "awk '/MemTotal/ {print int($2/1024/1024)}' /proc/meminfo 2>/dev/null", timeout=10)
+    _ram_gb = 0
+    if _ram_ok and (_ram_out or '').strip().isdigit():
+        _ram_gb = int((_ram_out or '').strip())
+    _pg_cmd_remote = _authentik_pg_command_for_ram(_ram_gb)
+    if _ram_gb:
+        plog(f"  Remote RAM: {_ram_gb} GB — PostgreSQL tuned for {_ram_gb}GB tier")
+    else:
+        plog("  Remote RAM: unknown — using conservative PostgreSQL settings")
     compose_content = """services:
   postgresql:
     image: docker.io/library/postgres:16-alpine
@@ -27213,6 +27341,17 @@ networks:
     external: true
 """
     compose_content = compose_content.replace('2026.2.0', _ak_latest)
+    compose_content = compose_content.replace(
+        'command: ' + _AUTHENTIK_PG_COMMAND_ENTERPRISE,
+        'command: ' + _pg_cmd_remote,
+    )
+    # Remote installs: bind HTTP port on 0.0.0.0 so Caddy on the console server
+    # can reach it for forward_auth and reverse_proxy. UFW in Step 8 restricts
+    # this to the console IP only. (Local installs keep 127.0.0.1 — see v0.9.12.)
+    compose_content = compose_content.replace(
+        '      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"',
+        '      - "0.0.0.0:${COMPOSE_PORT_HTTP:-9090}:9000"',
+    )
     with open('/tmp/authentik_remote_compose.yml', 'w') as f:
         f.write(compose_content)
     ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote_compose.yml', '/tmp/docker-compose.yml', log_fn=plog)
@@ -27228,12 +27367,30 @@ networks:
     plog("━━━ Step 6/8: Starting Authentik (remote) ━━━")
     _module_run(deploy_cfg, f'docker network inspect {INFRATAK_DOCKER_NETWORK} >/dev/null 2>&1 || docker network create {INFRATAK_DOCKER_NETWORK}', timeout=10)
     plog("  Running docker compose up (this may take 2-5 minutes)...")
+    # Wipe any stale volumes from a previous failed deploy. Each deploy generates
+    # a fresh PG_PASS in .env; if an old data volume exists with a different password
+    # Postgres will reject every login. `down -v` is safe here — this is a fresh
+    # install path, not an update.
+    _module_run(deploy_cfg, 'cd ~/authentik && docker compose down -v --remove-orphans 2>/dev/null || true', timeout=60)
     ok, out = _module_run(deploy_cfg, 'cd ~/authentik && docker compose pull 2>&1', timeout=600, log_fn=plog)
     if not ok:
         plog(f"  ⚠ Pull had issues: {(out or '').strip()[:200]}")
-    ok, out = _module_run(deploy_cfg, 'cd ~/authentik && docker compose up -d 2>&1', timeout=300, log_fn=plog)
+    ok, out = _module_run(deploy_cfg, 'cd ~/authentik && docker compose up -d 2>&1', timeout=600, log_fn=plog)
     if not ok:
         plog(f"✗ Docker Compose failed")
+        if (out or '').strip():
+            for _line in (out or '').strip().splitlines()[-20:]:
+                plog(f"  {_line}")
+        _, _ps = _module_run(deploy_cfg, 'docker ps -a --filter "name=authentik" --format "{{.Names}}  {{.Status}}" 2>/dev/null', timeout=10)
+        if (_ps or '').strip():
+            plog("  Container states:")
+            for _line in (_ps or '').strip().splitlines():
+                plog(f"    {_line}")
+        _, _logs = _module_run(deploy_cfg, 'docker logs authentik-postgresql-1 --tail 20 2>&1', timeout=10)
+        if (_logs or '').strip():
+            plog("  postgresql logs (last 20 lines):")
+            for _line in (_logs or '').strip().splitlines():
+                plog(f"    {_line}")
         authentik_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Containers started")
@@ -27250,43 +27407,73 @@ networks:
     else:
         plog("⚠ Authentik not healthy after 5 minutes — may still be starting")
 
-    # Step 6b: Same process as local — wait for API, then inject LDAP token and recreate (local Step 8 + 9 wait + 11 token inject)
+    # Step 6b: Inject LDAP token via curl on the remote host.
+    # Port 9090 is bound to 127.0.0.1 on the Authentik host, so all API
+    # calls must run on that host via _module_run, not from the console.
     plog("")
     plog("━━━ Step 6b/8: LDAP Outpost Token (remote) ━━━")
-    ak_url_remote = f"http://{host}:9090"
-    ak_headers_remote = {'Authorization': f'Bearer {bootstrap_token}', 'Content-Type': 'application/json'}
-    plog("  Waiting for Authentik API (same as local Step 8)...")
-    api_ready = _wait_for_authentik_api(ak_url_remote, ak_headers_remote, max_attempts=90, plog=plog, require_200=True)
+    _ak_local_url = "http://localhost:9090"
+    _auth_header = f"Authorization: Bearer {bootstrap_token}"
+    plog("  Waiting for Authentik API...")
+    api_ready = False
+    for _attempt in range(90):
+        _ok, _out = _module_run(deploy_cfg,
+            f'curl -s -o /dev/null -w "%{{http_code}}" -H "{_auth_header}" '
+            f'{_ak_local_url}/api/v3/core/tokens/ --connect-timeout 5 2>/dev/null',
+            timeout=12)
+        if _ok and (_out or '').strip() == '200':
+            api_ready = True
+            break
+        if _attempt % 6 == 0 and _attempt > 0:
+            plog(f"  ⏳ Still waiting for API... ({_attempt * 5}s)")
+        time.sleep(5)
     if api_ready:
         plog("  ✓ Authentik API is ready")
     else:
-        plog("  ⚠ API timeout — ensure port 9090 is reachable from this host")
-    plog("  Waiting for LDAP outpost (blueprint, same as local Step 9)...")
-    time.sleep(15)
+        plog("  ⚠ API timeout — LDAP token injection skipped; use Fix LDAP token on Authentik page")
+    # Blueprints that create the default LDAP outpost can take several minutes
+    # to finish after the API first becomes reachable. Retry for up to 5 minutes.
     ldap_token_key = None
-    try:
-        req = urllib.request.Request(f'{ak_url_remote}/api/v3/outposts/instances/?search=LDAP', headers=ak_headers_remote)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            results = json.loads(resp.read().decode()).get('results', [])
-        ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
-        if ldap_outpost:
-            outpost_token_id = ldap_outpost.get('token_identifier') or ldap_outpost.get('token')
-            if not outpost_token_id:
-                req = urllib.request.Request(f'{ak_url_remote}/api/v3/outposts/instances/{ldap_outpost["pk"]}/', headers=ak_headers_remote)
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    detail = json.loads(resp.read().decode())
-                outpost_token_id = detail.get('token_identifier') or detail.get('token')
-            if outpost_token_id:
-                req = urllib.request.Request(
-                    f'{ak_url_remote}/api/v3/core/tokens/{outpost_token_id}/view_key/',
-                    headers=ak_headers_remote, method='GET')
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    ldap_token_key = json.loads(resp.read().decode()).get('key', '')
-                plog(f"  ✓ Retrieved LDAP outpost token from API")
-    except urllib.error.HTTPError as e:
-        plog(f"  ⚠ API error: {e.code} {e.read().decode()[:150]}")
-    except Exception as e:
-        plog(f"  ⚠ Token fetch: {str(e)[:150]}")
+    if api_ready:
+        plog("  Waiting for LDAP outpost blueprint (up to 5 min)...")
+        _ldap_outpost_found = False
+        for _bp_attempt in range(30):  # 30 × 10s = 5 minutes
+            try:
+                _ok, _out = _module_run(deploy_cfg,
+                    f'curl -s -H "{_auth_header}" '
+                    f'"{_ak_local_url}/api/v3/outposts/instances/?search=LDAP" 2>/dev/null',
+                    timeout=15)
+                if _ok and _out:
+                    results = json.loads(_out).get('results', [])
+                    ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
+                    if ldap_outpost:
+                        outpost_token_id = ldap_outpost.get('token_identifier') or ldap_outpost.get('token')
+                        if not outpost_token_id:
+                            _ok2, _out2 = _module_run(deploy_cfg,
+                                f'curl -s -H "{_auth_header}" '
+                                f'"{_ak_local_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/" 2>/dev/null',
+                                timeout=10)
+                            if _ok2 and _out2:
+                                detail = json.loads(_out2)
+                                outpost_token_id = detail.get('token_identifier') or detail.get('token')
+                        if outpost_token_id:
+                            _ok3, _out3 = _module_run(deploy_cfg,
+                                f'curl -s -H "{_auth_header}" '
+                                f'"{_ak_local_url}/api/v3/core/tokens/{outpost_token_id}/view_key/" 2>/dev/null',
+                                timeout=10)
+                            if _ok3 and _out3:
+                                ldap_token_key = json.loads(_out3).get('key', '')
+                                if ldap_token_key:
+                                    plog(f"  ✓ Retrieved LDAP outpost token from API ({_bp_attempt * 10}s after API ready)")
+                                    _ldap_outpost_found = True
+                                    break
+            except Exception as e:
+                plog(f"  ⚠ Token fetch attempt {_bp_attempt + 1}: {str(e)[:100]}")
+            if _bp_attempt % 3 == 2:
+                plog(f"  ⏳ Waiting for LDAP blueprint... ({(_bp_attempt + 1) * 10}s)")
+            time.sleep(10)
+        if not _ldap_outpost_found:
+            plog("  ⚠ LDAP outpost not found after 5 min — token injection skipped")
     if ldap_token_key:
         try:
             safe_key = ldap_token_key.replace("'", "''")
@@ -27370,30 +27557,37 @@ networks:
     #     in keep working until the operator sets it.
     _console_src_ip = _fedhub_caddy_source_ip(settings)
     if _console_src_ip:
+        # Port 9090: Caddy on the console server needs to reach the Authentik HTTP
+        # API for forward_auth and reverse_proxy. Source-scope it to the console IP
+        # so it's reachable from exactly one host, not the general internet.
         _ufw_block = (
             'command -v ufw >/dev/null 2>&1 && (sudo ufw allow 22/tcp 2>/dev/null; '
             f'sudo ufw allow from {_console_src_ip} to any port 389 proto tcp 2>/dev/null; '
             f'sudo ufw allow from {_console_src_ip} to any port 636 proto tcp 2>/dev/null; '
+            f'sudo ufw allow from {_console_src_ip} to any port 9090 proto tcp 2>/dev/null; '
             'sudo ufw deny 389/tcp 2>/dev/null; sudo ufw deny 636/tcp 2>/dev/null; '
             'sudo ufw deny 9090/tcp 2>/dev/null; sudo ufw deny 9443/tcp 2>/dev/null; '
             'sudo ufw --force enable 2>/dev/null; sudo ufw reload 2>/dev/null); '
             'command -v firewall-cmd >/dev/null 2>&1 && ('
             f'sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address={_console_src_ip} port port=389 protocol=tcp accept" 2>/dev/null; '
             f'sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address={_console_src_ip} port port=636 protocol=tcp accept" 2>/dev/null; '
+            f'sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address={_console_src_ip} port port=9090 protocol=tcp accept" 2>/dev/null; '
             'sudo firewall-cmd --reload 2>/dev/null); true'
         )
-        plog(f"✓ Firewall hardened: 389/636 LDAP source-scoped to console IP {_console_src_ip}; 9090/9443 loopback only (Caddy proxies)")
+        plog(f"✓ Firewall hardened: 389/636/9090 source-scoped to console IP {_console_src_ip}; 9443 denied")
     else:
         _ufw_block = (
             'command -v ufw >/dev/null 2>&1 && (sudo ufw allow 22/tcp 2>/dev/null; '
             'sudo ufw allow 389/tcp 2>/dev/null; sudo ufw allow 636/tcp 2>/dev/null; '
-            'sudo ufw deny 9090/tcp 2>/dev/null; sudo ufw deny 9443/tcp 2>/dev/null; '
+            'sudo ufw allow 9090/tcp 2>/dev/null; '
+            'sudo ufw deny 9443/tcp 2>/dev/null; '
             'sudo ufw --force enable 2>/dev/null; sudo ufw reload 2>/dev/null); '
             'command -v firewall-cmd >/dev/null 2>&1 && (sudo firewall-cmd --permanent --add-port=389/tcp 2>/dev/null; '
             'sudo firewall-cmd --permanent --add-port=636/tcp 2>/dev/null; '
+            'sudo firewall-cmd --permanent --add-port=9090/tcp 2>/dev/null; '
             'sudo firewall-cmd --reload 2>/dev/null); true'
         )
-        plog("⚠ No console source IP set (Settings → Server IP) — 389/636 left public; 9090/9443 denied. Fill Server IP to enable source-scoping.")
+        plog("⚠ No console source IP set (Settings → Server IP) — 389/636/9090 left public. Fill Server IP to enable source-scoping.")
     _module_run(deploy_cfg, _ufw_block, timeout=20)
 
     # v0.9.30: stamp settings.authentik_trusted_proxy_cidrs_fix so the fail2ban
@@ -27405,6 +27599,24 @@ networks:
         _authentik_fix_trusted_proxy_cidrs(plog)
     except Exception as _tpc_e:
         plog(f"  ⚠ trusted-proxy CIDRs stamp skipped (non-fatal): {str(_tpc_e)[:120]}")
+
+    # Step 8b: Create Authentik proxy provider + application for the InfraTAK
+    # console so the embedded outpost recognises infratak.<fqdn> and handles
+    # forward_auth correctly (returns 302 to login, not 404 Not Found).
+    # Port 9090 is now accessible from the console server (opened in Step 8).
+    plog("")
+    plog("━━━ Step 8b/8: Authentik Console Application ━━━")
+    if fqdn and bootstrap_token:
+        _remote_ak_url = f'http://{host}:9090'
+        plog("  Registering infratak console proxy provider + application...")
+        _app_ok = _ensure_authentik_console_app(
+            fqdn, bootstrap_token, plog=plog, ak_url=_remote_ak_url)
+        if _app_ok:
+            plog("✓ infra-TAK Console application registered in Authentik")
+        else:
+            plog("  ⚠ Could not register console app — visit Authentik admin to create a proxy provider for infratak." + fqdn + " manually, or redeploy")
+    else:
+        plog("  ⚠ FQDN or token missing — skipping console app registration")
 
     plog("")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
@@ -29857,6 +30069,85 @@ _AUTHENTIK_PG_COMMAND_ENTERPRISE = (
     ' -c tcp_keepalives_interval=10'
     ' -c tcp_keepalives_count=6'
 )
+
+
+def _authentik_pg_command_for_ram(ram_gb):
+    """Return a postgres command string sized for the host's total RAM (GB).
+
+    Tiers follow pgtune 25%/75% shared_buffers/cache recommendations.
+    ram_gb=0 means the probe failed — fall back to a conservative baseline.
+    """
+    if ram_gb >= 48:
+        return _AUTHENTIK_PG_COMMAND_ENTERPRISE
+    if ram_gb >= 16:
+        return (
+            'postgres'
+            ' -c max_connections=1000'
+            ' -c shared_buffers=4GB'
+            ' -c effective_cache_size=12GB'
+            ' -c work_mem=12MB'
+            ' -c maintenance_work_mem=1GB'
+            ' -c wal_buffers=64MB'
+            ' -c max_wal_size=4GB'
+            ' -c statement_timeout=120s'
+            ' -c idle_session_timeout=300s'
+            ' -c idle_in_transaction_session_timeout=300s'
+            ' -c tcp_keepalives_idle=60'
+            ' -c tcp_keepalives_interval=10'
+            ' -c tcp_keepalives_count=6'
+        )
+    if ram_gb >= 8:
+        return (
+            'postgres'
+            ' -c max_connections=500'
+            ' -c shared_buffers=2GB'
+            ' -c effective_cache_size=6GB'
+            ' -c work_mem=8MB'
+            ' -c maintenance_work_mem=512MB'
+            ' -c wal_buffers=32MB'
+            ' -c max_wal_size=2GB'
+            ' -c statement_timeout=120s'
+            ' -c idle_session_timeout=300s'
+            ' -c idle_in_transaction_session_timeout=300s'
+            ' -c tcp_keepalives_idle=60'
+            ' -c tcp_keepalives_interval=10'
+            ' -c tcp_keepalives_count=6'
+        )
+    if ram_gb >= 4:
+        return (
+            'postgres'
+            ' -c max_connections=300'
+            ' -c shared_buffers=1GB'
+            ' -c effective_cache_size=3GB'
+            ' -c work_mem=6MB'
+            ' -c maintenance_work_mem=256MB'
+            ' -c wal_buffers=16MB'
+            ' -c max_wal_size=1GB'
+            ' -c statement_timeout=120s'
+            ' -c idle_session_timeout=300s'
+            ' -c idle_in_transaction_session_timeout=300s'
+            ' -c tcp_keepalives_idle=60'
+            ' -c tcp_keepalives_interval=10'
+            ' -c tcp_keepalives_count=6'
+        )
+    # < 4 GB or unknown: conservative baseline that fits any modern VPS
+    return (
+        'postgres'
+        ' -c max_connections=200'
+        ' -c shared_buffers=256MB'
+        ' -c effective_cache_size=768MB'
+        ' -c work_mem=4MB'
+        ' -c maintenance_work_mem=64MB'
+        ' -c wal_buffers=8MB'
+        ' -c max_wal_size=1GB'
+        ' -c statement_timeout=120s'
+        ' -c idle_session_timeout=300s'
+        ' -c idle_in_transaction_session_timeout=300s'
+        ' -c tcp_keepalives_idle=60'
+        ' -c tcp_keepalives_interval=10'
+        ' -c tcp_keepalives_count=6'
+    )
+
 
 # v0.9.28-alpha: enterprise scaling — PgBouncer tier.
 #   DEFAULT_POOL_SIZE 75 → 300: with PG max_connections bumped to 2000, the

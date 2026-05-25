@@ -17208,6 +17208,11 @@ smtp_generic_maps = hash:/etc/postfix/generic
 
 def _authentik_smtp_configured():
     """True if Authentik .env has email settings (SMTP was pushed by Configure Authentik or deploy)."""
+    settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    if ak_cfg.get('target_mode') == 'remote':
+        # For remote deploys the .env lives on the remote host; we track state in settings
+        return bool(settings.get('authentik_smtp_configured_remote'))
     env_path = os.path.expanduser('~/authentik/.env')
     if not os.path.exists(env_path):
         return False
@@ -18021,6 +18026,102 @@ def webodm_uninstall():
     return jsonify({'success': True})
 
 
+def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, settings, plog=None):
+    """Remote-deploy variant: SSH to the Authentik host, patch .env with SMTP settings
+    pointing to the console server's Postfix, restart containers, set up recovery flow.
+    Returns a status message string. Raises on fatal error."""
+    import re as _re
+    _log = plog or (lambda msg: None)
+    host = (deploy_cfg.get('remote', {}).get('host') or '').strip()
+    if not host:
+        raise RuntimeError('Remote host not configured in Authentik deployment settings.')
+
+    _from = (from_addr or '').strip() or 'authentik@localhost'
+    # Email Relay (Postfix) runs on the console server — Authentik must connect to it over the network
+    console_ip = (settings.get('server_ip') or '').strip()
+    smtp_host = console_ip if console_ip and console_ip not in ('localhost', '127.0.0.1') else host
+
+    email_lines = '\n'.join([
+        '',
+        '# Email — use console server Email Relay (Postfix)',
+        f'AUTHENTIK_EMAIL__HOST={smtp_host}',
+        'AUTHENTIK_EMAIL__PORT=25',
+        'AUTHENTIK_EMAIL__USERNAME=',
+        'AUTHENTIK_EMAIL__PASSWORD=',
+        'AUTHENTIK_EMAIL__USE_TLS=false',
+        'AUTHENTIK_EMAIL__USE_SSL=false',
+        'AUTHENTIK_EMAIL__TIMEOUT=10',
+        f'AUTHENTIK_EMAIL__FROM={_from}',
+    ])
+
+    # Read current .env from remote, strip old email settings, append new ones
+    _ok, _env_out = _module_run(deploy_cfg, 'cat ~/authentik/.env 2>/dev/null || true', timeout=10)
+    env_lines = []
+    for line in (_env_out or '').splitlines():
+        if not line.strip().startswith('AUTHENTIK_EMAIL__'):
+            env_lines.append(line)
+    if env_lines and env_lines[-1].strip() != '':
+        env_lines.append('')
+    new_env = '\n'.join(env_lines) + email_lines + '\n'
+
+    # Write patched .env back to remote
+    import base64 as _b64
+    encoded = _b64.b64encode(new_env.encode()).decode()
+    _ok, _out = _module_run(deploy_cfg,
+        f"echo '{encoded}' | base64 -d > ~/authentik/.env", timeout=15)
+    if not _ok:
+        raise RuntimeError(f'Could not write .env on remote host: {_out}')
+    _log('  Wrote SMTP settings to remote Authentik .env')
+
+    # Open port 25 on the console server for the remote Authentik host
+    if host:
+        subprocess.run(f'ufw allow from {host} to any port 25 proto tcp 2>/dev/null; true',
+                       shell=True, capture_output=True)
+        subprocess.run('ufw reload 2>/dev/null; true', shell=True, capture_output=True)
+        _log(f'  UFW: allowed {host} → port 25 (console Postfix)')
+
+    # Restart Authentik containers on remote
+    _log('  Restarting Authentik containers on remote...')
+    _ok, _out = _module_run(deploy_cfg,
+        'cd ~/authentik && docker compose up -d --force-recreate 2>&1', timeout=120)
+    if not _ok:
+        raise RuntimeError(f'Authentik restart failed on remote: {(_out or "")[:300]}')
+    _log('  ✓ Authentik restarted')
+
+    # Retrieve bootstrap token from remote .env
+    _ok2, _tok_out = _module_run(deploy_cfg,
+        "grep '^AUTHENTIK_BOOTSTRAP_TOKEN=' ~/authentik/.env | head -1 | cut -d= -f2-",
+        timeout=10)
+    ak_token = (_tok_out or '').strip().strip('"').strip("'")
+
+    message = f'Authentik SMTP configured ({smtp_host}:25).'
+    if ak_token:
+        ak_url = f'http://{host}:9090'
+        ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+        _log('  Waiting for Authentik API...')
+        api_ready = _wait_for_authentik_api(ak_url, ak_headers, max_attempts=120, plog=_log)
+        if api_ready:
+            _log('  Setting up recovery flow...')
+            ok, recovery_msg, recovery_slug = _ensure_authentik_recovery_flow(ak_url, ak_headers)
+            if ok:
+                message += ' ' + recovery_msg
+                if recovery_slug:
+                    base = _get_authentik_base_url(settings)
+                    message += f' Direct recovery URL: {base}/if/flow/{recovery_slug}/.'
+            else:
+                message += f' Recovery flow issue: {recovery_msg}.'
+        else:
+            message += ' API not ready in time — recovery flow not set up.'
+    # Persist the configured state so the status badge shows correctly on next page load
+    try:
+        s = load_settings()
+        s['authentik_smtp_configured_remote'] = True
+        save_settings(s)
+    except Exception:
+        pass
+    return message
+
+
 def _configure_authentik_smtp_and_recovery(from_addr, plog=None):
     """Push SMTP settings into Authentik .env, restart containers, and set up recovery flow.
     Used by both the Email Relay deploy and the 'Configure Authentik' button.
@@ -18445,6 +18546,16 @@ def emailrelay_configure_authentik():
     relay = settings.get('email_relay') or {}
     if not relay.get('from_addr'):
         return jsonify({'success': False, 'error': 'Email Relay not configured. Deploy the relay first.'}), 400
+    deploy_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    if not deploy_cfg.get('deployed'):
+        return jsonify({'success': False, 'error': 'Authentik is not installed.'}), 400
+    if deploy_cfg.get('target_mode') == 'remote':
+        try:
+            message = _configure_authentik_smtp_and_recovery_remote(
+                deploy_cfg, relay.get('from_addr', ''), settings)
+            return jsonify({'success': True, 'message': message})
+        except Exception as e:
+            return jsonify({'success': False, 'error': str(e)[:300]}), 500
     ak_dir = os.path.expanduser('~/authentik')
     if not os.path.exists(os.path.join(ak_dir, 'docker-compose.yml')):
         return jsonify({'success': False, 'error': 'Authentik is not installed.'}), 400

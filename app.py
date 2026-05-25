@@ -29953,10 +29953,11 @@ networks:
     plog("━━━ Step 6/8: Starting Authentik (remote) ━━━")
     _module_run(deploy_cfg, f'docker network inspect {INFRATAK_DOCKER_NETWORK} >/dev/null 2>&1 || docker network create {INFRATAK_DOCKER_NETWORK}', timeout=10)
     plog("  Running docker compose up (this may take 2-5 minutes)...")
-    # Wipe stale volumes so a fresh deploy always starts with the current password
-    plog("  Clearing any stale containers/volumes from previous attempts...")
-    _module_run(deploy_cfg, 'cd ~/authentik && docker compose down -v 2>&1', timeout=120)
-    plog("  ✓ Previous state cleared")
+    # Wipe any stale volumes from a previous failed deploy. Each deploy generates
+    # a fresh PG_PASS in .env; if an old data volume exists with a different password
+    # Postgres will reject every login. `down -v` is safe here — this is a fresh
+    # install path, not an update.
+    _module_run(deploy_cfg, 'cd ~/authentik && docker compose down -v --remove-orphans 2>/dev/null || true', timeout=60)
     ok, out = _module_run(deploy_cfg, 'cd ~/authentik && docker compose pull 2>&1', timeout=600, log_fn=plog)
     if not ok:
         plog(f"  ⚠ Pull had issues: {(out or '').strip()[:200]}")

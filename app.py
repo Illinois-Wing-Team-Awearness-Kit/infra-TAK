@@ -19052,9 +19052,10 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
     return True
 
-def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None):
+def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, ak_url=None):
     """Create infra-TAK Console proxy providers (infratak + console) and applications in Authentik, add to embedded outpost.
-    When flow_pk/inv_flow_pk are provided (e.g. from Step 12), use them. Otherwise wait for flows (e.g. when called from Caddy save)."""
+    When flow_pk/inv_flow_pk are provided (e.g. from Step 12), use them. Otherwise wait for flows (e.g. when called from Caddy save).
+    ak_url overrides the default 127.0.0.1:9090 — pass the remote host URL for remote Authentik deployments."""
     if not fqdn or not ak_token:
         return False
     def log(msg):
@@ -19062,7 +19063,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
             plog(msg)
     import urllib.request as _urlreq
     _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
-    _ak_url = 'http://127.0.0.1:9090'
+    _ak_url = ak_url or 'http://127.0.0.1:9090'
 
     try:
         if not flow_pk or not inv_flow_pk:
@@ -27292,6 +27293,24 @@ networks:
         _authentik_fix_trusted_proxy_cidrs(plog)
     except Exception as _tpc_e:
         plog(f"  ⚠ trusted-proxy CIDRs stamp skipped (non-fatal): {str(_tpc_e)[:120]}")
+
+    # Step 8b: Create Authentik proxy provider + application for the InfraTAK
+    # console so the embedded outpost recognises infratak.<fqdn> and handles
+    # forward_auth correctly (returns 302 to login, not 404 Not Found).
+    # Port 9090 is now accessible from the console server (opened in Step 8).
+    plog("")
+    plog("━━━ Step 8b/8: Authentik Console Application ━━━")
+    if fqdn and bootstrap_token:
+        _remote_ak_url = f'http://{host}:9090'
+        plog("  Registering infratak console proxy provider + application...")
+        _app_ok = _ensure_authentik_console_app(
+            fqdn, bootstrap_token, plog=plog, ak_url=_remote_ak_url)
+        if _app_ok:
+            plog("✓ infra-TAK Console application registered in Authentik")
+        else:
+            plog("  ⚠ Could not register console app — visit Authentik admin to create a proxy provider for infratak." + fqdn + " manually, or redeploy")
+    else:
+        plog("  ⚠ FQDN or token missing — skipping console app registration")
 
     plog("")
     plog("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")

@@ -13699,7 +13699,7 @@ def run_takportal_deploy():
                 except Exception as e:
                     plog(f"  \u26a0 Brand update: {str(e)[:80]}")
 
-                # Wait up to 15 min for authorization flow
+                # Wait up to 15 min for authorization flow (Authentik startup on fresh deploys)
                 flow_pk = None
                 for attempt in range(180):
                     try:

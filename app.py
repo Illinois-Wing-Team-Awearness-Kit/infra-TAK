@@ -27104,43 +27104,62 @@ networks:
     else:
         plog("⚠ Authentik not healthy after 5 minutes — may still be starting")
 
-    # Step 6b: Same process as local — wait for API, then inject LDAP token and recreate (local Step 8 + 9 wait + 11 token inject)
+    # Step 6b: Inject LDAP token via curl on the remote host.
+    # Port 9090 is bound to 127.0.0.1 on the Authentik host, so all API
+    # calls must run on that host via _module_run, not from the console.
     plog("")
     plog("━━━ Step 6b/8: LDAP Outpost Token (remote) ━━━")
-    ak_url_remote = f"http://{host}:9090"
-    ak_headers_remote = {'Authorization': f'Bearer {bootstrap_token}', 'Content-Type': 'application/json'}
-    plog("  Waiting for Authentik API (same as local Step 8)...")
-    api_ready = _wait_for_authentik_api(ak_url_remote, ak_headers_remote, max_attempts=90, plog=plog, require_200=True)
+    _ak_local_url = "http://localhost:9090"
+    _auth_header = f"Authorization: Bearer {bootstrap_token}"
+    plog("  Waiting for Authentik API...")
+    api_ready = False
+    for _attempt in range(90):
+        _ok, _out = _module_run(deploy_cfg,
+            f'curl -s -o /dev/null -w "%{{http_code}}" -H "{_auth_header}" '
+            f'{_ak_local_url}/api/v3/core/tokens/ --connect-timeout 5 2>/dev/null',
+            timeout=12)
+        if _ok and (_out or '').strip() == '200':
+            api_ready = True
+            break
+        if _attempt % 6 == 0 and _attempt > 0:
+            plog(f"  ⏳ Still waiting for API... ({_attempt * 5}s)")
+        time.sleep(5)
     if api_ready:
         plog("  ✓ Authentik API is ready")
     else:
-        plog("  ⚠ API timeout — ensure port 9090 is reachable from this host")
-    plog("  Waiting for LDAP outpost (blueprint, same as local Step 9)...")
+        plog("  ⚠ API timeout — LDAP token injection skipped; use Fix LDAP token on Authentik page")
+    plog("  Waiting for LDAP outpost blueprint...")
     time.sleep(15)
     ldap_token_key = None
-    try:
-        req = urllib.request.Request(f'{ak_url_remote}/api/v3/outposts/instances/?search=LDAP', headers=ak_headers_remote)
-        with urllib.request.urlopen(req, timeout=15) as resp:
-            results = json.loads(resp.read().decode()).get('results', [])
-        ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
-        if ldap_outpost:
-            outpost_token_id = ldap_outpost.get('token_identifier') or ldap_outpost.get('token')
-            if not outpost_token_id:
-                req = urllib.request.Request(f'{ak_url_remote}/api/v3/outposts/instances/{ldap_outpost["pk"]}/', headers=ak_headers_remote)
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    detail = json.loads(resp.read().decode())
-                outpost_token_id = detail.get('token_identifier') or detail.get('token')
-            if outpost_token_id:
-                req = urllib.request.Request(
-                    f'{ak_url_remote}/api/v3/core/tokens/{outpost_token_id}/view_key/',
-                    headers=ak_headers_remote, method='GET')
-                with urllib.request.urlopen(req, timeout=10) as resp:
-                    ldap_token_key = json.loads(resp.read().decode()).get('key', '')
-                plog(f"  ✓ Retrieved LDAP outpost token from API")
-    except urllib.error.HTTPError as e:
-        plog(f"  ⚠ API error: {e.code} {e.read().decode()[:150]}")
-    except Exception as e:
-        plog(f"  ⚠ Token fetch: {str(e)[:150]}")
+    if api_ready:
+        try:
+            _ok, _out = _module_run(deploy_cfg,
+                f'curl -s -H "{_auth_header}" '
+                f'"{_ak_local_url}/api/v3/outposts/instances/?search=LDAP" 2>/dev/null',
+                timeout=15)
+            if _ok and _out:
+                results = json.loads(_out).get('results', [])
+                ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
+                if ldap_outpost:
+                    outpost_token_id = ldap_outpost.get('token_identifier') or ldap_outpost.get('token')
+                    if not outpost_token_id:
+                        _ok2, _out2 = _module_run(deploy_cfg,
+                            f'curl -s -H "{_auth_header}" '
+                            f'"{_ak_local_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/" 2>/dev/null',
+                            timeout=10)
+                        if _ok2 and _out2:
+                            detail = json.loads(_out2)
+                            outpost_token_id = detail.get('token_identifier') or detail.get('token')
+                    if outpost_token_id:
+                        _ok3, _out3 = _module_run(deploy_cfg,
+                            f'curl -s -H "{_auth_header}" '
+                            f'"{_ak_local_url}/api/v3/core/tokens/{outpost_token_id}/view_key/" 2>/dev/null',
+                            timeout=10)
+                        if _ok3 and _out3:
+                            ldap_token_key = json.loads(_out3).get('key', '')
+                            plog("  ✓ Retrieved LDAP outpost token from API")
+        except Exception as e:
+            plog(f"  ⚠ Token fetch: {str(e)[:150]}")
     if ldap_token_key:
         try:
             safe_key = ldap_token_key.replace("'", "''")

@@ -17497,6 +17497,7 @@ def _authentik_smtp_configured():
     settings = load_settings()
     ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
     if ak_cfg.get('target_mode') == 'remote':
+        # For remote deploys the .env lives on the remote host; we track state in settings
         return bool(settings.get('authentik_smtp_configured_remote'))
     env_path = os.path.expanduser('~/authentik/.env')
     if not os.path.exists(env_path):

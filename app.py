@@ -848,16 +848,34 @@ def detect_modules():
     ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
     ak_installed = False
     ak_running = False
+    ak_status_unknown = False
     if ak_cfg.get('target_mode') == 'remote' and ak_cfg.get('deployed') and (ak_cfg.get('remote', {}).get('host') or '').strip():
         ak_installed = True
+        remote_host = (ak_cfg.get('remote', {}).get('host') or '').strip()
+        # Try SSH probe first
         ok, out = _ssh_probe(ak_cfg.get('remote', {}), 'docker ps --filter name=authentik-server --format "{{.Status}}"', timeout=12)
-        ak_running = bool(ok and out and 'Up' in out)
+        if ok and out is not None:
+            ak_running = 'Up' in out
+        else:
+            # SSH unavailable — fall back to HTTP health endpoint
+            try:
+                import urllib.request as _ak_ur
+                _ak_ur.urlopen(f'http://{remote_host}:9090/-/health/live/', timeout=5)
+                ak_running = True
+            except Exception:
+                try:
+                    _ak_ur.urlopen(f'https://{remote_host}:9443/-/health/live/', timeout=5)
+                    ak_running = True
+                except Exception:
+                    ak_running = False
+                    ak_status_unknown = True
     else:
         ak_installed = os.path.exists(os.path.expanduser('~/authentik/docker-compose.yml'))
         if ak_installed:
             r = subprocess.run('docker ps --filter name=authentik-server --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
             ak_running = 'Up' in r.stdout
     modules['authentik'] = {'name': 'Authentik', 'installed': ak_installed, 'running': ak_running,
+        'status_unknown': ak_status_unknown,
         'description': 'Identity provider — SSO, LDAP, user management', 'icon': '🔐', 'icon_url': AUTHENTIK_LOGO_URL, 'route': '/authentik', 'priority': 2}
     # TAK Portal - Docker-based user management (local only; stays with TAK Server)
     portal_installed = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
@@ -47543,7 +47561,7 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 <div class="module-desc">{{ mod.description }}</div>
 {% if module_versions.get(key) %}{% set v = module_versions.get(key) %}{% if v.version or v.update_available %}<div class="meta-line module-version-line" id="module-version-{{ key }}" style="margin-bottom:4px">{% if v.version %}{% if key == 'mediamtx' %}{{ v.version }}{% else %}v{{ v.version }}{% endif %}{% endif %}{% if v.update_available %} <span style="color:var(--cyan);font-size:10px" title="Update available">update</span>{% elif key == 'authentik' and v.get('channel') == 'dev' %} <span style="color:#f59e0b;font-size:10px" title="Dev channel — main is pinned at v{{ v.get('vetted_release','') }}">· main: v{{ v.get('vetted_release','') }}</span>{% elif key == 'authentik' and not v.update_available and v.get('vetted_release') %} <span style="color:var(--green);font-size:10px" title="Fleet-vetted release">vetted ✓</span>{% endif %}</div>{% endif %}{% endif %}
-<span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
+<span class="module-status status-{% if mod.installed and mod.running %}running{% elif mod.installed and mod.get('status_unknown') %}caution{% elif mod.installed %}stopped{% else %}not-installed{% endif %}" id="module-status-{{ key }}" data-module="{{ key }}" data-gd-overall="{% if key == 'guarddog' and mod.installed and mod.running %}fetch{% endif %}">{% if mod.installed and mod.running %}<span class="status-dot"></span> Running{% elif mod.installed and mod.get('status_unknown') %}<span class="status-dot"></span> Unknown{% elif mod.installed %}<span class="status-dot"></span> Stopped{% else %}Not Installed{% endif %}</span>
 {% if key == 'takserver' and mod.installed %}<div id="takserver-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'fedhub' and mod.installed %}<div id="fedhub-card-cert-expiry" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}
 {% if key == 'caddy' and mod.installed %}<div id="caddy-card-cert-days" style="font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--text-dim);margin-top:4px"></div>{% endif %}

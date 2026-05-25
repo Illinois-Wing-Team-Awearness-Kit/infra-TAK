@@ -27049,6 +27049,13 @@ networks:
         'command: ' + _AUTHENTIK_PG_COMMAND_ENTERPRISE,
         'command: ' + _pg_cmd_remote,
     )
+    # Remote installs: bind HTTP port on 0.0.0.0 so Caddy on the console server
+    # can reach it for forward_auth and reverse_proxy. UFW in Step 8 restricts
+    # this to the console IP only. (Local installs keep 127.0.0.1 — see v0.9.12.)
+    compose_content = compose_content.replace(
+        '      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"',
+        '      - "0.0.0.0:${COMPOSE_PORT_HTTP:-9090}:9000"',
+    )
     with open('/tmp/authentik_remote_compose.yml', 'w') as f:
         f.write(compose_content)
     ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote_compose.yml', '/tmp/docker-compose.yml', log_fn=plog)
@@ -27243,30 +27250,37 @@ networks:
     #     in keep working until the operator sets it.
     _console_src_ip = _fedhub_caddy_source_ip(settings)
     if _console_src_ip:
+        # Port 9090: Caddy on the console server needs to reach the Authentik HTTP
+        # API for forward_auth and reverse_proxy. Source-scope it to the console IP
+        # so it's reachable from exactly one host, not the general internet.
         _ufw_block = (
             'command -v ufw >/dev/null 2>&1 && (sudo ufw allow 22/tcp 2>/dev/null; '
             f'sudo ufw allow from {_console_src_ip} to any port 389 proto tcp 2>/dev/null; '
             f'sudo ufw allow from {_console_src_ip} to any port 636 proto tcp 2>/dev/null; '
+            f'sudo ufw allow from {_console_src_ip} to any port 9090 proto tcp 2>/dev/null; '
             'sudo ufw deny 389/tcp 2>/dev/null; sudo ufw deny 636/tcp 2>/dev/null; '
             'sudo ufw deny 9090/tcp 2>/dev/null; sudo ufw deny 9443/tcp 2>/dev/null; '
             'sudo ufw --force enable 2>/dev/null; sudo ufw reload 2>/dev/null); '
             'command -v firewall-cmd >/dev/null 2>&1 && ('
             f'sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address={_console_src_ip} port port=389 protocol=tcp accept" 2>/dev/null; '
             f'sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address={_console_src_ip} port port=636 protocol=tcp accept" 2>/dev/null; '
+            f'sudo firewall-cmd --permanent --add-rich-rule="rule family=ipv4 source address={_console_src_ip} port port=9090 protocol=tcp accept" 2>/dev/null; '
             'sudo firewall-cmd --reload 2>/dev/null); true'
         )
-        plog(f"✓ Firewall hardened: 389/636 LDAP source-scoped to console IP {_console_src_ip}; 9090/9443 loopback only (Caddy proxies)")
+        plog(f"✓ Firewall hardened: 389/636/9090 source-scoped to console IP {_console_src_ip}; 9443 denied")
     else:
         _ufw_block = (
             'command -v ufw >/dev/null 2>&1 && (sudo ufw allow 22/tcp 2>/dev/null; '
             'sudo ufw allow 389/tcp 2>/dev/null; sudo ufw allow 636/tcp 2>/dev/null; '
-            'sudo ufw deny 9090/tcp 2>/dev/null; sudo ufw deny 9443/tcp 2>/dev/null; '
+            'sudo ufw allow 9090/tcp 2>/dev/null; '
+            'sudo ufw deny 9443/tcp 2>/dev/null; '
             'sudo ufw --force enable 2>/dev/null; sudo ufw reload 2>/dev/null); '
             'command -v firewall-cmd >/dev/null 2>&1 && (sudo firewall-cmd --permanent --add-port=389/tcp 2>/dev/null; '
             'sudo firewall-cmd --permanent --add-port=636/tcp 2>/dev/null; '
+            'sudo firewall-cmd --permanent --add-port=9090/tcp 2>/dev/null; '
             'sudo firewall-cmd --reload 2>/dev/null); true'
         )
-        plog("⚠ No console source IP set (Settings → Server IP) — 389/636 left public; 9090/9443 denied. Fill Server IP to enable source-scoping.")
+        plog("⚠ No console source IP set (Settings → Server IP) — 389/636/9090 left public. Fill Server IP to enable source-scoping.")
     _module_run(deploy_cfg, _ufw_block, timeout=20)
 
     # v0.9.30: stamp settings.authentik_trusted_proxy_cidrs_fix so the fail2ban

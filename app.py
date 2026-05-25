@@ -30141,6 +30141,9 @@ networks:
     #     in keep working until the operator sets it.
     _console_src_ip = _fedhub_caddy_source_ip(settings)
     if _console_src_ip:
+        # Port 9090: Caddy on the console server needs to reach the Authentik HTTP
+        # API for forward_auth and reverse_proxy. Source-scope it to the console IP
+        # so it's reachable from exactly one host, not the general internet.
         _ufw_block = (
             'command -v ufw >/dev/null 2>&1 && (sudo ufw allow 22/tcp 2>/dev/null; '
             f'sudo ufw allow from {_console_src_ip} to any port 389 proto tcp 2>/dev/null; '

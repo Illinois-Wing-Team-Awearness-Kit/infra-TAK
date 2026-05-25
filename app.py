@@ -26232,11 +26232,16 @@ if not key:
     sys.exit(5)
 with open("docker-compose.yml") as f:
     content = f.read()
-if "AUTHENTIK_TOKEN: placeholder" not in content:
-    print("ERROR: docker-compose.yml has no placeholder or already patched", file=sys.stderr)
-    sys.exit(6)
+import re as _re
 safe = key.replace("'", "''")
-content = content.replace("AUTHENTIK_TOKEN: placeholder", "AUTHENTIK_TOKEN: '" + safe + "'")
+# Replace placeholder OR an already-set (possibly wrong) token — either way inject the current key
+if "AUTHENTIK_TOKEN: placeholder" in content:
+    content = content.replace("AUTHENTIK_TOKEN: placeholder", "AUTHENTIK_TOKEN: '" + safe + "'")
+elif _re.search(r"AUTHENTIK_TOKEN: '.*'", content):
+    content = _re.sub(r"AUTHENTIK_TOKEN: '.*'", "AUTHENTIK_TOKEN: '" + safe + "'", content)
+else:
+    print("ERROR: docker-compose.yml has no AUTHENTIK_TOKEN line to patch", file=sys.stderr)
+    sys.exit(6)
 with open("docker-compose.yml", "w") as f:
     f.write(content)
 subprocess.run("docker compose stop ldap 2>/dev/null; docker compose rm -f ldap 2>/dev/null; docker compose up -d ldap", shell=True, timeout=90, cwd=os.path.expanduser("~/authentik"))
@@ -27136,38 +27141,49 @@ networks:
         plog("  ✓ Authentik API is ready")
     else:
         plog("  ⚠ API timeout — LDAP token injection skipped; use Fix LDAP token on Authentik page")
-    plog("  Waiting for LDAP outpost blueprint...")
-    time.sleep(15)
+    # Blueprints that create the default LDAP outpost can take several minutes
+    # to finish after the API first becomes reachable. Retry for up to 5 minutes.
     ldap_token_key = None
     if api_ready:
-        try:
-            _ok, _out = _module_run(deploy_cfg,
-                f'curl -s -H "{_auth_header}" '
-                f'"{_ak_local_url}/api/v3/outposts/instances/?search=LDAP" 2>/dev/null',
-                timeout=15)
-            if _ok and _out:
-                results = json.loads(_out).get('results', [])
-                ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
-                if ldap_outpost:
-                    outpost_token_id = ldap_outpost.get('token_identifier') or ldap_outpost.get('token')
-                    if not outpost_token_id:
-                        _ok2, _out2 = _module_run(deploy_cfg,
-                            f'curl -s -H "{_auth_header}" '
-                            f'"{_ak_local_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/" 2>/dev/null',
-                            timeout=10)
-                        if _ok2 and _out2:
-                            detail = json.loads(_out2)
-                            outpost_token_id = detail.get('token_identifier') or detail.get('token')
-                    if outpost_token_id:
-                        _ok3, _out3 = _module_run(deploy_cfg,
-                            f'curl -s -H "{_auth_header}" '
-                            f'"{_ak_local_url}/api/v3/core/tokens/{outpost_token_id}/view_key/" 2>/dev/null',
-                            timeout=10)
-                        if _ok3 and _out3:
-                            ldap_token_key = json.loads(_out3).get('key', '')
-                            plog("  ✓ Retrieved LDAP outpost token from API")
-        except Exception as e:
-            plog(f"  ⚠ Token fetch: {str(e)[:150]}")
+        plog("  Waiting for LDAP outpost blueprint (up to 5 min)...")
+        _ldap_outpost_found = False
+        for _bp_attempt in range(30):  # 30 × 10s = 5 minutes
+            try:
+                _ok, _out = _module_run(deploy_cfg,
+                    f'curl -s -H "{_auth_header}" '
+                    f'"{_ak_local_url}/api/v3/outposts/instances/?search=LDAP" 2>/dev/null',
+                    timeout=15)
+                if _ok and _out:
+                    results = json.loads(_out).get('results', [])
+                    ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
+                    if ldap_outpost:
+                        outpost_token_id = ldap_outpost.get('token_identifier') or ldap_outpost.get('token')
+                        if not outpost_token_id:
+                            _ok2, _out2 = _module_run(deploy_cfg,
+                                f'curl -s -H "{_auth_header}" '
+                                f'"{_ak_local_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/" 2>/dev/null',
+                                timeout=10)
+                            if _ok2 and _out2:
+                                detail = json.loads(_out2)
+                                outpost_token_id = detail.get('token_identifier') or detail.get('token')
+                        if outpost_token_id:
+                            _ok3, _out3 = _module_run(deploy_cfg,
+                                f'curl -s -H "{_auth_header}" '
+                                f'"{_ak_local_url}/api/v3/core/tokens/{outpost_token_id}/view_key/" 2>/dev/null',
+                                timeout=10)
+                            if _ok3 and _out3:
+                                ldap_token_key = json.loads(_out3).get('key', '')
+                                if ldap_token_key:
+                                    plog(f"  ✓ Retrieved LDAP outpost token from API ({_bp_attempt * 10}s after API ready)")
+                                    _ldap_outpost_found = True
+                                    break
+            except Exception as e:
+                plog(f"  ⚠ Token fetch attempt {_bp_attempt + 1}: {str(e)[:100]}")
+            if _bp_attempt % 3 == 2:
+                plog(f"  ⏳ Waiting for LDAP blueprint... ({(_bp_attempt + 1) * 10}s)")
+            time.sleep(10)
+        if not _ldap_outpost_found:
+            plog("  ⚠ LDAP outpost not found after 5 min — token injection skipped")
     if ldap_token_key:
         try:
             safe_key = ldap_token_key.replace("'", "''")

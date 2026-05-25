@@ -29963,14 +29963,19 @@ networks:
     ok, out = _module_run(deploy_cfg, 'cd ~/authentik && docker compose up -d 2>&1', timeout=600, log_fn=plog)
     if not ok:
         plog(f"✗ Docker Compose failed")
-        # Show diagnostic output so operator doesn't need to SSH to debug
-        plog(f"  Last output: {(out or '')[-1000:]}")
-        _ok2, _ps_out = _module_run(deploy_cfg, 'docker ps -a --filter name=authentik 2>/dev/null', timeout=15)
-        if _ok2 and _ps_out:
-            plog(f"  Container state:\n{_ps_out[:600]}")
-        _ok3, _pg_log = _module_run(deploy_cfg, 'docker logs authentik-postgresql-1 --tail 20 2>/dev/null || docker logs authentik-postgres-1 --tail 20 2>/dev/null || true', timeout=15)
-        if _ok3 and _pg_log:
-            plog(f"  PostgreSQL logs:\n{_pg_log[:600]}")
+        if (out or '').strip():
+            for _line in (out or '').strip().splitlines()[-20:]:
+                plog(f"  {_line}")
+        _, _ps = _module_run(deploy_cfg, 'docker ps -a --filter "name=authentik" --format "{{.Names}}  {{.Status}}" 2>/dev/null', timeout=10)
+        if (_ps or '').strip():
+            plog("  Container states:")
+            for _line in (_ps or '').strip().splitlines():
+                plog(f"    {_line}")
+        _, _logs = _module_run(deploy_cfg, 'docker logs authentik-postgresql-1 --tail 20 2>&1', timeout=10)
+        if (_logs or '').strip():
+            plog("  postgresql logs (last 20 lines):")
+            for _line in (_logs or '').strip().splitlines():
+                plog(f"    {_line}")
         authentik_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Containers started")

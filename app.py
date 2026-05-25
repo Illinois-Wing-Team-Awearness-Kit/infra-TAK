@@ -1151,6 +1151,8 @@ def render_sidebar(modules, active_path, takwerx_logo_url=None):
     portal = modules.get('takportal', {})
     if portal.get('installed'):
         parts.append(link('/takportal', '<span class="nav-icon material-symbols-outlined">group</span>TAK Portal'))
+    if modules.get('takserver', {}).get('installed'):
+        parts.append(link('/mission-portal', '<span class="nav-icon material-symbols-outlined">emergency</span>Mission Portal'))
     cloudtak = modules.get('cloudtak', {})
     if cloudtak.get('installed'):
         parts.append(link('/cloudtak', f'<img src="{html.escape(CLOUDTAK_ICON)}" alt="" class="nav-icon" style="height:24px;width:auto;max-width:72px;object-fit:contain;display:block"><span>CloudTAK</span>'))
@@ -45943,6 +45945,821 @@ async function doConsoleRollback(){
         }
     }catch(e){if(btn){btn.disabled=false;btn.textContent='↩ Roll Back';}alert('Network error: '+e.message);}
 }
+</script></body></html>'''
+
+
+# ============================================================
+# MISSION PORTAL — Incident mission management, LDAP credential
+# provisioning per role, and credential email distribution.
+# ============================================================
+
+def _mp_generate_password(length=16):
+    """Generate a secure random password with mixed character classes."""
+    import secrets as _sec, string as _str
+    alphabet = _str.ascii_letters + _str.digits + '!@#$%^&*'
+    while True:
+        pw = ''.join(_sec.choice(alphabet) for _ in range(length))
+        if (any(c.isupper() for c in pw) and any(c.islower() for c in pw)
+                and any(c.isdigit() for c in pw)
+                and any(c in '!@#$%^&*' for c in pw)):
+            return pw
+
+
+def _mp_get_ak_creds(settings=None):
+    """Return (ak_url, headers) or (None, None) if Authentik not configured."""
+    if settings is None:
+        settings = load_settings()
+    ak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
+                or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
+    if not ak_token:
+        return None, None
+    ak_url = _get_authentik_api_url(settings)
+    headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
+    return ak_url, headers
+
+
+def _mp_ensure_authentik_group(ak_url, headers, group_name):
+    """Get or create an Authentik group by exact name. Returns group PK."""
+    import urllib.request as _req
+    import urllib.parse as _up
+    search = _req.Request(
+        f'{ak_url}/api/v3/core/groups/?search={_up.quote(group_name)}',
+        headers=headers)
+    results = json.loads(_req.urlopen(search, timeout=10).read().decode())['results']
+    existing = next((g for g in results if g['name'] == group_name), None)
+    if existing:
+        return existing['pk']
+    create = _req.Request(
+        f'{ak_url}/api/v3/core/groups/',
+        data=json.dumps({'name': group_name, 'is_superuser': False}).encode(),
+        headers=headers, method='POST')
+    return json.loads(_req.urlopen(create, timeout=10).read().decode())['pk']
+
+
+def _mp_create_or_update_authentik_user(ak_url, headers, username, display_name,
+                                         password, group_pks):
+    """Create user in Authentik (or update if exists). Returns user PK."""
+    import urllib.request as _req
+    import urllib.parse as _up
+    search = _req.Request(
+        f'{ak_url}/api/v3/core/users/?search={_up.quote(username)}',
+        headers=headers)
+    results = json.loads(_req.urlopen(search, timeout=10).read().decode())['results']
+    existing = next((u for u in results if u['username'] == username), None)
+    if not existing:
+        body = {
+            'username': username,
+            'name': display_name,
+            'is_active': True,
+            'is_superuser': False,
+            'path': 'users',
+            'groups': group_pks
+        }
+        req = _req.Request(
+            f'{ak_url}/api/v3/core/users/',
+            data=json.dumps(body).encode(),
+            headers=headers, method='POST')
+        user_pk = json.loads(_req.urlopen(req, timeout=10).read().decode())['pk']
+    else:
+        user_pk = existing['pk']
+        existing_gpks = [g.get('pk', g) if isinstance(g, dict) else g
+                         for g in (existing.get('groups') or [])]
+        merged = list(set(existing_gpks + group_pks))
+        req = _req.Request(
+            f'{ak_url}/api/v3/core/users/{user_pk}/',
+            data=json.dumps({'is_active': True, 'groups': merged}).encode(),
+            headers=headers, method='PATCH')
+        _req.urlopen(req, timeout=10)
+    pw_req = _req.Request(
+        f'{ak_url}/api/v3/core/users/{user_pk}/set_password/',
+        data=json.dumps({'password': password}).encode(),
+        headers=headers, method='POST')
+    _req.urlopen(pw_req, timeout=10)
+    return user_pk
+
+
+def _mp_disable_authentik_user(ak_url, headers, user_pk):
+    """Deactivate an Authentik user (revoke access without deleting)."""
+    import urllib.request as _req
+    req = _req.Request(
+        f'{ak_url}/api/v3/core/users/{user_pk}/',
+        data=json.dumps({'is_active': False}).encode(),
+        headers=headers, method='PATCH')
+    _req.urlopen(req, timeout=10)
+
+
+def _mp_send_credentials_email(settings, to_addr, mission_name, role_display,
+                                username, password, server_fqdn=''):
+    """Send HTML+plain credential email via Email Relay (localhost:25)."""
+    import smtplib
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.text import MIMEText
+    relay = settings.get('email_relay', {})
+    from_addr = relay.get('from_addr', 'noreply@localhost')
+    from_name = relay.get('from_name', 'infra-TAK Mission Portal')
+    server_note = f'<br><span style="color:#94a3b8">Server: {html.escape(server_fqdn)}</span>' if server_fqdn else ''
+    html_body = (
+        '<!DOCTYPE html><html><head><meta charset="UTF-8"></head>'
+        '<body style="background:#080b14;color:#f1f5f9;font-family:Arial,sans-serif;padding:32px">'
+        '<div style="max-width:520px;margin:0 auto">'
+        '<div style="background:#161b26;border:1px solid #1e2736;border-radius:14px;padding:32px">'
+        '<div style="font-size:11px;font-weight:700;letter-spacing:.12em;color:#06b6d4;text-transform:uppercase;margin-bottom:6px">MISSION CREDENTIALS</div>'
+        f'<h1 style="font-size:22px;font-weight:700;margin:0 0 6px">{html.escape(mission_name)}</h1>'
+        f'<div style="font-size:13px;color:#94a3b8;margin-bottom:28px">Role: <strong style="color:#f1f5f9">{html.escape(role_display)}</strong>{server_note}</div>'
+        '<div style="background:#0f1219;border:1px solid #1e2736;border-radius:10px;padding:20px;margin-bottom:20px">'
+        '<div style="margin-bottom:14px">'
+        '<div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Username</div>'
+        f'<div style="font-family:\'Courier New\',monospace;font-size:16px;font-weight:600;color:#06b6d4">{html.escape(username)}</div>'
+        '</div><div>'
+        '<div style="font-size:11px;color:#64748b;text-transform:uppercase;letter-spacing:.08em;margin-bottom:4px">Password</div>'
+        f'<div style="font-family:\'Courier New\',monospace;font-size:16px;font-weight:600;color:#10b981">{html.escape(password)}</div>'
+        '</div></div>'
+        '<div style="font-size:11px;color:#475569;line-height:1.6;border-top:1px solid #1e2736;padding-top:16px">'
+        f'Keep these credentials confidential. Do not share via unsecured channels.<br>'
+        f'These credentials provide access to the <strong>{html.escape(mission_name)}</strong> mission workspace.'
+        '</div></div>'
+        '<div style="text-align:center;font-size:10px;color:#334155;margin-top:16px">infra-TAK Mission Portal</div>'
+        '</div></body></html>'
+    )
+    text_body = (
+        f'MISSION CREDENTIALS\n'
+        f'Mission: {mission_name}\n'
+        f'Role: {role_display}\n\n'
+        f'Username: {username}\n'
+        f'Password: {password}\n\n'
+        f'Keep these credentials confidential.\n'
+    )
+    msg = MIMEMultipart('alternative')
+    msg['From'] = f'{from_name} <{from_addr}>'
+    msg['To'] = to_addr
+    msg['Subject'] = f'TAK Credentials – {mission_name} ({role_display})'
+    msg.attach(MIMEText(text_body, 'plain', 'utf-8'))
+    msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+    with smtplib.SMTP('localhost', 25, timeout=15) as s:
+        s.sendmail(from_addr, [to_addr], msg.as_string())
+
+
+def _mp_provision_mission(form_data):
+    """
+    Provision a new mission: Authentik group + per-role users, optional TAK
+    DataSync mission, credential emails. Returns (mission_record, errors).
+    """
+    import uuid as _umod
+    settings = load_settings()
+    errors = []
+    mission_id = str(_umod.uuid4())[:8]
+    now_iso = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    raw_name = (form_data.get('mission_name') or '').strip()
+    incident_name = (form_data.get('incident_name') or '').strip()
+    safe_id = re.sub(r'[^a-z0-9]', '-', raw_name.lower())[:20].strip('-') or mission_id
+    channel_name = f'mission-{safe_id}'
+    group_name = f'tak_mission_{safe_id}'
+    ROLE_DEFS = [
+        ('command_post', 'Command Post', 'cp', form_data.get('cp_email', '').strip(), True),
+        ('ground_teams', 'Ground Teams',  'gt', form_data.get('gt_email', '').strip(), True),
+        ('air_crews',    'Air Crews',     'ac', form_data.get('ac_email', '').strip(), True),
+        ('liaison',      'Liaison',       'li', form_data.get('li_email', '').strip(),
+            bool(form_data.get('liaison_enabled'))),
+        ('vista',        'VISTA',         'vi', form_data.get('vi_email', '').strip(),
+            bool(form_data.get('vista_enabled'))),
+    ]
+    active_roles = [(k, d, sfx, em) for k, d, sfx, em, en in ROLE_DEFS if en]
+    ak_url, ak_headers = _mp_get_ak_creds(settings)
+    role_records = {}
+    group_pk = None
+    if ak_url:
+        try:
+            group_pk = _mp_ensure_authentik_group(ak_url, ak_headers, group_name)
+        except Exception as e:
+            errors.append(f'Authentik group creation failed: {e}')
+        for role_key, role_display, suffix, role_email in active_roles:
+            username = f'm-{safe_id[:12]}-{suffix}'
+            password = _mp_generate_password()
+            ak_pk = None
+            if group_pk:
+                try:
+                    ak_pk = _mp_create_or_update_authentik_user(
+                        ak_url, ak_headers, username,
+                        f'{role_display} — {raw_name}', password, [group_pk])
+                except Exception as e:
+                    errors.append(f'User creation failed for {username}: {e}')
+            email_sent = False
+            email_sent_at = None
+            if role_email:
+                try:
+                    _mp_send_credentials_email(
+                        settings, role_email, raw_name, role_display, username,
+                        password, settings.get('fqdn', ''))
+                    email_sent = True
+                    email_sent_at = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+                except Exception as e:
+                    errors.append(f'Email to {role_email} failed: {e}')
+            role_records[role_key] = {
+                'display': role_display,
+                'username': username,
+                'password_preview': password[:4] + '****' if password else '',
+                'email': role_email,
+                'email_sent': email_sent,
+                'email_sent_at': email_sent_at,
+                'ak_user_pk': ak_pk,
+            }
+    else:
+        errors.append('Authentik not configured — LDAP users not created.')
+        for role_key, role_display, suffix, role_email in active_roles:
+            role_records[role_key] = {
+                'display': role_display,
+                'username': '',
+                'password_preview': '',
+                'email': role_email,
+                'email_sent': False,
+                'email_sent_at': None,
+                'ak_user_pk': None,
+            }
+    tak_mission_ok = False
+    if os.path.exists('/opt/tak'):
+        ws_pass = settings.get('webadmin_password', '')
+        if ws_pass:
+            try:
+                import base64 as _b64, urllib.request as _req, urllib.parse as _up
+                ssl_ctx = ssl.create_default_context()
+                ssl_ctx.check_hostname = False
+                ssl_ctx.verify_mode = ssl.CERT_NONE
+                b64creds = _b64.b64encode(f'webadmin:{ws_pass}'.encode()).decode()
+                hdrs = {'Authorization': f'Basic {b64creds}'}
+                desc = f'{raw_name} — {incident_name}' if incident_name else raw_name
+                params = _up.urlencode({
+                    'creatorUid': 'mission-portal',
+                    'description': desc,
+                    'defaultRole': 'MISSION_SUBSCRIBER'
+                })
+                mreq = _req.Request(
+                    f'https://localhost:8446/Marti/api/missions/{_up.quote(channel_name)}?{params}',
+                    data=b'', headers=hdrs, method='PUT')
+                _req.urlopen(mreq, context=ssl_ctx, timeout=15)
+                tak_mission_ok = True
+            except Exception as e:
+                errors.append(f'TAK Server mission creation skipped: {str(e)[:120]}')
+    access_log = [{'timestamp': now_iso, 'action': 'mission_created',
+                   'details': f'Roles: {", ".join(k for k, *_ in active_roles)}'}]
+    for role_key, rec in role_records.items():
+        if rec.get('email_sent'):
+            access_log.append({'timestamp': rec['email_sent_at'],
+                                'action': 'credentials_sent',
+                                'role': role_key, 'email': rec['email']})
+    record = {
+        'id': mission_id,
+        'name': raw_name,
+        'incident_name': incident_name,
+        'channel_name': channel_name,
+        'group_name': group_name,
+        'created_at': now_iso,
+        'status': 'active',
+        'tak_mission_created': tak_mission_ok,
+        'roles': role_records,
+        'access_log': access_log,
+        'provision_errors': errors,
+    }
+    s = load_settings()
+    s.setdefault('missions', {})[mission_id] = record
+    save_settings(s)
+    return record, errors
+
+
+@app.route('/mission-portal')
+@login_required
+def mission_portal_page():
+    settings = load_settings()
+    missions = sorted(settings.get('missions', {}).values(),
+                      key=lambda m: m.get('created_at', ''), reverse=True)
+    r = make_response(render_template_string(
+        MISSION_PORTAL_TEMPLATE,
+        settings=settings, version=VERSION,
+        missions=missions, modules=detect_modules()))
+    r.headers['Cache-Control'] = 'no-store, no-cache, must-revalidate'
+    return r
+
+
+@app.route('/api/missions', methods=['GET'])
+@login_required
+def mp_list_missions():
+    s = load_settings()
+    missions = sorted(s.get('missions', {}).values(),
+                      key=lambda m: m.get('created_at', ''), reverse=True)
+    return jsonify({'missions': list(missions)})
+
+
+@app.route('/api/missions', methods=['POST'])
+@login_required
+def mp_create_mission():
+    data = request.get_json(force=True) or {}
+    if not (data.get('mission_name') or '').strip():
+        return jsonify({'error': 'mission_name is required'}), 400
+    record, errors = _mp_provision_mission(data)
+    return jsonify({'mission': record, 'errors': errors})
+
+
+@app.route('/api/missions/<mission_id>', methods=['GET'])
+@login_required
+def mp_get_mission(mission_id):
+    s = load_settings()
+    m = s.get('missions', {}).get(mission_id)
+    if not m:
+        return jsonify({'error': 'Not found'}), 404
+    return jsonify({'mission': m})
+
+
+@app.route('/api/missions/<mission_id>/resend-email', methods=['POST'])
+@login_required
+def mp_resend_email(mission_id):
+    """Reset password and resend credentials to a role's email (or a new address)."""
+    data = request.get_json(force=True) or {}
+    role_key = (data.get('role') or '').strip()
+    new_email = (data.get('email') or '').strip()
+    s = load_settings()
+    m = s.get('missions', {}).get(mission_id)
+    if not m:
+        return jsonify({'error': 'Not found'}), 404
+    role_rec = m.get('roles', {}).get(role_key)
+    if not role_rec:
+        return jsonify({'error': f'Role not found: {role_key}'}), 400
+    target_email = new_email or role_rec.get('email', '')
+    if not target_email:
+        return jsonify({'error': 'No email address specified'}), 400
+    ak_url, ak_headers = _mp_get_ak_creds(s)
+    if not ak_url:
+        return jsonify({'error': 'Authentik not configured'}), 500
+    new_password = _mp_generate_password()
+    ak_pk = role_rec.get('ak_user_pk')
+    if ak_pk:
+        try:
+            import urllib.request as _req
+            pw_req = _req.Request(
+                f'{ak_url}/api/v3/core/users/{ak_pk}/set_password/',
+                data=json.dumps({'password': new_password}).encode(),
+                headers=ak_headers, method='POST')
+            _req.urlopen(pw_req, timeout=10)
+        except Exception as e:
+            return jsonify({'error': f'Password reset failed: {e}'}), 500
+    try:
+        _mp_send_credentials_email(
+            s, target_email, m['name'],
+            role_rec.get('display', role_key),
+            role_rec.get('username', ''), new_password,
+            s.get('fqdn', ''))
+    except Exception as e:
+        return jsonify({'error': f'Email send failed: {e}'}), 500
+    now_iso = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    role_rec['email'] = target_email
+    role_rec['email_sent'] = True
+    role_rec['email_sent_at'] = now_iso
+    role_rec['password_preview'] = new_password[:4] + '****'
+    m.setdefault('access_log', []).append({
+        'timestamp': now_iso, 'action': 'credentials_resent',
+        'role': role_key, 'email': target_email,
+    })
+    save_settings(s)
+    return jsonify({'ok': True, 'email': target_email})
+
+
+@app.route('/api/missions/<mission_id>/archive', methods=['POST'])
+@login_required
+def mp_archive_mission(mission_id):
+    s = load_settings()
+    m = s.get('missions', {}).get(mission_id)
+    if not m:
+        return jsonify({'error': 'Not found'}), 404
+    m['status'] = 'archived'
+    m.setdefault('access_log', []).append(
+        {'timestamp': datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ'),
+         'action': 'archived'})
+    save_settings(s)
+    return jsonify({'ok': True})
+
+
+@app.route('/api/missions/<mission_id>/revoke', methods=['POST'])
+@login_required
+def mp_revoke_mission(mission_id):
+    """Disable all LDAP users for a mission (revoke TAK access)."""
+    s = load_settings()
+    m = s.get('missions', {}).get(mission_id)
+    if not m:
+        return jsonify({'error': 'Not found'}), 404
+    ak_url, ak_headers = _mp_get_ak_creds(s)
+    errors = []
+    if ak_url:
+        for role_key, role_rec in m.get('roles', {}).items():
+            ak_pk = role_rec.get('ak_user_pk')
+            if ak_pk:
+                try:
+                    _mp_disable_authentik_user(ak_url, ak_headers, ak_pk)
+                except Exception as e:
+                    errors.append(f'{role_key}: {e}')
+    now_iso = datetime.utcnow().strftime('%Y-%m-%dT%H:%M:%SZ')
+    m['status'] = 'revoked'
+    m.setdefault('access_log', []).append(
+        {'timestamp': now_iso, 'action': 'revoked', 'errors': errors})
+    save_settings(s)
+    return jsonify({'ok': True, 'errors': errors})
+
+
+MISSION_PORTAL_TEMPLATE = '''<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Mission Portal — infra-TAK</title>
+<link rel="preconnect" href="https://fonts.googleapis.com"><link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+<link href="https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@24,400,0,0" rel="stylesheet">
+<style>
+.material-symbols-outlined{font-family:\'Material Symbols Outlined\';font-weight:400;font-style:normal;font-size:20px;line-height:1;letter-spacing:normal;white-space:nowrap;direction:ltr;-webkit-font-smoothing:antialiased}
+:root{--bg-deep:#080b14;--bg-surface:#0f1219;--bg-card:#161b26;--border:#1e2736;--text-primary:#f1f5f9;--text-secondary:#cbd5e1;--text-dim:#94a3b8;--accent:#3b82f6;--cyan:#06b6d4;--green:#10b981;--red:#ef4444;--yellow:#eab308;--orange:#f97316}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg-deep);color:var(--text-primary);font-family:\'DM Sans\',sans-serif;min-height:100vh;display:flex;flex-direction:row}
+.sidebar{width:220px;min-width:220px;background:var(--bg-surface);border-right:1px solid var(--border);padding:24px 0;flex-shrink:0}
+.nav-item{display:flex;align-items:center;gap:10px;padding:9px 20px;color:var(--text-secondary);text-decoration:none;font-size:13px;font-weight:500;transition:all .15s;border-left:2px solid transparent}
+.nav-item:hover{color:var(--text-primary);background:rgba(255,255,255,.03)}.nav-item.active{color:var(--cyan);background:rgba(6,182,212,.06);border-left-color:var(--cyan)}
+.sidebar-logo{padding:0 20px 24px;border-bottom:1px solid var(--border);margin-bottom:16px}
+.sidebar-logo span{font-size:15px;font-weight:700}.sidebar-logo small{display:block;font-size:10px;color:var(--text-dim);font-family:\'JetBrains Mono\',monospace;margin-top:2px}
+.main{flex:1;min-width:0;overflow-y:auto;padding:32px}
+.page-header{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:28px;flex-wrap:wrap;gap:12px}
+.page-header h1{font-size:22px;font-weight:700}.page-header p{color:var(--text-secondary);font-size:13px;margin-top:4px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;border:none;transition:opacity .15s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}
+.btn-primary:hover{opacity:.85}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+.btn-ghost:hover{color:var(--text-primary);background:rgba(255,255,255,.08)}
+.btn-danger{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}
+.btn-danger:hover{background:rgba(239,68,68,.25)}
+.btn-sm{padding:5px 12px;font-size:12px}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:16px}
+.mission-card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:14px;overflow:hidden}
+.mission-header{display:flex;align-items:center;gap:12px;padding:18px 22px;cursor:pointer;user-select:none}
+.mission-header:hover{background:rgba(255,255,255,.02)}
+.mission-title{font-size:15px;font-weight:700;flex:1}
+.mission-meta{font-size:11px;color:var(--text-dim);margin-top:2px}
+.badge{display:inline-flex;align-items:center;gap:4px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.05em}
+.badge-active{background:rgba(16,185,129,.12);color:var(--green);border:1px solid rgba(16,185,129,.25)}
+.badge-archived{background:rgba(100,116,139,.12);color:#64748b;border:1px solid rgba(100,116,139,.2)}
+.badge-revoked{background:rgba(239,68,68,.12);color:var(--red);border:1px solid rgba(239,68,68,.2)}
+.mission-body{display:none;padding:0 22px 22px;border-top:1px solid var(--border)}
+.mission-card.open .mission-body{display:block}
+.mission-card.open .expand-icon{transform:rotate(180deg)}
+.expand-icon{transition:transform .2s;font-size:18px;color:var(--text-dim)}
+.role-table{width:100%;border-collapse:collapse;margin:16px 0}
+.role-table th{font-size:11px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;padding:8px 12px;border-bottom:1px solid var(--border);text-align:left}
+.role-table td{padding:10px 12px;font-size:13px;border-bottom:1px solid rgba(30,39,54,.6)}
+.role-table tr:last-child td{border-bottom:none}
+.mono{font-family:\'JetBrains Mono\',monospace;font-size:12px;color:var(--cyan)}
+.sent-badge{display:inline-flex;align-items:center;gap:4px;font-size:11px}
+.sent-ok{color:var(--green)}.sent-no{color:var(--text-dim)}
+.form-label{display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:5px}
+.form-input{width:100%;background:#0a0e1a;border:1px solid var(--border);border-radius:8px;padding:9px 13px;color:var(--text-primary);font-size:13px;outline:none}
+.form-input:focus{border-color:var(--cyan)}
+.form-row{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:600px){.form-row{grid-template-columns:1fr}}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:1000;display:none;align-items:flex-start;justify-content:center;padding:40px 16px;overflow-y:auto}
+.modal-overlay.open{display:flex}
+.modal{background:var(--bg-card);border:1px solid var(--border);border-radius:14px;padding:28px;width:100%;max-width:620px}
+.modal-title{font-size:17px;font-weight:700;margin-bottom:4px}
+.modal-sub{font-size:12px;color:var(--text-dim);margin-bottom:24px}
+.section-title{font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.1em;margin:20px 0 12px;padding-bottom:6px;border-bottom:1px solid var(--border)}
+.toggle-row{display:flex;align-items:center;gap:10px;margin:12px 0 8px;cursor:pointer}
+.toggle-row input[type=checkbox]{width:16px;height:16px;accent-color:var(--cyan);cursor:pointer}
+.role-email-group{margin-left:26px;margin-bottom:4px}
+.access-log{margin-top:16px}
+.log-entry{display:flex;gap:10px;padding:6px 0;border-bottom:1px solid rgba(30,39,54,.5);font-size:12px}
+.log-entry:last-child{border-bottom:none}
+.log-ts{font-family:\'JetBrains Mono\',monospace;font-size:10px;color:var(--text-dim);white-space:nowrap;min-width:160px}
+.log-action{color:var(--text-secondary)}
+.toast-container{position:fixed;bottom:24px;right:24px;z-index:9999;display:flex;flex-direction:column;gap:8px}
+.toast{display:flex;align-items:center;gap:10px;padding:12px 18px;border-radius:10px;font-size:13px;font-weight:500;min-width:240px;max-width:380px;animation:toast-in .2s ease}
+.toast-ok{background:rgba(16,185,129,.15);border:1px solid rgba(16,185,129,.3);color:var(--green)}
+.toast-err{background:rgba(239,68,68,.15);border:1px solid rgba(239,68,68,.3);color:var(--red)}
+.toast-info{background:rgba(59,130,246,.15);border:1px solid rgba(59,130,246,.3);color:var(--accent)}
+@keyframes toast-in{from{opacity:0;transform:translateY(12px)}to{opacity:1;transform:translateY(0)}}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid rgba(255,255,255,.2);border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+.empty-state{text-align:center;padding:60px 20px;color:var(--text-dim)}
+.empty-state .material-symbols-outlined{font-size:48px;margin-bottom:12px;display:block;color:var(--border)}
+.channel-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;background:rgba(6,182,212,.08);border:1px solid rgba(6,182,212,.2);border-radius:4px;font-family:\'JetBrains Mono\',monospace;font-size:10px;color:var(--cyan)}
+.tak-chip{display:inline-flex;align-items:center;gap:4px;padding:2px 8px;background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.2);border-radius:4px;font-size:10px;color:var(--green)}
+.nav-icon.material-symbols-outlined{font-size:22px;width:22px;text-align:center}
+</style></head><body>
+{{ sidebar_html }}
+<div class="main">
+<div class="page-header">
+  <div>
+    <h1><span class="material-symbols-outlined" style="font-size:26px;vertical-align:-5px;margin-right:6px;color:var(--orange)">emergency</span>Mission Portal</h1>
+    <p>Create incident missions, provision LDAP credentials per role, and distribute via email</p>
+  </div>
+  <button class="btn btn-primary" onclick="openNewMissionModal()">
+    <span class="material-symbols-outlined" style="font-size:16px">add</span>New Mission
+  </button>
+</div>
+<div id="mission-list">
+  <div class="empty-state" id="loading-state">
+    <span class="spinner" style="width:24px;height:24px;border-color:var(--border);border-top-color:var(--cyan)"></span>
+    <div style="margin-top:12px;font-size:13px">Loading missions...</div>
+  </div>
+</div>
+</div>
+<!-- New Mission Modal -->
+<div class="modal-overlay" id="new-mission-modal">
+<div class="modal">
+  <div class="modal-title">Create New Mission</div>
+  <div class="modal-sub">Provisions LDAP credentials and sends them to each role’s email address</div>
+  <div class="section-title">Mission Details</div>
+  <div class="form-row" style="margin-bottom:14px">
+    <div>
+      <label class="form-label">Mission Name <span style="color:var(--red)">*</span></label>
+      <input class="form-input" id="f-mission-name" placeholder="e.g. Bravo" required>
+    </div>
+    <div>
+      <label class="form-label">Incident Name</label>
+      <input class="form-input" id="f-incident-name" placeholder="e.g. Wildfire 2024-A">
+    </div>
+  </div>
+  <div class="section-title">Required Roles</div>
+  <div style="display:flex;flex-direction:column;gap:10px;margin-bottom:4px">
+    <div class="form-row">
+      <div>
+        <label class="form-label">Command Post Email</label>
+        <input class="form-input" id="f-cp-email" type="email" placeholder="cp@example.com">
+      </div>
+      <div>
+        <label class="form-label">Ground Teams Email</label>
+        <input class="form-input" id="f-gt-email" type="email" placeholder="gt@example.com">
+      </div>
+    </div>
+    <div style="max-width:300px">
+      <label class="form-label">Air Crews Email</label>
+      <input class="form-input" id="f-ac-email" type="email" placeholder="ac@example.com">
+    </div>
+  </div>
+  <div class="section-title">Optional Roles</div>
+  <div>
+    <label class="toggle-row">
+      <input type="checkbox" id="f-li-enabled" onchange="toggleOptionalRole(\'li\')">
+      <span style="font-size:13px;font-weight:600">Liaison</span>
+    </label>
+    <div class="role-email-group" id="li-email-group" style="display:none">
+      <label class="form-label">Liaison Email</label>
+      <input class="form-input" id="f-li-email" type="email" placeholder="liaison@example.com" style="max-width:320px">
+    </div>
+    <label class="toggle-row" style="margin-top:10px">
+      <input type="checkbox" id="f-vi-enabled" onchange="toggleOptionalRole(\'vi\')">
+      <span style="font-size:13px;font-weight:600">VISTA</span>
+    </label>
+    <div class="role-email-group" id="vi-email-group" style="display:none">
+      <label class="form-label">VISTA Email</label>
+      <input class="form-input" id="f-vi-email" type="email" placeholder="vista@example.com" style="max-width:320px">
+    </div>
+  </div>
+  <div style="display:flex;gap:10px;margin-top:24px;justify-content:flex-end">
+    <button class="btn btn-ghost" onclick="closeNewMissionModal()">Cancel</button>
+    <button class="btn btn-primary" id="create-btn" onclick="submitNewMission()">
+      <span class="material-symbols-outlined" style="font-size:15px">rocket_launch</span>Provision Mission
+    </button>
+  </div>
+</div>
+</div>
+<!-- Resend Email Modal -->
+<div class="modal-overlay" id="resend-modal">
+<div class="modal" style="max-width:420px">
+  <div class="modal-title">Resend Credentials</div>
+  <div class="modal-sub">A new password will be generated and sent.</div>
+  <input type="hidden" id="resend-mission-id">
+  <input type="hidden" id="resend-role-key">
+  <div style="margin-bottom:16px">
+    <label class="form-label">Send to Email</label>
+    <input class="form-input" id="resend-email-input" type="email" placeholder="recipient@example.com">
+  </div>
+  <div style="display:flex;gap:10px;justify-content:flex-end">
+    <button class="btn btn-ghost" onclick="closeResendModal()">Cancel</button>
+    <button class="btn btn-primary" id="resend-btn" onclick="submitResend()">
+      <span class="material-symbols-outlined" style="font-size:15px">send</span>Send
+    </button>
+  </div>
+</div>
+</div>
+<div class="toast-container" id="toast-container"></div>
+<script>
+const ROLE_LABELS = {
+  command_post: \'Command Post\',
+  ground_teams: \'Ground Teams\',
+  air_crews: \'Air Crews\',
+  liaison: \'Liaison\',
+  vista: \'VISTA\'
+};
+
+function toast(msg, type) {
+  const tc = document.getElementById(\'toast-container\');
+  const t = document.createElement(\'div\');
+  t.className = \'toast toast-\' + (type || \'info\');
+  t.textContent = msg;
+  tc.appendChild(t);
+  setTimeout(() => { t.remove(); }, 4000);
+}
+
+function fmtDate(iso) {
+  if (!iso) return \'\';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleDateString(\'en-US\', {month:\'short\',day:\'numeric\',year:\'numeric\'})
+      + \' \' + d.toLocaleTimeString(\'en-US\', {hour:\'2-digit\',minute:\'2-digit\'});
+  } catch(e) { return iso.slice(0,16).replace(\'T\',\' \'); }
+}
+
+function toggleOptionalRole(prefix) {
+  const cb = document.getElementById(\'f-\' + prefix + \'-enabled\');
+  const grp = document.getElementById(prefix + \'-email-group\');
+  if (grp) grp.style.display = cb.checked ? \'block\' : \'none\';
+}
+
+function openNewMissionModal() {
+  document.getElementById(\'new-mission-modal\').classList.add(\'open\');
+  document.getElementById(\'f-mission-name\').focus();
+}
+
+function closeNewMissionModal() {
+  document.getElementById(\'new-mission-modal\').classList.remove(\'open\');
+}
+
+function closeResendModal() {
+  document.getElementById(\'resend-modal\').classList.remove(\'open\');
+}
+
+async function submitNewMission() {
+  const name = document.getElementById(\'f-mission-name\').value.trim();
+  if (!name) { toast(\'Mission name is required\', \'err\'); return; }
+  const liEnabled = document.getElementById(\'f-li-enabled\').checked;
+  const viEnabled = document.getElementById(\'f-vi-enabled\').checked;
+  const payload = {
+    mission_name: name,
+    incident_name: document.getElementById(\'f-incident-name\').value.trim(),
+    cp_email: document.getElementById(\'f-cp-email\').value.trim(),
+    gt_email: document.getElementById(\'f-gt-email\').value.trim(),
+    ac_email: document.getElementById(\'f-ac-email\').value.trim(),
+    liaison_enabled: liEnabled,
+    li_email: liEnabled ? document.getElementById(\'f-li-email\').value.trim() : \'\',
+    vista_enabled: viEnabled,
+    vi_email: viEnabled ? document.getElementById(\'f-vi-email\').value.trim() : \'\',
+  };
+  const btn = document.getElementById(\'create-btn\');
+  btn.disabled = true;
+  btn.innerHTML = \'<span class="spinner"></span> Provisioning...\';
+  try {
+    const resp = await fetch(\'/api/missions\', {
+      method: \'POST\',
+      headers: {\'Content-Type\': \'application/json\'},
+      body: JSON.stringify(payload)
+    });
+    const data = await resp.json();
+    if (data.error) { toast(\'Error: \' + data.error, \'err\'); return; }
+    closeNewMissionModal();
+    const errs = data.errors || [];
+    if (errs.length) {
+      toast(\'Mission created with \' + errs.length + \' warning(s)\', \'info\');
+    } else {
+      toast(\'Mission provisioned successfully\', \'ok\');
+    }
+    loadMissions();
+  } catch(e) {
+    toast(\'Request failed: \' + e, \'err\');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = \'<span class="material-symbols-outlined" style="font-size:15px">rocket_launch</span>Provision Mission\';
+  }
+}
+
+function openResendModal(missionId, roleKey, currentEmail) {
+  document.getElementById(\'resend-mission-id\').value = missionId;
+  document.getElementById(\'resend-role-key\').value = roleKey;
+  document.getElementById(\'resend-email-input\').value = currentEmail || \'\';
+  document.getElementById(\'resend-modal\').classList.add(\'open\');
+  document.getElementById(\'resend-email-input\').focus();
+}
+
+async function submitResend() {
+  const missionId = document.getElementById(\'resend-mission-id\').value;
+  const roleKey = document.getElementById(\'resend-role-key\').value;
+  const email = document.getElementById(\'resend-email-input\').value.trim();
+  if (!email) { toast(\'Email address required\', \'err\'); return; }
+  const btn = document.getElementById(\'resend-btn\');
+  btn.disabled = true;
+  btn.innerHTML = \'<span class="spinner"></span> Sending...\';
+  try {
+    const resp = await fetch(\'/api/missions/\' + missionId + \'/resend-email\', {
+      method: \'POST\',
+      headers: {\'Content-Type\': \'application/json\'},
+      body: JSON.stringify({role: roleKey, email: email})
+    });
+    const data = await resp.json();
+    if (data.error) { toast(\'Error: \' + data.error, \'err\'); return; }
+    toast(\'Credentials sent to \' + email, \'ok\');
+    closeResendModal();
+    loadMissions();
+  } catch(e) {
+    toast(\'Request failed: \' + e, \'err\');
+  } finally {
+    btn.disabled = false;
+    btn.innerHTML = \'<span class="material-symbols-outlined" style="font-size:15px">send</span>Send\';
+  }
+}
+
+async function archiveMission(id, name) {
+  if (!confirm(\'Archive mission "\' + name + \'"? Users will keep their credentials but the mission will be marked inactive.\')) return;
+  const resp = await fetch(\'/api/missions/\' + id + \'/archive\', {method:\'POST\'});
+  const data = await resp.json();
+  if (data.ok) { toast(\'Mission archived\', \'ok\'); loadMissions(); }
+  else toast(\'Error: \' + (data.error||\'unknown\'), \'err\');
+}
+
+async function revokeMission(id, name) {
+  if (!confirm(\'Revoke access for mission "\' + name + \'"?\\n\\nThis will DISABLE all LDAP accounts for this mission. Users will immediately lose TAK access.\')) return;
+  const resp = await fetch(\'/api/missions/\' + id + \'/revoke\', {method:\'POST\'});
+  const data = await resp.json();
+  if (data.ok) {
+    const e = data.errors || [];
+    if (e.length) toast(\'Revoked with \' + e.length + \' error(s)\', \'info\');
+    else toast(\'All accounts revoked\', \'ok\');
+    loadMissions();
+  } else toast(\'Error: \' + (data.error||\'unknown\'), \'err\');
+}
+
+function renderMissions(missions) {
+  const el = document.getElementById(\'mission-list\');
+  if (!missions.length) {
+    el.innerHTML = \'<div class="empty-state"><span class="material-symbols-outlined">emergency_off</span><div style="font-size:15px;font-weight:600;margin-bottom:6px">No missions yet</div><div style="font-size:13px">Click “New Mission” to create your first incident mission.</div></div>\';
+    return;
+  }
+  el.innerHTML = missions.map(m => {
+    const status = m.status || \'active\';
+    const badgeClass = {active:\'badge-active\', archived:\'badge-archived\', revoked:\'badge-revoked\'}[status] || \'badge-archived\';
+    const roles = m.roles || {};
+    const roleRows = Object.entries(roles).map(([rk, r]) => {
+      const sentHtml = r.email_sent
+        ? \'<span class="sent-badge sent-ok"><span class="material-symbols-outlined" style="font-size:14px">check_circle</span>Sent\' + (r.email_sent_at ? \' \' + fmtDate(r.email_sent_at) : \'\') + \'</span>\'
+        : \'<span class="sent-badge sent-no"><span class="material-symbols-outlined" style="font-size:14px">schedule</span>Not sent</span>\';
+      const email = r.email || \'&mdash;\';
+      const resendBtn = \'<button class="btn btn-ghost btn-sm" onclick="event.stopPropagation();openResendModal(\\\'\' + m.id + \'\\\',\\\'\' + rk + \'\\\',\\\'\' + (r.email||\'\')+\'\\\')"><span class="material-symbols-outlined" style="font-size:13px">send</span>Resend</button>\';
+      return \'<tr><td><strong>\' + (r.display || ROLE_LABELS[rk] || rk) + \'</strong></td>\'
+        + \'<td class="mono">\' + (r.username || \'&mdash;\') + \'</td>\'
+        + \'<td style="color:var(--text-dim);\' + (\'font-size:12px\') + \'">\' + email + \'</td>\'
+        + \'<td>\' + sentHtml + \'</td>\'
+        + \'<td>\' + resendBtn + \'</td></tr>\';
+    }).join(\'\');
+    const logEntries = (m.access_log || []).slice().reverse().slice(0,8).map(e => {
+      const detail = e.role ? (ROLE_LABELS[e.role]||e.role) + (e.email?\' → \'+e.email:\'\') : (e.details||\'\');
+      return \'<div class="log-entry"><span class="log-ts">\' + fmtDate(e.timestamp) + \'</span><span class="log-action">\' + e.action.replace(/_/g,\' \') + (detail?\' &mdash; \'+detail:\'\') + \'</span></div>\';
+    }).join(\'\');
+    const errs = (m.provision_errors || []);
+    const errBlock = errs.length ? \'<div style="margin-top:12px;padding:10px 14px;background:rgba(239,68,68,.06);border:1px solid rgba(239,68,68,.2);border-radius:8px;font-size:12px;color:var(--red)">\' + errs.map(e => \'<div>⚠ \' + e + \'</div>\').join(\'\') + \'</div>\' : \'\';
+    const takBadge = m.tak_mission_created ? \'<span class="tak-chip" style="margin-left:6px"><span class="material-symbols-outlined" style="font-size:11px">wifi_tethering</span>TAK Mission</span>\' : \'\';
+    const actionBtns = status === \'active\'
+      ? \'<div style="display:flex;gap:8px;margin-top:16px">\'
+        + \'<button class="btn btn-ghost btn-sm" onclick="archiveMission(\\\'\'+m.id+\'\\\',\\\'\'+m.name+\'\\\')"><span class="material-symbols-outlined" style="font-size:13px">archive</span>Archive</button>\'
+        + \'<button class="btn btn-danger btn-sm" onclick="revokeMission(\\\'\'+m.id+\'\\\',\\\'\'+m.name+\'\\\')"><span class="material-symbols-outlined" style="font-size:13px">block</span>Revoke Access</button>\'
+        + \'</div>\'
+      : \'\';
+    return \'<div class="mission-card" id="mc-\' + m.id + \'">\''
+      + \'<div class="mission-header" onclick="toggleMission(\\\'\' + m.id + \'\\\')">\'
+      + \'<div style="flex:1"><div class="mission-title">\' + m.name + (m.incident_name ? \' <span style="font-weight:400;color:var(--text-dim);font-size:13px">— \'+m.incident_name+\'</span>\' : \'\') + \'</div>\'
+      + \'<div class="mission-meta">Created \' + fmtDate(m.created_at) + \' &nbsp;&bull;&nbsp; <span class="channel-chip">\' + m.channel_name + \'</span>\' + takBadge + \'</div></div>\'
+      + \'<span class="badge \' + badgeClass + \'">\' + status + \'</span>\'
+      + \'<span class="material-symbols-outlined expand-icon">expand_more</span>\'
+      + \'</div>\'
+      + \'<div class="mission-body">\'
+      + \'<table class="role-table"><thead><tr><th>Role</th><th>Username</th><th>Email</th><th>Status</th><th></th></tr></thead><tbody>\' + roleRows + \'</tbody></table>\'
+      + errBlock
+      + actionBtns
+      + (logEntries ? \'<div class="access-log"><div style="font-size:11px;font-weight:700;color:var(--text-dim);text-transform:uppercase;letter-spacing:.08em;margin-bottom:8px">Access Log</div>\' + logEntries + \'</div>\' : \'\')
+      + \'</div></div>\';
+  }).join(\'\');
+}
+
+function toggleMission(id) {
+  const card = document.getElementById(\'mc-\' + id);
+  if (card) card.classList.toggle(\'open\');
+}
+
+async function loadMissions() {
+  try {
+    const resp = await fetch(\'/api/missions\');
+    const data = await resp.json();
+    renderMissions(data.missions || []);
+  } catch(e) {
+    document.getElementById(\'mission-list\').innerHTML = \'<div class="empty-state"><span class="material-symbols-outlined">error</span><div>Failed to load missions</div></div>\';
+  }
+}
+
+document.addEventListener(\'DOMContentLoaded\', loadMissions);
+document.getElementById(\'new-mission-modal\').addEventListener(\'click\', function(e) {
+  if (e.target === this) closeNewMissionModal();
+});
+document.getElementById(\'resend-modal\').addEventListener(\'click\', function(e) {
+  if (e.target === this) closeResendModal();
+});
+document.addEventListener(\'keydown\', function(e) {
+  if (e.key === \'Escape\') { closeNewMissionModal(); closeResendModal(); }
+});
 </script></body></html>'''
 
 # === Console Template (installed services only) ===

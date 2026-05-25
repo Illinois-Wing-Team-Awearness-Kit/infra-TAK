@@ -13428,7 +13428,7 @@ def run_takportal_deploy():
             try:
                 import urllib.request as _urlreq
                 _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
-                _ak_url = 'http://127.0.0.1:9090'
+                _ak_url = _get_authentik_api_url(settings)
 
                 # Update brand domain
                 try:
@@ -13447,10 +13447,9 @@ def run_takportal_deploy():
                 except Exception as e:
                     plog(f"  \u26a0 Brand update: {str(e)[:80]}")
 
-                # Wait forever for authorization flow
+                # Wait up to 15 min for authorization flow (Authentik startup on fresh deploys)
                 flow_pk = None
-                attempt = 0
-                while True:
+                for attempt in range(180):
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=authorization&ordering=slug', headers=_ak_headers)
                         resp = _urlreq.urlopen(req, timeout=10)
@@ -13470,13 +13469,14 @@ def run_takportal_deploy():
                     else:
                         authentik_deploy_log.append(f"  ⏳ {attempt * 5 // 60:02d}:{attempt * 5 % 60:02d}")
                     time.sleep(5)
-                    attempt += 1
-                plog(f"  ✓ Got authorization flow")
+                if flow_pk:
+                    plog(f"  ✓ Got authorization flow")
+                else:
+                    plog(f"  ⚠ No authorization flow found after 15 min — proxy provider skipped")
 
-                # Wait forever for invalidation flow
+                # Wait up to 15 min for invalidation flow
                 inv_flow_pk = None
-                attempt = 0
-                while True:
+                for attempt in range(180):
                     try:
                         req = _urlreq.Request(f'{_ak_url}/api/v3/flows/instances/?designation=invalidation', headers=_ak_headers)
                         resp = _urlreq.urlopen(req, timeout=10)
@@ -13491,8 +13491,10 @@ def run_takportal_deploy():
                     else:
                         authentik_deploy_log.append(f"  ⏳ {attempt * 5 // 60:02d}:{attempt * 5 % 60:02d}")
                     time.sleep(5)
-                    attempt += 1
-                plog(f"  ✓ Got invalidation flow")
+                if inv_flow_pk:
+                    plog(f"  ✓ Got invalidation flow")
+                else:
+                    plog(f"  ⚠ No invalidation flow found after 15 min — proxy provider skipped")
 
                 # Create proxy provider
                 provider_pk = None

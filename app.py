@@ -29731,6 +29731,15 @@ entries:
     plog("━━━ Step 5/8: Creating Docker Compose ━━━")
     _ak_latest = _get_authentik_target_release()
     plog(f"  Authentik version: {_ak_latest} (channel: {(load_settings().get('update_channel') or 'main')})")
+    _ram_ok, _ram_out = _module_run(deploy_cfg, "awk '/MemTotal/ {print int($2/1024/1024)}' /proc/meminfo 2>/dev/null", timeout=10)
+    _ram_gb = 0
+    if _ram_ok and (_ram_out or '').strip().isdigit():
+        _ram_gb = int((_ram_out or '').strip())
+    _pg_cmd_remote = _authentik_pg_command_for_ram(_ram_gb)
+    if _ram_gb:
+        plog(f"  Remote RAM: {_ram_gb} GB — PostgreSQL tuned for {_ram_gb}GB tier")
+    else:
+        plog("  Remote RAM: unknown — using conservative PostgreSQL settings")
     compose_content = """services:
   postgresql:
     image: docker.io/library/postgres:16-alpine
@@ -32636,6 +32645,85 @@ _AUTHENTIK_PG_COMMAND_ENTERPRISE = (
     ' -c tcp_keepalives_interval=10'
     ' -c tcp_keepalives_count=6'
 )
+
+
+def _authentik_pg_command_for_ram(ram_gb):
+    """Return a postgres command string sized for the host's total RAM (GB).
+
+    Tiers follow pgtune 25%/75% shared_buffers/cache recommendations.
+    ram_gb=0 means the probe failed — fall back to a conservative baseline.
+    """
+    if ram_gb >= 48:
+        return _AUTHENTIK_PG_COMMAND_ENTERPRISE
+    if ram_gb >= 16:
+        return (
+            'postgres'
+            ' -c max_connections=1000'
+            ' -c shared_buffers=4GB'
+            ' -c effective_cache_size=12GB'
+            ' -c work_mem=12MB'
+            ' -c maintenance_work_mem=1GB'
+            ' -c wal_buffers=64MB'
+            ' -c max_wal_size=4GB'
+            ' -c statement_timeout=120s'
+            ' -c idle_session_timeout=300s'
+            ' -c idle_in_transaction_session_timeout=300s'
+            ' -c tcp_keepalives_idle=60'
+            ' -c tcp_keepalives_interval=10'
+            ' -c tcp_keepalives_count=6'
+        )
+    if ram_gb >= 8:
+        return (
+            'postgres'
+            ' -c max_connections=500'
+            ' -c shared_buffers=2GB'
+            ' -c effective_cache_size=6GB'
+            ' -c work_mem=8MB'
+            ' -c maintenance_work_mem=512MB'
+            ' -c wal_buffers=32MB'
+            ' -c max_wal_size=2GB'
+            ' -c statement_timeout=120s'
+            ' -c idle_session_timeout=300s'
+            ' -c idle_in_transaction_session_timeout=300s'
+            ' -c tcp_keepalives_idle=60'
+            ' -c tcp_keepalives_interval=10'
+            ' -c tcp_keepalives_count=6'
+        )
+    if ram_gb >= 4:
+        return (
+            'postgres'
+            ' -c max_connections=300'
+            ' -c shared_buffers=1GB'
+            ' -c effective_cache_size=3GB'
+            ' -c work_mem=6MB'
+            ' -c maintenance_work_mem=256MB'
+            ' -c wal_buffers=16MB'
+            ' -c max_wal_size=1GB'
+            ' -c statement_timeout=120s'
+            ' -c idle_session_timeout=300s'
+            ' -c idle_in_transaction_session_timeout=300s'
+            ' -c tcp_keepalives_idle=60'
+            ' -c tcp_keepalives_interval=10'
+            ' -c tcp_keepalives_count=6'
+        )
+    # < 4 GB or unknown: conservative baseline that fits any modern VPS
+    return (
+        'postgres'
+        ' -c max_connections=200'
+        ' -c shared_buffers=256MB'
+        ' -c effective_cache_size=768MB'
+        ' -c work_mem=4MB'
+        ' -c maintenance_work_mem=64MB'
+        ' -c wal_buffers=8MB'
+        ' -c max_wal_size=1GB'
+        ' -c statement_timeout=120s'
+        ' -c idle_session_timeout=300s'
+        ' -c idle_in_transaction_session_timeout=300s'
+        ' -c tcp_keepalives_idle=60'
+        ' -c tcp_keepalives_interval=10'
+        ' -c tcp_keepalives_count=6'
+    )
+
 
 # v0.9.28-alpha: enterprise scaling — PgBouncer tier.
 #   DEFAULT_POOL_SIZE 75 → 300: with PG max_connections bumped to 2000, the

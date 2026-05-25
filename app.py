@@ -29060,6 +29060,7 @@ with open("docker-compose.yml") as f:
     content = f.read()
 import re as _re
 safe = key.replace("'", "''")
+# Replace placeholder OR an already-set (possibly wrong) token — either way inject the current key
 if "AUTHENTIK_TOKEN: placeholder" in content:
     content = content.replace("AUTHENTIK_TOKEN: placeholder", "AUTHENTIK_TOKEN: '" + safe + "'")
 elif _re.search(r"AUTHENTIK_TOKEN: '.*'", content):

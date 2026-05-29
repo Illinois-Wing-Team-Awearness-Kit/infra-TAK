@@ -862,12 +862,19 @@ def detect_modules():
             ak_running = 'Up' in r.stdout
     modules['authentik'] = {'name': 'Authentik', 'installed': ak_installed, 'running': ak_running,
         'description': 'Identity provider — SSO, LDAP, user management', 'icon': '🔐', 'icon_url': AUTHENTIK_LOGO_URL, 'route': '/authentik', 'priority': 2}
-    # TAK Portal - Docker-based user management (local only; stays with TAK Server)
-    portal_installed = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
+    # TAK Portal - local or remote deployment
+    portal_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
+    portal_installed = False
     portal_running = False
-    if portal_installed:
-        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-        portal_running = 'Up' in r.stdout
+    if portal_cfg.get('target_mode') == 'remote' and portal_cfg.get('deployed') and (portal_cfg.get('remote', {}).get('host') or '').strip():
+        portal_installed = True
+        ok, out = _ssh_probe(portal_cfg.get('remote', {}), 'docker ps --filter name=tak-portal --format "{{.Status}}"', timeout=12)
+        portal_running = bool(ok and out and 'Up' in out)
+    else:
+        portal_installed = os.path.exists(os.path.expanduser('~/TAK-Portal/docker-compose.yml'))
+        if portal_installed:
+            r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+            portal_running = 'Up' in r.stdout
     modules['takportal'] = {'name': 'TAK Portal', 'installed': portal_installed, 'running': portal_running,
         'description': 'User & certificate management with Authentik', 'icon': '👥', 'route': '/takportal', 'priority': 3}
     # MediaMTX (local or remote deployment)
@@ -12868,16 +12875,23 @@ def takportal_page():
     modules = detect_modules()
     portal = modules.get('takportal', {})
     settings = load_settings()
+    takportal_deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
+    is_remote_portal = takportal_deploy_cfg.get('target_mode') == 'remote'
     # Reset deploy_done once TAK Portal is running so the running view shows
     if portal.get('installed') and portal.get('running') and not takportal_deploy_status.get('running', False):
         takportal_deploy_status.update({'complete': False, 'error': False})
     # Get container info if running
     container_info = {}
     if portal.get('running'):
-        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Names}}|||{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-        if r.stdout.strip():
+        if is_remote_portal:
+            ok, out = _module_run(takportal_deploy_cfg, 'docker ps --filter name=tak-portal --format "{{.Names}}|||{{.Status}}" 2>/dev/null', timeout=12)
+            raw = out if ok else ''
+        else:
+            r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Names}}|||{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
+            raw = r.stdout
+        if raw and raw.strip():
             containers = []
-            for line in r.stdout.strip().split('\n'):
+            for line in raw.strip().split('\n'):
                 if line.strip():
                     parts = line.strip().split('|||')
                     containers.append({'name': parts[0] if len(parts) > 0 else 'tak-portal', 'status': parts[1] if len(parts) > 1 else ''})
@@ -12885,18 +12899,24 @@ def takportal_page():
             container_info['status'] = containers[0]['status'] if containers else ''
     # Get portal port from .env if exists
     portal_port = '3000'
-    env_path = os.path.expanduser('~/TAK-Portal/.env')
-    if os.path.exists(env_path):
-        with open(env_path) as f:
-            for line in f:
+    if is_remote_portal:
+        ok, out = _module_run(takportal_deploy_cfg, 'cat ~/TAK-Portal/.env 2>/dev/null || true', timeout=10)
+        if ok and out:
+            for line in out.splitlines():
                 if line.strip().startswith('WEB_UI_PORT='):
                     portal_port = line.strip().split('=', 1)[1].strip() or '3000'
+    else:
+        env_path = os.path.expanduser('~/TAK-Portal/.env')
+        if os.path.exists(env_path):
+            with open(env_path) as f:
+                for line in f:
+                    if line.strip().startswith('WEB_UI_PORT='):
+                        portal_port = line.strip().split('=', 1)[1].strip() or '3000'
     # Real version (package.json) and update-available (from container logs)
     vinfo = _get_takportal_version_info()
     portal_version = vinfo['version'] or ''
     portal_update_available = vinfo['update_available']
     portal_latest = vinfo['latest']
-    takportal_deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
     return render_template_string(TAKPORTAL_TEMPLATE,
         settings=settings, portal=portal, container_info=container_info,
         portal_port=portal_port, portal_version=portal_version,
@@ -13126,40 +13146,56 @@ def _takportal_build_settings_json(settings):
 @login_required
 def takportal_control():
     action = request.json.get('action')
-    portal_dir = os.path.expanduser('~/TAK-Portal')
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
+    is_remote = deploy_cfg.get('target_mode') == 'remote'
+    portal_dir = '~/TAK-Portal'
+
+    def _run(cmd, timeout=120):
+        if is_remote:
+            return _module_run(deploy_cfg, cmd, timeout=timeout)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
+    def _portal_running():
+        ok, out = _run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', timeout=15)
+        return ok and 'Up' in (out or '')
+
     if action == 'start':
-        _patch_takportal_compose_network()
-        _patch_takportal_compose_ports(portal_dir)
-        subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=120)
-        _ensure_infratak_network_for_portal()
-        _ensure_infratak_network_for_authentik()
+        _run(f'cd {portal_dir} && docker compose up -d --build')
     elif action == 'stop':
-        subprocess.run(f'cd {portal_dir} && docker compose down', shell=True, capture_output=True, text=True, timeout=60)
+        _run(f'cd {portal_dir} && docker compose down', timeout=60)
     elif action == 'restart':
-        _patch_takportal_compose_network()
-        _patch_takportal_compose_ports(portal_dir)
-        subprocess.run(f'cd {portal_dir} && docker compose down && docker compose up -d', shell=True, capture_output=True, text=True, timeout=120)
-        _ensure_infratak_network_for_portal()
-        _ensure_infratak_network_for_authentik()
+        _run(f'cd {portal_dir} && docker compose down && docker compose up -d')
     elif action == 'reconfigure':
-        # Update config only: push settings into container and restart (no git pull / image build). Preserves user-configured keys (e.g. BRAND_LOGO_URL).
-        settings = load_settings()
-        settings_json = _takportal_merged_settings_json(settings)
+        # Update config only: push settings into container and restart. Preserves user-configured keys (e.g. BRAND_LOGO_URL).
         try:
+            if is_remote:
+                settings_json = json.dumps(_takportal_build_settings_dict(settings), indent=2)
+            else:
+                settings_json = _takportal_merged_settings_json(settings)
             fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
             try:
                 with os.fdopen(fd, 'w') as f:
                     f.write(settings_json)
-                cp = subprocess.run(f'docker cp {shlex.quote(tmp_settings)} tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True, timeout=20)
+                if is_remote:
+                    remote_tmp = f'/tmp/tak-portal-settings-{os.getpid()}.json'
+                    ok_copy, _ = _module_copy(deploy_cfg, tmp_settings, remote_tmp, timeout=20)
+                    if not ok_copy:
+                        return jsonify({'success': False, 'error': 'SCP settings to remote failed'}), 500
+                    ok_cp, cp_out = _module_run(deploy_cfg, f'docker cp {remote_tmp} tak-portal:/usr/src/app/data/settings.json && rm -f {remote_tmp}', timeout=20)
+                    if not ok_cp:
+                        return jsonify({'success': False, 'error': (cp_out or 'docker cp failed')[:300]}), 500
+                else:
+                    cp = subprocess.run(f'docker cp {shlex.quote(tmp_settings)} tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True, timeout=20)
+                    if cp.returncode != 0:
+                        return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]}), 500
             finally:
                 try:
                     os.remove(tmp_settings)
                 except OSError:
                     pass
-            if cp.returncode != 0:
-                return jsonify({'success': False, 'error': (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]}), 500
-            _takportal_setup_ssh()
-            subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
+            _run('docker restart tak-portal', timeout=30)
         except Exception as e:
             return jsonify({'success': False, 'error': str(e)[:300]}), 500
         # v0.9.31: run the full Authentik proxy chain heal for all deployed
@@ -13178,90 +13214,70 @@ def takportal_control():
         except Exception:
             pass
         time.sleep(2)
-        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-        running = 'Up' in (r.stdout or '')
-        tp_state = (chain_summary or {}).get('takportal', {})
-        ok = (tp_state.get('provider') in ('ok', 'created', 'fixed', 'adopted')
-              and tp_state.get('app') in ('ok', 'created', 'fixed'))
-        msg = 'Config updated and portal restarted.'
-        if not chain_summary:
-            # Healer didn't run (Authentik not installed, no token, etc.) — just report container state
-            msg = 'Config updated and portal restarted (SSH configured).'
-        elif ok:
-            msg = 'Config updated, portal restarted, and Authentik proxy chain reconciled.'
-        elif tp_state:
-            msg = (f'Config updated and portal restarted, but Authentik proxy chain heal reported: '
-                   f"provider={tp_state.get('provider')}, app={tp_state.get('app')}, outpost={tp_state.get('outpost')}. "
-                   f"Check console logs and Authentik admin UI.")
-        return jsonify({'success': True, 'running': running, 'action': action,
-                        'message': msg, 'chain_summary': chain_summary})
+        running = _portal_running()
+        return jsonify({'success': True, 'running': running, 'action': action, 'message': 'Config updated and portal restarted.'})
     elif action == 'update':
-        # Reset any local changes to tracked files before pulling — the network
-        # and hardening patches now live in docker-compose.override.yml (not tracked
-        # by git) so it's safe to discard dirty tracked files without losing anything.
-        subprocess.run(
-            f'git -c safe.directory={portal_dir} -C {portal_dir} checkout -- .',
-            shell=True, capture_output=True, text=True, timeout=15)
-        pull = subprocess.run(
-            f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase',
-            shell=True, capture_output=True, text=True, timeout=60)
-        pull_msg = pull.stdout.strip().split('\n')[-1] if pull.stdout.strip() else ''
-        # Rewrite the override file so network hardening survives the pull.
-        # Also patch the base compose so port binding is loopback-only
-        # (git pull resets the upstream 0.0.0.0 binding on every update).
-        _write_takportal_override()
-        _patch_takportal_compose_ports(portal_dir)
-        build = subprocess.run(f'cd {portal_dir} && docker compose up -d --build', shell=True, capture_output=True, text=True, timeout=180)
-        _ensure_infratak_network_for_portal()
-        _ensure_infratak_network_for_authentik()
-        if build.returncode != 0:
-            err = (build.stderr or build.stdout or 'Build failed').strip()[:400]
+        ok_pull, pull_out = _run(f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase --autostash', timeout=60)
+        pull_msg = (pull_out or '').strip().split('\n')[-1] if (pull_out or '').strip() else ''
+        ok_build, build_out = _run(f'cd {portal_dir} && docker compose up -d --build', timeout=300)
+        if not ok_build:
             return jsonify({'success': False, 'error': 'Build failed. Container may have stopped — try Start below or check container logs.'}), 500
         settings_synced = False
         settings_sync_error = ''
         cloudtak_url = ''
         try:
-            settings = load_settings()
-            settings_json = _takportal_merged_settings_json(settings)
-            cloudtak_url = ''
+            if is_remote:
+                settings_json = json.dumps(_takportal_build_settings_dict(settings), indent=2)
+            else:
+                settings_json = _takportal_merged_settings_json(settings)
             try:
                 import json as json_mod
-                portal_settings = json_mod.loads(settings_json)
-                cloudtak_url = portal_settings.get('CLOUDTAK_URL', '')
+                portal_settings_d = json_mod.loads(settings_json)
+                cloudtak_url = portal_settings_d.get('CLOUDTAK_URL', '')
             except Exception:
                 pass
             fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
             try:
                 with os.fdopen(fd, 'w') as f:
                     f.write(settings_json)
-                cp = subprocess.run(f'docker cp {shlex.quote(tmp_settings)} tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True, timeout=20)
+                if is_remote:
+                    remote_tmp = f'/tmp/tak-portal-settings-{os.getpid()}.json'
+                    ok_copy, _ = _module_copy(deploy_cfg, tmp_settings, remote_tmp, timeout=20)
+                    if ok_copy:
+                        ok_cp, _ = _module_run(deploy_cfg, f'docker cp {remote_tmp} tak-portal:/usr/src/app/data/settings.json && rm -f {remote_tmp}', timeout=20)
+                        if ok_cp:
+                            _run('docker restart tak-portal', timeout=30)
+                            settings_synced = True
+                        else:
+                            settings_sync_error = 'docker cp failed on remote'
+                    else:
+                        settings_sync_error = 'SCP settings to remote failed'
+                else:
+                    cp = subprocess.run(f'docker cp {shlex.quote(tmp_settings)} tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True, timeout=20)
+                    if cp.returncode == 0:
+                        subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
+                        settings_synced = True
+                    else:
+                        settings_sync_error = (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]
             finally:
                 try:
                     os.remove(tmp_settings)
                 except OSError:
                     pass
-            if cp.returncode == 0:
-                _takportal_setup_ssh()
-                subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
-                settings_synced = True
-            else:
-                settings_sync_error = (cp.stderr or cp.stdout or 'docker cp failed').strip()[:300]
         except Exception as e:
             settings_sync_error = str(e)[:300]
-        subprocess.run(f'cd {portal_dir} && docker image prune -f', shell=True, capture_output=True, text=True, timeout=30)
+        _run(f'cd {portal_dir} && docker image prune -f', timeout=30)
         time.sleep(3)
         vinfo = _get_takportal_version_info()
         new_version = vinfo['version'] or ''
-        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-        running = 'Up' in (r.stdout or '')
+        running = _portal_running()
         if not running:
             return jsonify({'success': False, 'error': 'Container not running after update — click Start below.'}), 500
         return jsonify({'success': True, 'running': running, 'action': action, 'pull': pull_msg, 'version': new_version, 'settings_synced': settings_synced, 'settings_sync_error': settings_sync_error, 'cloudtak_url': cloudtak_url})
     else:
         return jsonify({'error': 'Invalid action'}), 400
     time.sleep(3)
-    r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-    running = 'Up' in r.stdout
+    running = _portal_running()
     return jsonify({'success': True, 'running': running, 'action': action})
 
 @app.route('/api/takportal/deploy', methods=['POST'])
@@ -13287,10 +13303,17 @@ def takportal_deploy_log_api():
 def takportal_container_logs():
     """Get recent container logs"""
     lines = request.args.get('lines', 50, type=int)
-    r = subprocess.run(f'docker logs tak-portal --tail {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
+    if deploy_cfg.get('target_mode') == 'remote' and (deploy_cfg.get('remote', {}).get('host') or '').strip():
+        ok, out = _module_run(deploy_cfg, f'docker logs tak-portal --tail {lines} 2>&1', timeout=15)
+        raw = out if ok else ''
+    else:
+        r = subprocess.run(f'docker logs tak-portal --tail {lines} 2>&1', shell=True, capture_output=True, text=True, timeout=10)
+        raw = r.stdout
     entries = []
     skip_lines = {'npm error', 'npm ERR', 'signal SIGTERM', 'command failed', 'A complete log of this run'}
-    for line in (r.stdout.strip().split('\n') if r.stdout.strip() else []):
+    for line in (raw.strip().split('\n') if raw.strip() else []):
         if not any(s in line for s in skip_lines):
             entries.append(line)
     return jsonify({'entries': entries})
@@ -13303,13 +13326,28 @@ def takportal_uninstall():
     auth = load_auth()
     if not auth.get('password_hash') or not check_password_hash(auth['password_hash'], password):
         return jsonify({'error': 'Invalid admin password'}), 403
-    portal_dir = os.path.expanduser('~/TAK-Portal')
+    settings = load_settings()
+    deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
+    is_remote = deploy_cfg.get('target_mode') == 'remote'
+    portal_dir = '~/TAK-Portal'
     steps = []
-    subprocess.run(f'cd {portal_dir} && docker compose down -v --rmi local 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
-    steps.append('Stopped and removed Docker containers/volumes')
-    if os.path.exists(portal_dir):
-        subprocess.run(f'rm -rf {portal_dir}', shell=True, capture_output=True)
-        steps.append('Removed ~/TAK-Portal')
+    if is_remote:
+        _module_run(deploy_cfg, f'cd {portal_dir} && docker compose down -v --rmi local 2>/dev/null; true', timeout=120)
+        steps.append('Stopped and removed Docker containers/volumes (remote)')
+        _module_run(deploy_cfg, f'rm -rf {portal_dir}', timeout=30)
+        steps.append('Removed ~/TAK-Portal on remote')
+        # Clear deployed flag in settings
+        cfg = _get_module_deployment_config(settings, 'takportal_deployment')
+        cfg.pop('deployed', None)
+        settings['takportal_deployment'] = cfg
+        save_settings(settings)
+    else:
+        portal_dir_local = os.path.expanduser('~/TAK-Portal')
+        subprocess.run(f'cd {portal_dir_local} && docker compose down -v --rmi local 2>/dev/null; true', shell=True, capture_output=True, timeout=120)
+        steps.append('Stopped and removed Docker containers/volumes')
+        if os.path.exists(portal_dir_local):
+            subprocess.run(f'rm -rf {portal_dir_local}', shell=True, capture_output=True)
+            steps.append('Removed ~/TAK-Portal')
     takportal_deploy_log.clear()
     takportal_deploy_status.update({'running': False, 'complete': False, 'error': False})
     # v0.9.31: regenerate Caddyfile so the takportal.<fqdn> vhost is removed.
@@ -13366,249 +13404,232 @@ def run_takportal_deploy():
         entry = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
         takportal_deploy_log.append(entry)
         print(entry, flush=True)
+
+    def _run(cmd, timeout=120):
+        if is_remote:
+            return _module_run(deploy_cfg, cmd, timeout=timeout)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=timeout)
+        return r.returncode == 0, (r.stdout or '') + (r.stderr or '')
+
     try:
-        portal_dir = os.path.expanduser('~/TAK-Portal')
+        portal_dir = '~/TAK-Portal'
+        portal_dir_local = os.path.expanduser('~/TAK-Portal')
         settings = load_settings()
-        if settings.get('pkg_mgr', 'apt') == 'apt':
-            wait_for_apt_lock(plog, takportal_deploy_log)
+        deploy_cfg = _get_module_deployment_config(settings, 'takportal_deployment')
+        is_remote = deploy_cfg.get('target_mode') == 'remote'
+
+        if is_remote:
+            remote_host = (deploy_cfg.get('remote', {}).get('host') or '').strip()
+            plog(f"  [remote] Deploying TAK Portal on {remote_host}")
+        else:
+            if settings.get('pkg_mgr', 'apt') == 'apt':
+                wait_for_apt_lock(plog, takportal_deploy_log)
+
         # Step 1: Check Docker
         plog("\u2501\u2501\u2501 Step 1/6: Checking Docker \u2501\u2501\u2501")
-        r = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
-        if r.returncode != 0:
+        ok, out = _run('docker --version', timeout=15)
+        if not ok:
             plog("Docker not found. Installing...")
-            subprocess.run('curl -fsSL https://get.docker.com | sh', shell=True, capture_output=True, text=True, timeout=300)
-            r2 = subprocess.run('docker --version', shell=True, capture_output=True, text=True)
-            if r2.returncode != 0:
+            _run('curl -fsSL https://get.docker.com | sh', timeout=300)
+            ok3, out3 = _run('docker --version', timeout=15)
+            if not ok3:
                 plog("\u2717 Failed to install Docker")
                 takportal_deploy_status.update({'running': False, 'error': True})
                 return
-            plog(f"  {r2.stdout.strip()}")
+            plog(f"  {(out3 or '').strip()}")
             plog("\u2713 Docker installed")
         else:
-            plog(f"  {r.stdout.strip()}")
+            plog(f"  {(out or '').strip()}")
             plog("\u2713 Docker available")
 
-        _ensure_docker_log_limits(plog)
+        if not is_remote:
+            _ensure_docker_log_limits(plog)
 
         # Step 2: Clone repo
         plog("")
         plog("\u2501\u2501\u2501 Step 2/6: Cloning TAK Portal \u2501\u2501\u2501")
-        if os.path.exists(portal_dir):
+        ok_exist, _ = _run(f'test -f {portal_dir}/docker-compose.yml', timeout=10)
+        if ok_exist:
             plog("  TAK-Portal directory already exists, pulling latest...")
-            subprocess.run(
-                f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase --autostash',
-                shell=True, capture_output=True, text=True, timeout=60)
+            _run(f'cd {portal_dir} && git -c safe.directory={portal_dir} pull --rebase --autostash', timeout=60)
         else:
             plog("  Cloning from GitHub (shallow, latest only)...")
-            r = subprocess.run(f'git clone --depth 1 https://github.com/AdventureSeeker423/TAK-Portal.git {portal_dir}', shell=True, capture_output=True, text=True, timeout=180)
-            if r.returncode != 0:
-                plog(f"\u2717 Clone failed: {r.stderr.strip()}")
+            ok_clone, clone_out = _run(f'git clone --depth 1 https://github.com/AdventureSeeker423/TAK-Portal.git {portal_dir}', timeout=300)
+            if not ok_clone:
+                plog(f"\u2717 Clone failed: {(clone_out or '').strip()[:200]}")
                 takportal_deploy_status.update({'running': False, 'error': True})
                 return
         plog("\u2713 Repository ready")
 
-        # Step 3: Create .env if missing (exactly as main — no AUTHENTIK_URL here; set in settings.json in Step 6)
+        # Step 3: Create .env if missing
         plog("")
         plog("\u2501\u2501\u2501 Step 3/6: Configuring \u2501\u2501\u2501")
-        env_path = os.path.join(portal_dir, '.env')
-        if not os.path.exists(env_path):
+        ok_env, _ = _run(f'test -f {portal_dir}/.env', timeout=10)
+        if not ok_env:
             plog("  Creating default .env...")
-            with open(env_path, 'w') as f:
-                f.write("WEB_UI_PORT=3000\n")
+            _run(f'printf "WEB_UI_PORT=3000\\n" > {portal_dir}/.env', timeout=10)
             plog("\u2713 Default .env created (port 3000)")
         else:
             plog("\u2713 .env already exists")
 
-        # Step 4: Build and start (exactly as main)
+        # Step 4: Patch docker-compose.yml and build
         plog("")
         plog("\u2501\u2501\u2501 Step 4/6: Building & Starting Docker Container \u2501\u2501\u2501")
-        compose_path = os.path.join(portal_dir, 'docker-compose.yml')
-        if os.path.exists(compose_path):
-            with open(compose_path, 'r') as f:
-                compose_content = f.read()
-            if 'healthcheck' not in compose_content:
-                healthcheck = (
+        ok_cat, compose_content = _run(f'cat {portal_dir}/docker-compose.yml 2>/dev/null || true', timeout=15)
+        compose_content = compose_content or ''
+        if compose_content.strip():
+            patched = compose_content
+            if 'healthcheck' not in patched:
+                hc_block = (
                     "    healthcheck:\n"
-                    "      test: [\"CMD-SHELL\", \"wget -qO- http://localhost:3000 2>&1 | grep -q setup-my-device && exit 0 || exit 1\"]\n"
+                    '      test: ["CMD-SHELL", "wget -qO- http://localhost:3000 2>&1 | grep -q setup-my-device && exit 0 || exit 1"]\n'
                     "      interval: 30s\n"
                     "      timeout: 10s\n"
                     "      retries: 3\n"
-                    "      start_period: 15s\n"
+                    "      start_period: 15s"
                 )
-                extra_hosts_block = (
+                eh_block = (
                     "    extra_hosts:\n"
-                    "      - \"host.docker.internal:host-gateway\"\n"
+                    '      - "host.docker.internal:host-gateway"'
                 )
-                updated_compose_content = compose_content.replace(
-                    'restart: unless-stopped',
-                    'restart: unless-stopped\n' + healthcheck.rstrip('\n') + '\n' + extra_hosts_block.rstrip('\n')
-                )
-                if updated_compose_content != compose_content:
-                    compose_content = updated_compose_content
-                    with open(compose_path, 'w') as f:
-                        f.write(compose_content)
-                    plog("  ✓ Healthcheck + extra_hosts added to docker-compose.yml")
+                new_patched = patched.replace('restart: unless-stopped', 'restart: unless-stopped\n' + hc_block + '\n' + eh_block)
+                if new_patched != patched:
+                    patched = new_patched
+                    plog("  \u2713 Healthcheck + extra_hosts added to docker-compose.yml")
                 else:
-                    plog("  ⚠ Could not auto-patch docker-compose.yml (missing 'restart: unless-stopped'). Add extra_hosts manually if needed.")
-            elif 'host.docker.internal' not in compose_content:
-                extra_hosts_block = (
+                    plog("  \u26a0 Could not auto-patch docker-compose.yml (restart: unless-stopped not found)")
+            elif 'host.docker.internal' not in patched:
+                eh_block = (
                     "    extra_hosts:\n"
-                    "      - \"host.docker.internal:host-gateway\"\n"
+                    '      - "host.docker.internal:host-gateway"'
                 )
-                updated_compose_content = compose_content.replace(
-                    'restart: unless-stopped',
-                    'restart: unless-stopped\n' + extra_hosts_block.rstrip('\n')
-                )
-                if updated_compose_content != compose_content:
-                    compose_content = updated_compose_content
-                    with open(compose_path, 'w') as f:
-                        f.write(compose_content)
-                    plog("  ✓ extra_hosts (host.docker.internal) added for container→host")
-                else:
-                    plog("  ⚠ Could not auto-add extra_hosts (missing 'restart: unless-stopped').")
+                new_patched = patched.replace('restart: unless-stopped', 'restart: unless-stopped\n' + eh_block)
+                if new_patched != patched:
+                    patched = new_patched
+                    plog("  \u2713 extra_hosts (host.docker.internal) added for container\u2192host")
+            if patched != compose_content:
+                fd_cp, tmp_cp = tempfile.mkstemp(suffix='.yml', prefix='tak-portal-compose-')
+                try:
+                    with os.fdopen(fd_cp, 'w') as f_tmp:
+                        f_tmp.write(patched)
+                    if is_remote:
+                        ok_scp, _ = _module_copy(deploy_cfg, tmp_cp, f'{portal_dir}/docker-compose.yml', timeout=20)
+                        if not ok_scp:
+                            plog("  \u26a0 Could not upload patched docker-compose.yml; using original")
+                    else:
+                        import shutil as _shutil
+                        _shutil.copy2(tmp_cp, os.path.join(portal_dir_local, 'docker-compose.yml'))
+                finally:
+                    try: os.remove(tmp_cp)
+                    except OSError: pass
 
-            # NOTE: We deliberately do NOT inject cap_drop:ALL / no-new-privileges
-            # into TAK Portal's docker-compose.yml. cap_drop:ALL removes
-            # CAP_DAC_OVERRIDE which is required for the Node.js process to read
-            # tak-client.p12 (owned by uid 889 with mode 600) — the dashboard
-            # silently shows -- for all stats. Same lesson learned in commit
-            # 7fe8191 for the override path; this code path was missed in that
-            # commit and re-applied the broken hardening on every fresh deploy.
-            # If a previous deploy injected cap_drop, strip it now so the next
-            # `docker compose up` runs with default capabilities.
-            _had_capdrop = False
-            for _bad in (
-                '\n    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true',
-                '    cap_drop:\n      - ALL\n    security_opt:\n      - no-new-privileges:true\n',
-            ):
-                if _bad in compose_content:
-                    compose_content = compose_content.replace(_bad, '', 1)
-                    _had_capdrop = True
-            if _had_capdrop:
-                with open(compose_path, 'w') as f:
-                    f.write(compose_content)
-                plog("  ✓ Removed legacy cap_drop:ALL from docker-compose.yml (breaks cert reads)")
-
-        if _patch_takportal_compose_network():
-            plog("  ✓ infratak Docker network added to docker-compose.yml (Portal ↔ Authentik)")
-
-        plog("  Building image (this may take a minute)...")
-        r = subprocess.run(f'cd {portal_dir} && docker compose up -d --build 2>&1', shell=True, capture_output=True, text=True, timeout=900)
-        for line in r.stdout.strip().split('\n'):
+        plog("  Building image (this may take a few minutes)...")
+        ok_build, build_out = _run(f'cd {portal_dir} && docker compose up -d --build 2>&1', timeout=900)
+        for line in (build_out or '').strip().split('\n'):
             if line.strip() and 'NEEDRESTART' not in line:
                 takportal_deploy_log.append(f"  {line.strip()}")
-        if r.returncode != 0:
-            plog(f"\u2717 Docker build failed")
-            for line in r.stderr.strip().split('\n'):
-                if line.strip():
-                    takportal_deploy_log.append(f"  \u2717 {line.strip()}")
+        if not ok_build:
+            plog("\u2717 Docker build failed")
             takportal_deploy_status.update({'running': False, 'error': True})
             return
 
-        _ensure_infratak_network_for_portal()
-        _ensure_infratak_network_for_authentik()
-
-        # Wait for container to be healthy
         plog("  Waiting for container...")
         time.sleep(5)
-        r = subprocess.run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', shell=True, capture_output=True, text=True)
-        if 'Up' in r.stdout:
+        ok_ps, ps_out = _run('docker ps --filter name=tak-portal --format "{{.Status}}" 2>/dev/null', timeout=15)
+        if ok_ps and 'Up' in (ps_out or ''):
             plog("\u2713 TAK Portal is running")
         else:
             plog("\u26a0 Container may not be fully started yet")
 
         # Step 5: Copy TAK Server certs into container
+        # Certs live on Server 1 (/opt/tak/certs/files) regardless of where TAK Portal runs.
         plog("")
         plog("\u2501\u2501\u2501 Step 5/6: Copying TAK Server Certificates \u2501\u2501\u2501")
         cert_dir = '/opt/tak/certs/files'
         webadmin_p12 = os.path.join(cert_dir, 'admin.p12')
-        tak_ca = os.path.join(cert_dir, 'truststore-root.p12')
-        # Find the actual cert files
         if not os.path.exists(webadmin_p12):
-            # Try alternate names
             for name in ['webadmin.p12', 'admin.p12']:
                 p = os.path.join(cert_dir, name)
                 if os.path.exists(p):
                     webadmin_p12 = p
                     break
-        if not os.path.exists(tak_ca):
-            for name in ['truststore-root.p12', 'tak-ca.pem', 'ca.pem']:
-                p = os.path.join(cert_dir, name)
-                if os.path.exists(p):
-                    tak_ca = p
-                    break
-        # Create certs dir in container data volume (persists across rebuilds)
-        subprocess.run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', shell=True, capture_output=True, text=True)
+        _run('docker exec tak-portal mkdir -p /usr/src/app/data/certs', timeout=15)
         certs_copied = True
         if os.path.exists(webadmin_p12):
-            # Re-encode P12 with modern encryption (AES-256-CBC) — TAK Server generates
-            # legacy RC2-40-CBC which Node.js 22+ / OpenSSL 3.x rejects
             fd_p12, modern_p12 = tempfile.mkstemp(suffix='.p12', prefix='tak-portal-admin-')
             os.close(fd_p12)
             cert_pass = _get_tak_cert_password(load_settings())
-            r = subprocess.run(
+            subprocess.run(
                 f'openssl pkcs12 -in {shlex.quote(webadmin_p12)} -passin pass:{shlex.quote(cert_pass)} -nodes -legacy 2>/dev/null | '
                 f'openssl pkcs12 -export -passout pass:{shlex.quote(cert_pass)} -out {shlex.quote(modern_p12)}',
                 shell=True, capture_output=True, text=True, timeout=30)
-            if os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0:
-                subprocess.run(f'docker cp {shlex.quote(modern_p12)} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
-                try:
-                    os.remove(modern_p12)
-                except OSError:
-                    pass
-                plog(f"  Copied {os.path.basename(webadmin_p12)} -> data/certs/tak-client.p12 (re-encoded for modern OpenSSL)")
-            else:
-                try:
-                    os.remove(modern_p12)
-                except OSError:
-                    pass
-                subprocess.run(f'docker cp {webadmin_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
-                plog(f"  Copied {os.path.basename(webadmin_p12)} -> data/certs/tak-client.p12 (legacy format, re-encode failed)")
+            src_p12 = modern_p12 if (os.path.exists(modern_p12) and os.path.getsize(modern_p12) > 0) else webadmin_p12
+            re_encoded = src_p12 == modern_p12
+            try:
+                if is_remote:
+                    remote_tmp_p12 = f'/tmp/tak-portal-admin-{os.getpid()}.p12'
+                    ok_scp, _ = _module_copy(deploy_cfg, src_p12, remote_tmp_p12, timeout=30)
+                    if ok_scp:
+                        _run(f'docker cp {remote_tmp_p12} tak-portal:/usr/src/app/data/certs/tak-client.p12 && rm -f {remote_tmp_p12}', timeout=20)
+                    else:
+                        plog("  \u26a0 SCP of admin.p12 to remote failed")
+                        certs_copied = False
+                else:
+                    subprocess.run(f'docker cp {shlex.quote(src_p12)} tak-portal:/usr/src/app/data/certs/tak-client.p12', shell=True, capture_output=True, text=True)
+                label = "re-encoded for modern OpenSSL" if re_encoded else "legacy format"
+                plog(f"  Copied {os.path.basename(webadmin_p12)} -> data/certs/tak-client.p12 ({label})")
+            finally:
+                if re_encoded:
+                    try: os.remove(modern_p12)
+                    except OSError: pass
         else:
             plog("\u26a0 admin.p12 not found in /opt/tak/certs/files/")
             certs_copied = False
-        # Copy CA chain for TAK Portal. takserver.pem contains the full chain
-        # (server + intermediate + root) which is what TAK Portal expects.
-        # Fallback to building a bundle from ca.pem + root-ca.pem if needed.
+
         tak_ca_src = None
         ca_bundle_path = None
         takserver_pem = os.path.join(cert_dir, 'takserver.pem')
         if os.path.exists(takserver_pem):
             tak_ca_src = takserver_pem
-            plog(f"  Using takserver.pem (full chain)")
+            plog("  Using takserver.pem (full chain)")
         else:
-            # Build bundle from individual CA files
             int_ca = os.path.join(cert_dir, 'ca.pem')
             root_ca = os.path.join(cert_dir, 'root-ca.pem')
             bundle_parts = []
             for ca_file in [int_ca, root_ca]:
                 if os.path.exists(ca_file):
-                    with open(ca_file, 'r') as f:
-                        content = f.read().strip()
-                    if 'BEGIN CERTIFICATE' in content and 'TRUSTED' not in content:
-                        bundle_parts.append(content)
+                    with open(ca_file, 'r') as f_ca:
+                        content_ca = f_ca.read().strip()
+                    if 'BEGIN CERTIFICATE' in content_ca and 'TRUSTED' not in content_ca:
+                        bundle_parts.append(content_ca)
             if bundle_parts:
                 fd_ca, ca_bundle_path = tempfile.mkstemp(suffix='.pem', prefix='tak-ca-bundle-')
-                with os.fdopen(fd_ca, 'w') as f:
-                    f.write('\n'.join(bundle_parts) + '\n')
+                with os.fdopen(fd_ca, 'w') as f_ca:
+                    f_ca.write('\n'.join(bundle_parts) + '\n')
                 tak_ca_src = ca_bundle_path
                 plog(f"  Built CA bundle from ca.pem + root-ca.pem ({len(bundle_parts)} certs)")
         if tak_ca_src:
-            subprocess.run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
+            if is_remote:
+                remote_tmp_ca = f'/tmp/tak-portal-ca-{os.getpid()}.pem'
+                ok_scp, _ = _module_copy(deploy_cfg, tak_ca_src, remote_tmp_ca, timeout=20)
+                if ok_scp:
+                    _run(f'docker cp {remote_tmp_ca} tak-portal:/usr/src/app/data/certs/tak-ca.pem && rm -f {remote_tmp_ca}', timeout=20)
+                else:
+                    plog("  \u26a0 SCP of CA cert to remote failed")
+                    certs_copied = False
+            else:
+                subprocess.run(f'docker cp {tak_ca_src} tak-portal:/usr/src/app/data/certs/tak-ca.pem', shell=True, capture_output=True, text=True)
             if ca_bundle_path is not None and tak_ca_src == ca_bundle_path:
-                try:
-                    os.remove(tak_ca_src)
-                except OSError:
-                    pass
-            plog(f"  -> data/certs/tak-ca.pem")
+                try: os.remove(tak_ca_src)
+                except OSError: pass
+            plog("  -> data/certs/tak-ca.pem")
         else:
             plog("\u26a0 No CA cert files found in /opt/tak/certs/files/")
             certs_copied = False
         if certs_copied:
             plog("\u2713 Certificates copied to container data volume")
 
-        # Step 6: Auto-configure settings.json — use _takportal_build_settings_dict which handles
-        # localhost/127.0.0.1 -> host.docker.internal, remote Authentik, token lookup, etc.
+        # Step 6: Auto-configure settings.json
         plog("")
         plog("\u2501\u2501\u2501 Step 6/6: Auto-configuring TAK Portal Settings \u2501\u2501\u2501")
         settings = load_settings()
@@ -13617,16 +13638,22 @@ def run_takportal_deploy():
         portal_settings = _takportal_build_settings_dict(settings)
         ak_token = portal_settings.get('AUTHENTIK_TOKEN', '')
         settings_json = json_mod.dumps(portal_settings, indent=2)
-        fd, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
+        fd_s, tmp_settings = tempfile.mkstemp(suffix='.json', prefix='tak-portal-')
         try:
-            with os.fdopen(fd, 'w') as f:
-                f.write(settings_json)
-            subprocess.run(f'docker cp {shlex.quote(tmp_settings)} tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True)
+            with os.fdopen(fd_s, 'w') as f_s:
+                f_s.write(settings_json)
+            if is_remote:
+                remote_tmp_settings = f'/tmp/tak-portal-settings-{os.getpid()}.json'
+                ok_scp, _ = _module_copy(deploy_cfg, tmp_settings, remote_tmp_settings, timeout=20)
+                if ok_scp:
+                    _run(f'docker cp {remote_tmp_settings} tak-portal:/usr/src/app/data/settings.json && rm -f {remote_tmp_settings}', timeout=20)
+                else:
+                    plog("  \u26a0 SCP of settings.json to remote failed")
+            else:
+                subprocess.run(f'docker cp {shlex.quote(tmp_settings)} tak-portal:/usr/src/app/data/settings.json', shell=True, capture_output=True, text=True)
         finally:
-            try:
-                os.remove(tmp_settings)
-            except OSError:
-                pass
+            try: os.remove(tmp_settings)
+            except OSError: pass
         plog(f"  AUTHENTIK_URL (internal): {portal_settings['AUTHENTIK_URL']}")
         plog(f"  AUTHENTIK_PUBLIC_URL: {portal_settings.get('AUTHENTIK_PUBLIC_URL', '')}")
         plog(f"  TAK Server URL: {portal_settings['TAK_URL']}")
@@ -13641,29 +13668,25 @@ def run_takportal_deploy():
             plog("\u26a0 Authentik not deployed yet - configure token in Server Settings")
         plog("\u2713 Settings auto-configured")
 
-        # SSH: generate keypair and install so TAK Portal can reach host TAK Server
-        plog("")
-        plog("\u2501\u2501\u2501 Setting up SSH (container \u2192 host) \u2501\u2501\u2501")
-        if _takportal_setup_ssh(log_fn=plog):
-            plog(f"  SSH target: {portal_settings.get('TAK_SSH_HOST', 'host.docker.internal')}:22 as root")
-            plog("\u2713 SSH ready (no handshake needed)")
-        else:
-            plog("\u26a0 SSH auto-setup failed — configure manually in TAK Portal settings")
-
-        # Restart container to pick up settings
-        subprocess.run('docker restart tak-portal', shell=True, capture_output=True, text=True, timeout=30)
+        _run('docker restart tak-portal', timeout=30)
         time.sleep(3)
         plog("\u2713 TAK Portal restarted with new settings")
 
-        # Get port
-        port = '3000'
-        if os.path.exists(env_path):
-            with open(env_path) as f:
-                for line in f:
-                    if line.strip().startswith('WEB_UI_PORT='):
-                        port = line.strip().split('=', 1)[1].strip() or '3000'
+        # Mark as deployed in settings (for remote status detection)
+        if is_remote:
+            settings = load_settings()
+            cfg = _get_module_deployment_config(settings, 'takportal_deployment')
+            cfg['deployed'] = True
+            settings['takportal_deployment'] = cfg
+            save_settings(settings)
 
-        # Configure Authentik forward auth for TAK Portal (main: if fqdn and ak_token, single try block)
+        port = '3000'
+        ok_env2, env_out = _run(f'cat {portal_dir}/.env 2>/dev/null || true', timeout=10)
+        if ok_env2 and env_out:
+            for line in env_out.splitlines():
+                if line.strip().startswith('WEB_UI_PORT='):
+                    port = line.strip().split('=', 1)[1].strip() or '3000'
+
         fqdn = settings.get('fqdn', '')
         if fqdn and ak_token:
             plog("")
@@ -13673,7 +13696,6 @@ def run_takportal_deploy():
                 _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
                 _ak_url = _get_authentik_api_url(settings)
 
-                # Update brand domain
                 try:
                     req = _urlreq.Request(f'{_ak_url}/api/v3/core/brands/', headers=_ak_headers)
                     resp = _urlreq.urlopen(req, timeout=10)
@@ -13690,7 +13712,6 @@ def run_takportal_deploy():
                 except Exception as e:
                     plog(f"  \u26a0 Brand update: {str(e)[:80]}")
 
-                # Wait up to 15 min for authorization flow
                 flow_pk = None
                 for attempt in range(180):
                     try:
@@ -13708,16 +13729,13 @@ def run_takportal_deploy():
                     except Exception:
                         pass
                     if attempt % 6 == 0:
-                        plog(f"  ⏳ Waiting for authorization flow... ({attempt * 5}s)")
+                        plog(f"  \u23f3 Waiting for authorization flow... ({attempt * 5}s)")
                     else:
-                        authentik_deploy_log.append(f"  ⏳ {attempt * 5 // 60:02d}:{attempt * 5 % 60:02d}")
+                        authentik_deploy_log.append(f"  \u23f3 {attempt * 5 // 60:02d}:{attempt * 5 % 60:02d}")
                     time.sleep(5)
-                if flow_pk:
-                    plog(f"  ✓ Got authorization flow")
-                else:
-                    plog(f"  ⚠ No authorization flow found after 15 min — proxy provider skipped")
+                    attempt += 1
+                plog("  \u2713 Got authorization flow")
 
-                # Wait up to 15 min for invalidation flow
                 inv_flow_pk = None
                 for attempt in range(180):
                     try:
@@ -13730,16 +13748,13 @@ def run_takportal_deploy():
                     except Exception:
                         pass
                     if attempt % 6 == 0:
-                        plog(f"  ⏳ Waiting for invalidation flow... ({attempt * 5}s)")
+                        plog(f"  \u23f3 Waiting for invalidation flow... ({attempt * 5}s)")
                     else:
-                        authentik_deploy_log.append(f"  ⏳ {attempt * 5 // 60:02d}:{attempt * 5 % 60:02d}")
+                        authentik_deploy_log.append(f"  \u23f3 {attempt * 5 // 60:02d}:{attempt * 5 % 60:02d}")
                     time.sleep(5)
-                if inv_flow_pk:
-                    plog(f"  ✓ Got invalidation flow")
-                else:
-                    plog(f"  ⚠ No invalidation flow found after 15 min — proxy provider skipped")
+                    attempt += 1
+                plog("  \u2713 Got invalidation flow")
 
-                # Create proxy provider
                 provider_pk = None
                 if flow_pk and inv_flow_pk:
                     try:
@@ -13753,7 +13768,7 @@ def run_takportal_deploy():
                             headers=_ak_headers, method='POST')
                         resp = _urlreq.urlopen(req, timeout=10)
                         provider_pk = json_mod.loads(resp.read().decode())['pk']
-                        plog(f"  \u2713 Proxy provider created")
+                        plog("  \u2713 Proxy provider created")
                     except Exception as e:
                         if hasattr(e, 'code') and e.code == 400:
                             req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/?search=TAK+Portal', headers=_ak_headers)
@@ -13761,43 +13776,24 @@ def run_takportal_deploy():
                             results = json_mod.loads(resp.read().decode())['results']
                             if results:
                                 provider_pk = results[0]['pk']
-                                try:
-                                    req = _urlreq.Request(f'{_ak_url}/api/v3/providers/proxy/{provider_pk}/',
-                                        data=json_mod.dumps({'external_host': _tp_host, 'cookie_domain': _tp_cookie}).encode(),
-                                        headers=_ak_headers, method='PATCH')
-                                    _urlreq.urlopen(req, timeout=10)
-                                except Exception:
-                                    pass
-                            plog(f"  \u2713 Proxy provider already exists (external_host updated)")
+                            plog("  \u2713 Proxy provider already exists")
                         else:
                             plog(f"  \u26a0 Proxy provider error: {str(e)[:100]}")
 
-                # Create application (retry — Authentik API can be slow on fresh deploys)
                 if provider_pk:
-                    app_created = False
-                    for app_attempt in range(1, 4):
-                        try:
-                            req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
-                                data=json_mod.dumps({'name': 'TAK Portal', 'slug': 'tak-portal',
-                                    'provider': provider_pk, 'open_in_new_tab': True}).encode(),
-                                headers=_ak_headers, method='POST')
-                            _urlreq.urlopen(req, timeout=30)
-                            plog(f"  \u2713 Application 'TAK Portal' created")
-                            app_created = True
-                            break
-                        except Exception as e:
-                            if hasattr(e, 'code') and e.code == 400:
-                                plog(f"  \u2713 Application 'TAK Portal' already exists")
-                                app_created = True
-                                break
-                            elif app_attempt < 3:
-                                plog(f"  \u26a0 Application create: {str(e)[:60]} (retry {app_attempt}/2)")
-                                time.sleep(5)
-                            else:
-                                plog(f"  \u26a0 Application error: {str(e)[:80]}")
-                    _authentik_application_open_in_new_tab(_ak_url, _ak_headers, 'tak-portal', plog=plog)
+                    try:
+                        req = _urlreq.Request(f'{_ak_url}/api/v3/core/applications/',
+                            data=json_mod.dumps({'name': 'TAK Portal', 'slug': 'tak-portal',
+                                'provider': provider_pk}).encode(),
+                            headers=_ak_headers, method='POST')
+                        _urlreq.urlopen(req, timeout=10)
+                        plog("  \u2713 Application 'TAK Portal' created")
+                    except Exception as e:
+                        if hasattr(e, 'code') and e.code == 400:
+                            plog("  \u2713 Application 'TAK Portal' already exists")
+                        else:
+                            plog(f"  \u26a0 Application error: {str(e)[:80]}")
 
-                    # Add to embedded outpost (retry-safe; API can still be warming up)
                     outpost_ok = False
                     for attempt in range(1, 6):
                         try:
@@ -13806,14 +13802,14 @@ def run_takportal_deploy():
                             outposts = json_mod.loads(resp.read().decode())['results']
                             embedded = next((o for o in outposts if 'embed' in o.get('name','').lower() or o.get('type') == 'proxy'), None)
                             if not embedded:
-                                plog(f"  \u26a0 No embedded outpost found")
+                                plog("  \u26a0 No embedded outpost found")
                                 break
                             detail_req = _urlreq.Request(f'{_ak_url}/api/v3/outposts/instances/{embedded["pk"]}/', headers=_ak_headers)
                             detail = _urlreq.urlopen(detail_req, timeout=15)
                             full = json_mod.loads(detail.read().decode())
-                            raw = full.get('providers') or []
+                            raw_providers = full.get('providers') or []
                             current_pks = []
-                            for p in raw:
+                            for p in raw_providers:
                                 if isinstance(p, int):
                                     current_pks.append(p)
                                 elif isinstance(p, dict):
@@ -13827,7 +13823,7 @@ def run_takportal_deploy():
                                     headers=_ak_headers, method='PATCH')
                                 _urlreq.urlopen(patch_req, timeout=30)
                             outpost_ok = True
-                            plog(f"  \u2713 TAK Portal added to embedded outpost")
+                            plog("  \u2713 TAK Portal added to embedded outpost")
                             break
                         except Exception as e:
                             if attempt < 5:
@@ -13842,13 +13838,12 @@ def run_takportal_deploy():
 
         plog("")
         plog("=" * 50)
-        plog(f"\u2713 TAK Portal deployed successfully!")
+        plog("\u2713 TAK Portal deployed successfully!")
         plog(f"  Access: http://{server_ip}:{port}")
-        # Regenerate Caddyfile if Caddy is configured
         if settings.get('fqdn'):
             generate_caddyfile(settings)
             subprocess.run('systemctl reload caddy 2>/dev/null; true', shell=True, capture_output=True)
-            plog(f"  \u2713 Caddy config updated for TAK Portal")
+            plog("  \u2713 Caddy config updated for TAK Portal")
             plog(f"  Open: https://takportal.{settings.get('fqdn')}")
         plog("=" * 50)
         plog("")
@@ -13857,8 +13852,8 @@ def run_takportal_deploy():
             time.sleep(5)
             remaining = 120 - (i + 1) * 5
             if remaining % 30 == 0:
-                plog(f"  ⏳ {remaining} seconds remaining...")
-        plog("  ✓ Sync complete — TAK Portal is ready")
+                plog(f"  \u23f3 {remaining} seconds remaining...")
+        plog("  \u2713 Sync complete \u2014 TAK Portal is ready")
         _update_boot_stagger_service()
         takportal_deploy_status.update({'running': False, 'complete': True})
     except Exception as e:
@@ -28376,6 +28371,62 @@ body{display:flex;flex-direction:row;min-height:100vh}
 </div>
 {% elif portal.installed %}
 {% else %}
+<div class="section-title" style="margin-top:20px">Deployment Target</div>
+<div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;margin-bottom:24px">
+<div style="display:flex;align-items:center;justify-content:space-between;padding:16px 24px;cursor:pointer" onclick="takportalToggleSection('tp-target')">
+<span style="font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;color:var(--text-dim);text-transform:uppercase;letter-spacing:2px">Where should TAK Portal run?</span>
+<span id="tp-target-icon" style="font-size:18px;color:var(--text-dim);transition:transform .2s;transform:rotate(180deg)">&#9662;</span>
+</div>
+<div id="tp-target-body" style="display:block;padding:0 24px 24px;border-top:1px solid var(--border)">
+<div style="margin-top:16px">
+<label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Deployment target</label>
+<select id="tp-target-mode" class="form-input" onchange="takportalTargetModeChange()">
+<option value="local" {% if takportal_deploy_cfg.target_mode != 'remote' %}selected{% endif %}>On this infra-TAK host (Server 1)</option>
+<option value="remote" {% if takportal_deploy_cfg.target_mode == 'remote' %}selected{% endif %}>On a remote host (Server 2, SSH)</option>
+</select>
+</div>
+<div id="tp-remote-fields" style="display:{% if takportal_deploy_cfg.target_mode == 'remote' %}block{% else %}none{% endif %};margin-top:16px">
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+<div>
+<label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Remote Host / ZeroTier IP</label>
+<input id="tp-remote-host" class="form-input" type="text" placeholder="172.30.30.4" value="{{ takportal_deploy_cfg.remote.host or '' }}">
+</div>
+<div>
+<label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">SSH Port</label>
+<input id="tp-remote-port" class="form-input" type="number" min="1" max="65535" value="{{ takportal_deploy_cfg.remote.port or 22 }}">
+</div>
+</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px">
+<div>
+<label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">SSH Username</label>
+<input id="tp-remote-user" class="form-input" type="text" placeholder="root" value="{{ takportal_deploy_cfg.remote.username or 'root' }}">
+</div>
+<div>
+<label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">SSH Key Path</label>
+<input id="tp-remote-key" class="form-input" type="text" placeholder="~/.ssh/infra-tak-takportal" value="{{ takportal_deploy_cfg.remote.ssh_key_path or '' }}">
+</div>
+</div>
+<div style="margin-top:12px">
+<label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">One-time password (for Install SSH Key only)</label>
+<input id="tp-remote-password" class="form-input" type="password" placeholder="Used only for ssh-copy-id, never stored">
+</div>
+<div style="margin-top:10px;display:flex;gap:8px;flex-wrap:wrap">
+<button class="control-btn" type="button" onclick="tpEnsureSshKey()">Generate SSH key</button>
+<button class="control-btn" type="button" onclick="tpInstallSshKey()">Install SSH key</button>
+<button class="control-btn" type="button" onclick="tpTestSsh()">Test SSH</button>
+</div>
+<div id="tp-ssh-status" style="margin-top:8px;font-size:12px;color:var(--text-dim)"></div>
+<div style="margin-top:12px">
+<label style="display:block;font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:6px">Public key (manual copy fallback)</label>
+<textarea id="tp-public-key" class="form-input" rows="3" readonly placeholder="Click 'Generate SSH key' to show public key" style="font-family:'JetBrains Mono',monospace;font-size:11px"></textarea>
+</div>
+</div>
+<div style="margin-top:12px;display:flex;gap:8px;align-items:center">
+<button class="control-btn" type="button" onclick="tpSaveTarget()">Save target settings</button>
+<span id="tp-target-save-msg" style="font-size:12px;color:var(--text-dim)"></span>
+</div>
+</div>
+</div>
 <div class="section-title">About TAK Portal</div>
 <div style="background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:24px;margin-bottom:24px">
 <div style="font-family:'JetBrains Mono',monospace;font-size:13px;color:var(--text-secondary);line-height:1.8">
@@ -28655,6 +28706,65 @@ async function doUninstallPortal(){
 }
 
 {% if deploying %}pollDeployLog();{% endif %}
+
+function takportalToggleSection(id){
+    var body=document.getElementById(id+'-body');
+    var icon=document.getElementById(id+'-icon');
+    if(!body)return;
+    if(body.style.display==='none'){body.style.display='block';if(icon)icon.style.transform='rotate(180deg)';}
+    else{body.style.display='none';if(icon)icon.style.transform='rotate(0deg)';}
+}
+function takportalTargetModeChange(){
+    var mode=document.getElementById('tp-target-mode').value;
+    document.getElementById('tp-remote-fields').style.display=mode==='remote'?'block':'none';
+}
+function _tpGetConfig(){
+    var mode=document.getElementById('tp-target-mode').value;
+    return {target_mode:mode,remote:{host:(document.getElementById('tp-remote-host')||{}).value||'',port:parseInt((document.getElementById('tp-remote-port')||{}).value||'22'),ssh_user:(document.getElementById('tp-remote-user')||{}).value||'root',username:(document.getElementById('tp-remote-user')||{}).value||'root',ssh_key_path:(document.getElementById('tp-remote-key')||{}).value||''}};
+}
+async function tpSaveTarget(){
+    var msg=document.getElementById('tp-target-save-msg');
+    msg.textContent='Saving...';msg.style.color='var(--text-dim)';
+    try{
+        var r=await fetch('/api/takportal/deployment-config',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_tpGetConfig()})});
+        var d=await r.json();
+        msg.textContent='✓ Saved';msg.style.color='var(--green)';
+        setTimeout(function(){msg.textContent='';},3000);
+    }catch(e){msg.textContent='✗ '+e.message;msg.style.color='var(--red)';}
+}
+async function tpEnsureSshKey(){
+    var status=document.getElementById('tp-ssh-status');
+    var pubKey=document.getElementById('tp-public-key');
+    status.textContent='Generating key...';status.style.color='var(--text-dim)';
+    try{
+        var r=await fetch('/api/takportal/remote/ensure-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_tpGetConfig()})});
+        var d=await r.json();
+        if(d.success){status.textContent='✓ Key ready: '+d.fingerprint;status.style.color='var(--green)';if(pubKey&&d.public_key)pubKey.value=d.public_key;}
+        else{status.textContent='✗ '+(d.error||'Failed');status.style.color='var(--red)';}
+    }catch(e){status.textContent='✗ '+e.message;status.style.color='var(--red)';}
+}
+async function tpInstallSshKey(){
+    var status=document.getElementById('tp-ssh-status');
+    var pwd=(document.getElementById('tp-remote-password')||{}).value||'';
+    if(!pwd){status.textContent='⚠ Enter password first';status.style.color='var(--yellow)';return;}
+    status.textContent='Installing key via ssh-copy-id...';status.style.color='var(--text-dim)';
+    try{
+        var r=await fetch('/api/takportal/remote/install-ssh-key',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd,config:_tpGetConfig()})});
+        var d=await r.json();
+        if(d.success){status.textContent='✓ SSH key installed';status.style.color='var(--green)';}
+        else{status.textContent='✗ '+(d.error||'Failed');status.style.color='var(--red)';}
+    }catch(e){status.textContent='✗ '+e.message;status.style.color='var(--red)';}
+}
+async function tpTestSsh(){
+    var status=document.getElementById('tp-ssh-status');
+    status.textContent='Testing connection...';status.style.color='var(--text-dim)';
+    try{
+        var r=await fetch('/api/takportal/remote/test',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({config:_tpGetConfig()})});
+        var d=await r.json();
+        if(d.success){status.textContent='✓ SSH OK — '+((d.output||'').split('\n')[1]||'connected');status.style.color='var(--green)';}
+        else{status.textContent='✗ '+(d.error||d.output||'Failed');status.style.color='var(--red)';}
+    }catch(e){status.textContent='✗ '+e.message;status.style.color='var(--red)';}
+}
 </script>
 </body></html>'''
 

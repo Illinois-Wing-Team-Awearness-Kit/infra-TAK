@@ -5,6 +5,11 @@
 #
 # This is the ONLY script users need to run.
 # Everything else happens in the browser.
+#
+# Multi-server roles:
+#   sudo ./start.sh                   → Server 1 (TAK + Caddy + Portal + console)
+#   sudo ./start.sh --role authentik  → Server 2 (Authentik only, no console)
+#   sudo ./start.sh --role cloudtak   → Server 3 (CloudTAK only, no console)
 ##############################################################################
 
 set -e
@@ -21,6 +26,27 @@ CONFIG_DIR="$INSTALL_DIR/.config"
 AUTH_FILE="$CONFIG_DIR/auth.json"
 SETTINGS_FILE="$CONFIG_DIR/settings.json"
 
+# ==========================================
+# Parse --role argument
+# ==========================================
+SERVER_ROLE="server1"
+for arg in "$@"; do
+    case "$arg" in
+        --role=*)
+            SERVER_ROLE="${arg#--role=}"
+            ;;
+        --role)
+            shift
+            SERVER_ROLE="${1:-server1}"
+            ;;
+    esac
+done
+# Normalize aliases
+case "$SERVER_ROLE" in
+    authentik|auth) SERVER_ROLE="server2" ;;
+    cloudtak|cloud) SERVER_ROLE="server3" ;;
+esac
+
 clear
 echo ""
 echo -e "${CYAN}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
@@ -28,11 +54,15 @@ echo -e "${CYAN}${BOLD}  ║  infra-TAK                                         
 echo -e "${CYAN}${BOLD}  ║  Team Awareness Kit Infrastructure Platform          ║${NC}"
 echo -e "${CYAN}${BOLD}  ╚══════════════════════════════════════════════════════╝${NC}"
 echo ""
+if [ "$SERVER_ROLE" != "server1" ]; then
+    echo -e "  ${YELLOW}${BOLD}Role: $SERVER_ROLE${NC}"
+    echo ""
+fi
 
 # Check if running as root
-if [ "$EUID" -ne 0 ]; then 
+if [ "$EUID" -ne 0 ]; then
     echo -e "${RED}ERROR: This script must be run as root${NC}"
-    echo "Please run: sudo $0"
+    echo "Please run: sudo $0 ${*}"
     exit 1
 fi
 
@@ -459,8 +489,281 @@ EOF
 }
 
 # ==========================================
+# Install Docker (standalone, no console)
+# ==========================================
+install_docker() {
+    if command -v docker >/dev/null 2>&1; then
+        echo -e "  ${GREEN}✓ Docker already installed${NC}"
+        echo ""
+        return 0
+    fi
+    echo -e "  Installing Docker..."
+    case "$PKG_MGR" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            apt-get install -y ca-certificates curl gnupg lsb-release > /tmp/infratak-docker-apt.log 2>&1 || true
+            install -m 0755 -d /etc/apt/keyrings
+            curl -fsSL https://download.docker.com/linux/$(. /etc/os-release && echo "$ID")/gpg \
+                | gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null
+            chmod a+r /etc/apt/keyrings/docker.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] \
+https://download.docker.com/linux/$(. /etc/os-release && echo "$ID") \
+$(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+            apt-get update -qq >> /tmp/infratak-docker-apt.log 2>&1
+            NEEDRESTART_MODE=a apt-get install -y docker-ce docker-ce-cli containerd.io \
+                docker-buildx-plugin docker-compose-plugin >> /tmp/infratak-docker-apt.log 2>&1
+            ;;
+        dnf)
+            dnf install -y yum-utils > /tmp/infratak-docker-dnf.log 2>&1
+            yum-config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo >> /tmp/infratak-docker-dnf.log 2>&1
+            dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin >> /tmp/infratak-docker-dnf.log 2>&1
+            ;;
+    esac
+    systemctl enable docker --now > /dev/null 2>&1 || true
+    echo -e "  ${GREEN}✓ Docker installed${NC}"
+    echo ""
+}
+
+# ==========================================
+# Install ZeroTier and join network
+# ==========================================
+install_zerotier() {
+    echo -e "  ${BOLD}ZeroTier Setup${NC}"
+    echo ""
+
+    if ! command -v zerotier-cli >/dev/null 2>&1; then
+        echo -e "  Installing ZeroTier..."
+        curl -s https://install.zerotier.com | bash > /tmp/infratak-zt.log 2>&1
+        systemctl enable zerotier-one --now > /dev/null 2>&1 || true
+        sleep 3
+        echo -e "  ${GREEN}✓ ZeroTier installed${NC}"
+    else
+        echo -e "  ${GREEN}✓ ZeroTier already installed${NC}"
+    fi
+
+    ZT_NETWORKS=$(zerotier-cli listnetworks 2>/dev/null | tail -n +2 || true)
+    if [ -n "$ZT_NETWORKS" ]; then
+        echo -e "  ${GREEN}✓ Already joined ZeroTier network(s)${NC}"
+        zerotier-cli listnetworks 2>/dev/null | grep -v "^200" | while read -r _line; do
+            echo -e "    $_line"
+        done
+        echo ""
+        return 0
+    fi
+
+    echo ""
+    echo -e "  Enter your ZeroTier Network ID (16-character hex):"
+    read -p "  Network ID: " ZT_NETWORK_ID
+    ZT_NETWORK_ID=$(echo "$ZT_NETWORK_ID" | tr -d ' ')
+    if [ -z "$ZT_NETWORK_ID" ]; then
+        echo -e "  ${YELLOW}⚠ No network ID entered — skipping join. Run: zerotier-cli join <NETWORK_ID>${NC}"
+    else
+        zerotier-cli join "$ZT_NETWORK_ID" > /dev/null 2>&1 || true
+        ZT_ADDR=$(zerotier-cli info 2>/dev/null | awk '{print $3}' || echo "unknown")
+        echo ""
+        echo -e "  ${GREEN}✓ Joined ZeroTier network${NC}"
+        echo -e "  ${BOLD}ZeroTier Node ID:${NC} $ZT_ADDR"
+        echo -e "  ${YELLOW}  Approve this device in your ZeroTier Central console${NC}"
+        echo -e "  ${YELLOW}  then note the assigned IP — you'll need it in the Server 1 console.${NC}"
+    fi
+    echo ""
+}
+
+# ==========================================
+# Install guarddog for a single service
+# ==========================================
+install_guarddog_service() {
+    local watch_script="$1"   # e.g. tak-authentik-watch.sh
+    local timer_name="$2"     # e.g. takauthentikguard
+    local desc="$3"           # human description
+
+    local src="$INSTALL_DIR/scripts/guarddog/$watch_script"
+    if [ ! -f "$src" ]; then
+        echo -e "  ${YELLOW}⚠ Guard dog script not found: $src${NC}"
+        return 0
+    fi
+
+    mkdir -p /opt/tak-guarddog /var/lib/takguard /var/log/takguard
+    cp "$src" "/opt/tak-guarddog/$watch_script"
+    chmod +x "/opt/tak-guarddog/$watch_script"
+
+    # Patch alert email placeholder if email was provided
+    if [ -n "$ALERT_EMAIL" ]; then
+        sed -i "s/ALERT_EMAIL_PLACEHOLDER/$ALERT_EMAIL/g" "/opt/tak-guarddog/$watch_script" 2>/dev/null || true
+    fi
+
+    hostname > /opt/tak-guarddog/server_identifier 2>/dev/null || true
+
+    cat > "/etc/systemd/system/${timer_name}.service" << EOF
+[Unit]
+Description=Guard Dog $desc Monitor
+
+[Service]
+Type=oneshot
+ExecStart=/opt/tak-guarddog/$watch_script
+EOF
+
+    cat > "/etc/systemd/system/${timer_name}.timer" << EOF
+[Unit]
+Description=Run $desc guard every 1 minute
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec=1min
+Unit=${timer_name}.service
+
+[Install]
+WantedBy=timers.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable "${timer_name}.timer" > /dev/null 2>&1 || true
+    systemctl start "${timer_name}.timer" > /dev/null 2>&1 || true
+    echo -e "  ${GREEN}✓ Guard dog timer installed: ${timer_name}.timer${NC}"
+}
+
+# ==========================================
+# Server 2: Authentik remote host setup
+# ==========================================
+run_server2() {
+    echo -e "  ${BOLD}Server 2 — Authentik Host${NC}"
+    echo -e "  This server will run Authentik (identity provider)."
+    echo -e "  The infra-TAK console on Server 1 manages deployment via SSH."
+    echo ""
+
+    detect_os
+    check_disk_io
+    wait_for_upgrades
+
+    # Minimal deps (curl, jq for compose)
+    case "$PKG_MGR" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            NEEDRESTART_MODE=a apt-get install -y curl jq > /tmp/infratak-s2-apt.log 2>&1
+            ;;
+        dnf)
+            dnf install -y curl jq > /tmp/infratak-s2-dnf.log 2>&1
+            ;;
+    esac
+
+    install_docker
+    install_zerotier
+
+    # Create ~/authentik stub directory so console can deploy there
+    TAKWERX_HOME="${SUDO_USER:+$(eval echo ~$SUDO_USER)}"
+    TAKWERX_HOME="${TAKWERX_HOME:-/root}"
+    mkdir -p "$TAKWERX_HOME/authentik"
+    echo -e "  ${GREEN}✓ ~/authentik directory ready${NC}"
+    echo ""
+
+    # Ask for alert email for guarddog
+    echo -e "  ${BOLD}Guard Dog alert email${NC} (optional, press Enter to skip):"
+    read -p "  Email: " ALERT_EMAIL
+    echo ""
+
+    install_guarddog_service "tak-authentik-watch.sh" "takauthentikguard" "Authentik"
+
+    SERVER_IP=$(hostname -I | awk '{print $1}')
+    ZT_IP=$(zerotier-cli listnetworks 2>/dev/null | awk 'NR>1 {print $NF}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+
+    echo ""
+    echo -e "${GREEN}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}${BOLD}  ║  Server 2 (Authentik) is ready!                      ║${NC}"
+    echo -e "${GREEN}${BOLD}  ╚══════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${BOLD}Next steps:${NC}"
+    echo -e "  1. Approve this server in ZeroTier Central"
+    if [ -n "$ZT_IP" ]; then
+        echo -e "  2. ZeroTier IP: ${CYAN}${BOLD}$ZT_IP${NC}"
+    else
+        echo -e "  2. Note the ZeroTier IP assigned in ZeroTier Central"
+    fi
+    echo -e "  3. On Server 1, open the infra-TAK console → Authentik → Deployment"
+    echo -e "     Enter this server's ZeroTier IP and SSH credentials"
+    echo -e "  4. The console will deploy Authentik here and configure Caddy on Server 1"
+    echo -e "     to proxy ${CYAN}auth.yourdomain.com${NC} → this server"
+    echo ""
+    echo -e "  ${BOLD}SSH into this server:${NC} ssh root@${ZT_IP:-<zerotier-ip>}"
+    echo -e "  ${BOLD}Guard Dog:${NC} systemctl status takauthentikguard.timer"
+    echo ""
+}
+
+# ==========================================
+# Server 3: CloudTAK remote host setup
+# ==========================================
+run_server3() {
+    echo -e "  ${BOLD}Server 3 — CloudTAK Host${NC}"
+    echo -e "  This server will run CloudTAK (browser-based TAK client)."
+    echo -e "  The infra-TAK console on Server 1 manages deployment via SSH."
+    echo ""
+
+    detect_os
+    check_disk_io
+    wait_for_upgrades
+
+    case "$PKG_MGR" in
+        apt)
+            export DEBIAN_FRONTEND=noninteractive
+            NEEDRESTART_MODE=a apt-get install -y curl jq > /tmp/infratak-s3-apt.log 2>&1
+            ;;
+        dnf)
+            dnf install -y curl jq > /tmp/infratak-s3-dnf.log 2>&1
+            ;;
+    esac
+
+    install_docker
+    install_zerotier
+
+    TAKWERX_HOME="${SUDO_USER:+$(eval echo ~$SUDO_USER)}"
+    TAKWERX_HOME="${TAKWERX_HOME:-/root}"
+    mkdir -p "$TAKWERX_HOME/CloudTAK"
+    echo -e "  ${GREEN}✓ ~/CloudTAK directory ready${NC}"
+    echo ""
+
+    echo -e "  ${BOLD}Guard Dog alert email${NC} (optional, press Enter to skip):"
+    read -p "  Email: " ALERT_EMAIL
+    echo ""
+
+    install_guarddog_service "tak-cloudtak-watch.sh" "takcloudtakguard" "CloudTAK"
+
+    ZT_IP=$(zerotier-cli listnetworks 2>/dev/null | awk 'NR>1 {print $NF}' | grep -oE '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || echo "")
+
+    echo ""
+    echo -e "${GREEN}${BOLD}  ╔══════════════════════════════════════════════════════╗${NC}"
+    echo -e "${GREEN}${BOLD}  ║  Server 3 (CloudTAK) is ready!                       ║${NC}"
+    echo -e "${GREEN}${BOLD}  ╚══════════════════════════════════════════════════════╝${NC}"
+    echo ""
+    echo -e "  ${BOLD}Next steps:${NC}"
+    echo -e "  1. Approve this server in ZeroTier Central"
+    if [ -n "$ZT_IP" ]; then
+        echo -e "  2. ZeroTier IP: ${CYAN}${BOLD}$ZT_IP${NC}"
+    else
+        echo -e "  2. Note the ZeroTier IP assigned in ZeroTier Central"
+    fi
+    echo -e "  3. On Server 1, open the infra-TAK console → CloudTAK → Deployment"
+    echo -e "     Enter this server's ZeroTier IP and SSH credentials"
+    echo -e "  4. CloudTAK connects back to TAKServer on Server 1 via ZeroTier"
+    echo ""
+    echo -e "  ${BOLD}SSH into this server:${NC} ssh root@${ZT_IP:-<zerotier-ip>}"
+    echo -e "  ${BOLD}Guard Dog:${NC} systemctl status takcloudtakguard.timer"
+    echo ""
+}
+
+# ==========================================
 # Main
 # ==========================================
+
+# Branch to role-specific setup
+if [ "$SERVER_ROLE" = "server2" ]; then
+    run_server2
+    exit 0
+fi
+if [ "$SERVER_ROLE" = "server3" ]; then
+    run_server3
+    exit 0
+fi
+
+# Server 1 (default) — original full install
 detect_os
 check_disk_io
 wait_for_upgrades

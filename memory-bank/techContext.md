@@ -75,6 +75,7 @@ The list lives in `start.sh` (apt + pip) — no `requirements.txt` is committed 
 | Authentik | `9443` | HTTPS | Direct, rarely needed |
 | LDAP outpost | `389` / `636` | TCP | TAK Server uses for auth |
 | TAK Portal | `3000` | HTTP | Proxied via Caddy |
+| TAK Video Restreamer | `3100` | HTTP | Flask web UI — loopback only, proxied via Caddy at `stream.<FQDN>` |
 | Email Relay | `25` | SMTP | localhost only |
 | Node-RED | `1880` | HTTP | Proxied via Caddy on FQDN, direct on IP-mode |
 | MediaMTX | `8554` / `8889` / `5080` | RTSP / WebRTC+HLS / HTTP | Editor on `:5080` |

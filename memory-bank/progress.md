@@ -5,7 +5,7 @@
 ## Current status
 
 - **Released (`main`):** `v0.9.41-alpha` (2026-05-28). Main tip: `2916efd`.
-- **In flight (`dev`):** In sync with `main`. No active in-flight work; ready for next release.
+- **In flight (`dev`):** `v0.9.42-alpha` complete — TAK Video Restreamer module. Ready for selective merge to `main`.
 
 ## What works (production-validated)
 
@@ -80,6 +80,17 @@
 - Compose-driven deploy with Authentik forward auth options.
 - RTSP fail2ban jail with watching panel + manual ban (v0.9.4).
 - Pill-style UI on the console.
+- Mutually exclusive with TAK Video Restreamer (same streaming ports). Marketplace blocks both ways.
+
+### TAK Video Restreamer (v0.9.42)
+- Docker-based deploy from Marketplace. Clones `raytheonbbn/tak-video-restreamer`, builds image, starts container.
+- Host port **3100** → container port 3000 (TAK Portal owns 3000).
+- Caddy at `stream.<FQDN>` — same subdomain as MediaMTX (mutually exclusive, can't conflict).
+- Own Flask login (admin / generated password). No Authentik SSO — TVR has built-in auth.
+- Change password from UI: patches `ADMIN_PASSWORD` in docker-compose.yml, `docker compose up -d` (no rebuild).
+- Guard Dog: `tvr_http` monitor on `GET /login` port 3100.
+- Update Now: `git pull --ff-only` + `docker compose up -d --build` with live log.
+- Console card: name, git SHA version, update badge vs upstream main.
 
 ### Federation Hub
 - Local deployment (v0.9.4) — same machine as console, no SSH.

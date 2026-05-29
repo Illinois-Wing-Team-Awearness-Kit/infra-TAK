@@ -4,10 +4,19 @@
 
 ## Current state (snapshot)
 
-- **Active branch:** `dev` (in sync with `main` after v0.9.41 ship).
+- **Active branch:** `dev` — v0.9.42-alpha complete, ready to selective-merge to `main`.
 - **Latest tag on `main`:** `v0.9.41-alpha` (`VERSION = "0.9.41-alpha"`). Released 2026-05-28.
-- **Main tip SHA:** `2916efd` — squash merge of all v0.9.41 dev work.
-- **Dev tip SHA:** `199dfdd` (`docs: v0.9.41-alpha release notes final + README pointer`).
+- **Dev tip SHA:** `70207c8` (Guard Dog TVR healthcheck fix — last commit before ship).
+
+## In-flight: v0.9.42-alpha (2026-05-29) — shipping now
+
+New module: **TAK Video Restreamer** (Flask + MediaMTX + FFmpeg). Full details in `docs/RELEASE-v0.9.42-alpha.md`.
+
+Key decisions made during this release:
+- TVR uses host port **3100** (not 3000 — TAK Portal owns 3000).
+- TVR has **no Authentik `forward_auth` wrapper** — it has its own built-in Flask login. Double-login was rejected; single TVR login is the UX.
+- Guard Dog health check uses `GET /login` (port 3100) — TVR has no `/api/health` endpoint.
+- TVR and MediaMTX are **mutually exclusive** — same streaming ports (8554/8555/8890/1935/8888). Marketplace enforces bidirectional blocking.
 
 ## Recent release: v0.9.41-alpha (2026-05-28)
 
@@ -55,9 +64,10 @@ No active in-flight work on dev. Ready to pick up next items from backlog.
 
 ## Next steps
 
-- Pick up next backlog items for v0.9.42-alpha.
+- Ship v0.9.42-alpha to `main` (selective merge + tag).
 - Consider adding note in UI for Azure PostgreSQL: recommend PG 15 over PG 18.
 - Two-server snapshot rollback (pg_dump over SSH) still pending from backlog.
+- Future: fork `raytheonbbn/tak-video-restreamer` to `takwerx/tak-video-restreamer`, add `DISABLE_AUTH=true` env var to skip TVR's own login when behind Authentik. Parked for v0.9.43+.
 
 ## How to resume after a memory reset
 

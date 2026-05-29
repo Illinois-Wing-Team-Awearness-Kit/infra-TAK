@@ -14558,7 +14558,7 @@ paths:
         if _ak_token and domain:
             plog("")
             plog("━━━ Registering MediaMTX in Authentik (proxy provider + application) ━━━")
-            _ak_url = 'http://127.0.0.1:9090'
+            _ak_url = _get_authentik_api_url(settings)
             _ak_headers = {'Authorization': f'Bearer {_ak_token}', 'Content-Type': 'application/json'}
             _ensure_authentik_console_app(domain, _ak_token, plog)
             _repair_embedded_outpost_all_apps(_ak_url, _ak_headers, settings, plog)
@@ -21789,10 +21789,10 @@ def _ensure_authentik_fedhub_proxy_app(fqdn, ak_token, plog=None, flow_pk=None, 
         log(f"  ⚠ Forward auth setup error: {str(e)[:100]}")
     return True
 
-def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, ak_url=None):
+def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_flow_pk=None, settings=None):
     """Create infra-TAK Console proxy providers (infratak + console) and applications in Authentik, add to embedded outpost.
     When flow_pk/inv_flow_pk are provided (e.g. from Step 12), use them. Otherwise wait for flows (e.g. when called from Caddy save).
-    ak_url overrides the default 127.0.0.1:9090 — pass the remote host URL for remote Authentik deployments."""
+    settings overrides load_settings() — pass the settings dict for remote Authentik deployments."""
     if not fqdn or not ak_token:
         return False
     def log(msg):
@@ -21800,7 +21800,7 @@ def _ensure_authentik_console_app(fqdn, ak_token, plog=None, flow_pk=None, inv_f
             plog(msg)
     import urllib.request as _urlreq
     _ak_headers = {'Authorization': f'Bearer {ak_token}', 'Content-Type': 'application/json'}
-    _ak_url = ak_url or 'http://127.0.0.1:9090'
+    _ak_url = _get_authentik_api_url(settings or load_settings())
 
     try:
         if not flow_pk or not inv_flow_pk:
@@ -30154,11 +30154,11 @@ networks:
     plog("")
     plog("━━━ Step 8b/8: Authentik Console Application ━━━")
     if fqdn and bootstrap_token:
-        _remote_ak_url = f'http://{host}:9090'
+        _remote_ak_settings = {'authentik_deployment': {'target_mode': 'remote', 'remote': {'host': host}}}
         plog("  Registering infratak console proxy provider + application...")
         try:
             _app_ok = _ensure_authentik_console_app(
-                fqdn, bootstrap_token, plog=plog, ak_url=_remote_ak_url)
+                fqdn, bootstrap_token, plog=plog, settings=_remote_ak_settings)
             if _app_ok:
                 plog("✓ infra-TAK Console application registered in Authentik")
             else:

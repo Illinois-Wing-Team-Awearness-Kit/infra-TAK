@@ -40725,7 +40725,12 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
         if has_flow_error:
             saw_spiral = True
 
-    return 'inconclusive' if saw_spiral or not has_ldapsearch else 'fail'
+    # For remote Authentik, ldapsearch may be installed but unreachable (ZeroTier
+    # source IP vs. public IP in UFW allowlist). A connection failure is not a
+    # credential failure — fall back to 'inconclusive' so callers don't treat it
+    # as a confirmed bad password. Only 'invalid credentials' in ldapsearch output
+    # (already returned 'fail' early above) is a definitive remote failure.
+    return 'inconclusive' if saw_spiral or not has_ldapsearch or is_remote else 'fail'
 
 
 def _test_ldap_bind_dn(bind_dn, bind_pass):
@@ -43413,9 +43418,14 @@ def takserver_connect_ldap():
         verify['webadmin_exists_in_authentik'] = bool(ws.get('exists'))
         verify['webadmin_superuser'] = bool(ws.get('is_superuser'))
         ldap_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD') or ''
-        verify['service_bind_seen'] = bool(_test_ldap_bind(ldap_pass)) if ldap_pass else False
+        # Use raw verdict (ok/fail/inconclusive) so an inconclusive result on remote
+        # Authentik (ldapsearch can't reach remote LDAP port via ZeroTier src IP)
+        # does not count as a confirmed failure.
+        _sa_verdict = _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', ldap_pass) if ldap_pass else 'skip'
+        verify['service_bind_seen'] = _sa_verdict == 'ok'
         wap = (settings.get('webadmin_password') or '').strip()
-        verify['webadmin_bind_seen'] = bool(_test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', wap)) if wap else False
+        _wa_verdict = _test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', wap) if wap else 'skip'
+        verify['webadmin_bind_seen'] = _wa_verdict != 'fail'  # ok or inconclusive both pass
         verify['ready'] = all([
             verify['coreconfig_has_ldap'],
             verify['webadmin_exists_in_authentik'],

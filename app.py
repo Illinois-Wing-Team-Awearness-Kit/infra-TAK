@@ -12030,9 +12030,18 @@ def install_le_cert_on_8446(takserver_host, log_fn, wait_for_cert=True):
             new_connector, content, count=1
         )
         if patched != content:
+            # Also enable VBM (certificate enrollment) now that the LE cert is in place.
+            # VBM is inserted as enabled="false" during initial TAK Server deploy and never
+            # flipped — without this, QR/token enrollment on port 8446 silently rejects
+            # every connection even though the connector and JKS are correctly configured.
+            patched = patched.replace('<vbm enabled="false"/>', '<vbm enabled="true"/>')
             with open(core_config, 'w') as f:
                 f.write(patched)
             log_fn("  ✓ CoreConfig.xml 8446 connector patched to use LE cert")
+            if '<vbm enabled="true"/>' in patched:
+                log_fn("  ✓ Certificate enrollment (VBM) enabled")
+            else:
+                log_fn("  ⚠ VBM block not found in CoreConfig — enrollment may be disabled; check manually")
             # v0.9.29 — verify the patch actually landed by reading back. Critical
             # because subtle whitespace differences or a stale file lock could leave
             # the patch unwritten, and a silent no-op here means 8446 serves the

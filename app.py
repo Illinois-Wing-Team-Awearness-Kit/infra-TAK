@@ -40652,8 +40652,10 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
     spiral_markers = ('exceeded stage recursion depth', 'nil pointer dereference', 'eof')
 
     # Try to install ldapsearch once at the top — best chance of getting a decisive result.
+    # For remote Authentik, ldapsearch runs on the console host pointing at ldap_host (the
+    # remote IP). UFW on the remote host allows port 389 from the console IP, so this works.
     has_ldapsearch = shutil.which('ldapsearch') is not None
-    if not has_ldapsearch and not is_remote:
+    if not has_ldapsearch:
         try:
             _ensure_ldapsearch()
             has_ldapsearch = shutil.which('ldapsearch') is not None
@@ -40662,7 +40664,7 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
 
     saw_spiral = False
     for _ in range(3):
-        if has_ldapsearch and not is_remote:
+        if has_ldapsearch:
             try:
                 # Search ou=users (not dc= root) so the search itself also succeeds.
                 # Authentik doesn't expose a root object at dc=takldap, so a base-scope

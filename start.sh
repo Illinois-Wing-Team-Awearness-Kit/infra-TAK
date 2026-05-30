@@ -769,6 +769,7 @@ check_disk_io
 wait_for_upgrades
 
 install_dependencies
+install_zerotier
 
 # First-time setup if no auth file exists
 if [ ! -f "$AUTH_FILE" ]; then

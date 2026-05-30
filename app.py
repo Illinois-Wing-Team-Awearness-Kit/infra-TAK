@@ -40971,6 +40971,21 @@ def _ensure_ldap_flow_authentication_none():
                                 pass
                 else:
                     return False, f'LDAP stages not found/created: id={id_stage} pw={pw_stage} login={login_stage}'
+            # Always enforce evaluate_on_plan=False on all stage bindings.
+            # evaluate_on_plan=True + re_evaluate_policies=True (Authentik blueprint default)
+            # causes "exceeded stage recursion depth" on every cache miss (fresh outpost
+            # restart, new bind DN). The result is the flow fails and the LDAP outpost
+            # returns "invalid credentials" even when the password is correct.
+            # Re-fetch ldap_bindings in case the recreate path above replaced them.
+            _refreshed = _get(f'flows/bindings/?target={ldap_flow_pk}&ordering=order&page_size=100').get('results', [])
+            if _refreshed:
+                ldap_bindings = _refreshed
+            for _b in ldap_bindings:
+                if _b.get('evaluate_on_plan') is True:
+                    try:
+                        _patch(f'flows/bindings/{_b["pk"]}/', {'evaluate_on_plan': False})
+                    except Exception:
+                        pass
             # Always enforce short session_duration on ldap-authentication-login so password
             # changes propagate within 2 minutes (cached bind mode caches for session lifetime)
             _login_stage_pk = _find_stage('stages/user_login/', 'ldap-authentication-login')

@@ -43360,6 +43360,27 @@ def takserver_connect_ldap():
             msg += '. For remote Authentik ensure this host can reach the Authentik server on port 9090 (firewall).'
         return jsonify({'success': False, 'message': msg}), 400
     diag.append('Flow: OK')
+    # Diagnostic: report current evaluate_on_plan state on LDAP flow bindings so we can
+    # confirm the DELETE+POST fix actually applied. A binding with evaluate_on_plan=True
+    # causes "exceeded stage recursion depth" on cold-cache and maps to LDAP error 49.
+    try:
+        import urllib.request as _dq_req
+        _dq_settings = load_settings()
+        _dq_tok = _get_authentik_env_value(_dq_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(_dq_settings, 'AUTHENTIK_TOKEN')
+        _dq_url = _get_authentik_api_url(_dq_settings)
+        if _dq_tok and _dq_url:
+            _dq_hdrs = {'Authorization': f'Bearer {_dq_tok}', 'Content-Type': 'application/json'}
+            _dq_r = _dq_req.Request(f'{_dq_url}/api/v3/flows/instances/?slug=ldap-authentication-flow', headers=_dq_hdrs)
+            _dq_flow = json.loads(_dq_req.urlopen(_dq_r, timeout=15).read().decode()).get('results', [{}])[0]
+            _dq_fpk = _dq_flow.get('pk', '')
+            if _dq_fpk:
+                _dq_br = _dq_req.Request(f'{_dq_url}/api/v3/flows/bindings/?page_size=500', headers=_dq_hdrs)
+                _dq_bindings = [b for b in json.loads(_dq_req.urlopen(_dq_br, timeout=15).read().decode()).get('results', [])
+                                if str(b.get('target')) == str(_dq_fpk)]
+                _eval_states = [f"order={b.get('order')} eval_on_plan={b.get('evaluate_on_plan')}" for b in _dq_bindings]
+                diag.append(f'Flow bindings ({len(_dq_bindings)}): ' + ('; '.join(_eval_states) if _eval_states else 'none found'))
+    except Exception as _dq_err:
+        diag.append(f'Flow binding diag: {str(_dq_err)[:60]} (non-fatal)')
     # Ensure reputation policy exists on ldap-authentication-flow with negate=True (fail-open).
     # Without this, Authentik's ReputationPolicy.passes() returns True only for BAD users —
     # with negate=False every normal-reputation user gets denied (v0.9.2→v0.9.12 bug).

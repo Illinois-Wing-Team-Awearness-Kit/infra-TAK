@@ -34530,8 +34530,10 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
             settings = load_settings()
 
         ak_env_path = os.path.expanduser('~/authentik/.env')
-        if not os.path.exists(ak_env_path):
-            _log("  proxy chain: Authentik not installed locally — skip")
+        _ak_chain_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        _ak_chain_remote = _ak_chain_cfg.get('target_mode') == 'remote' and (_ak_chain_cfg.get('remote', {}).get('host') or '').strip()
+        if not os.path.exists(ak_env_path) and not _ak_chain_remote:
+            _log("  proxy chain: Authentik not installed locally or remotely — skip")
             return summary
 
         fqdn = (settings.get('fqdn') or '').strip()
@@ -37165,12 +37167,13 @@ def _authentik_setup_reputation_policy(plog):
     import urllib.request as _req
     import urllib.error
 
-    ak_env = os.path.expanduser('~/authentik/.env')
-    if not os.path.exists(ak_env):
-        plog("  reputation policy: ~/authentik/.env not found — skipping (Authentik not installed)")
+    settings = load_settings()
+    _ak_rep_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    _ak_rep_remote = _ak_rep_cfg.get('target_mode') == 'remote' and (_ak_rep_cfg.get('remote', {}).get('host') or '').strip()
+    if not os.path.exists(os.path.expanduser('~/authentik/.env')) and not _ak_rep_remote:
+        plog("  reputation policy: Authentik not installed locally or remotely — skipping")
         return False
 
-    settings = load_settings()
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or \
                _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     if not ak_token:
@@ -52222,9 +52225,11 @@ _startup_harden_cloudtak_ports()
 # Idempotent: no-op once both fields are at safe values.
 def _startup_fix_reputation_policy_drift():
     try:
-        if not os.path.isdir(os.path.expanduser('~/authentik')):
-            return False
         settings = load_settings()
+        _ak_sd_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        _ak_sd_remote = _ak_sd_cfg.get('target_mode') == 'remote' and (_ak_sd_cfg.get('remote', {}).get('host') or '').strip()
+        if not os.path.isdir(os.path.expanduser('~/authentik')) and not _ak_sd_remote:
+            return False
         ak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
                     or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
         if not ak_token:
@@ -53466,8 +53471,13 @@ def _startup_migrations():
 
         # v0.9.2: Create Authentik ReputationPolicy and bind to ldap-authentication-flow.
         # Idempotent — only runs the API calls on first startup per box.
+        # Also applies to remote Authentik (function now handles both local and remote).
         try:
-            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+            _ak_rep_s = load_settings()
+            _ak_rep_c = _get_module_deployment_config(_ak_rep_s, 'authentik_deployment')
+            _ak_rep_ok = (os.path.exists(os.path.expanduser('~/authentik/.env')) or
+                          (_ak_rep_c.get('target_mode') == 'remote' and (_ak_rep_c.get('remote', {}).get('host') or '').strip()))
+            if _ak_rep_ok:
                 _authentik_setup_reputation_policy(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _ak_rep_err:
             print(f"Startup migration: authentik reputation policy error (non-fatal): {_ak_rep_err}")
@@ -53940,8 +53950,13 @@ def _post_update_auto_deploy():
                 print(f"Post-update: fail2ban takserver filter error (non-fatal): {_f2b_tak_err}")
 
             # v0.9.2: Set up Authentik ReputationPolicy on ldap-authentication-flow.
+            # Also applies to remote Authentik (function now handles both local and remote).
             try:
-                if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _ak_pu_s = load_settings()
+                _ak_pu_c = _get_module_deployment_config(_ak_pu_s, 'authentik_deployment')
+                _ak_pu_ok = (os.path.exists(os.path.expanduser('~/authentik/.env')) or
+                             (_ak_pu_c.get('target_mode') == 'remote' and (_ak_pu_c.get('remote', {}).get('host') or '').strip()))
+                if _ak_pu_ok:
                     _authentik_setup_reputation_policy(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _ak_rep_err:
                 print(f"Post-update: authentik reputation policy error (non-fatal): {_ak_rep_err}")

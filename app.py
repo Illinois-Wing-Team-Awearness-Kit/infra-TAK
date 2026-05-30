@@ -40982,8 +40982,19 @@ def _ensure_ldap_flow_authentication_none():
                 ldap_bindings = _refreshed
             for _b in ldap_bindings:
                 if _b.get('evaluate_on_plan') is True:
+                    # PATCH returns 405 on Authentik 2026.x for flow bindings — use DELETE+POST.
                     try:
-                        _patch(f'flows/bindings/{_b["pk"]}/', {'evaluate_on_plan': False})
+                        _delete(f'flows/bindings/{_b["pk"]}/')
+                        _post('flows/bindings/', {
+                            'target': _b.get('target', ldap_flow_pk),
+                            'stage': _b['stage'],
+                            'order': _b.get('order', 10),
+                            'evaluate_on_plan': False,
+                            're_evaluate_policies': _b.get('re_evaluate_policies', True),
+                            'policy_engine_mode': _b.get('policy_engine_mode', 'any'),
+                            'invalid_response_action': _b.get('invalid_response_action', 'retry'),
+                            'enabled': _b.get('enabled', True),
+                        })
                     except Exception:
                         pass
             # Always enforce short session_duration on ldap-authentication-login so password

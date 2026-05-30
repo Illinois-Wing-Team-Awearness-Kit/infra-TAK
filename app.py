@@ -41008,11 +41008,28 @@ def _ensure_ldap_flow_authentication_none():
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
             ldap_prov = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
             if ldap_prov:
+                # authorization_flow must be a simple authorization flow, NOT the authentication
+                # flow. Using the same flow for both causes Authentik to re-run the credential
+                # verification on the authorization step (no credentials → identification fails →
+                # bind returns error 49 "invalid credentials"). Known issue: github.com/goauthentik/authentik/issues/9972
+                _authz_candidates = [
+                    'default-provider-authorization-implicit-consent',
+                    'default-provider-authorization-explicit-consent',
+                ]
+                _authz_flow_pk = None
+                for _slug in _authz_candidates:
+                    _r = _get(f'flows/instances/?slug={_slug}').get('results', [])
+                    if _r:
+                        _authz_flow_pk = _r[0]['pk']
+                        break
+                if not _authz_flow_pk:
+                    # Fall back to the authentication flow only if no authorization flow exists.
+                    _authz_flow_pk = ldap_flow_pk
                 try:
                     ldap_authz_flow_pk = ldap_authz_flow['pk'] if ldap_authz_flow else ldap_flow_pk
                     _patch(f'providers/ldap/{ldap_prov["pk"]}/', {
                         'authentication_flow': ldap_flow_pk,
-                        'authorization_flow': ldap_authz_flow_pk,
+                        'authorization_flow': _authz_flow_pk,
                         'bind_mode': 'cached',
                         'search_mode': 'cached'})
                 except urllib.error.HTTPError as e:

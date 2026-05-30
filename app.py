@@ -29771,7 +29771,7 @@ entries:
       name: LDAP
     attrs:
       authentication_flow: !KeyOf ldap-authentication-flow
-      authorization_flow: !KeyOf ldap-authentication-flow
+      authorization_flow: !KeyOf ldap-authorization-flow
       base_dn: !Context basedn
       bind_mode: cached
       gid_start_number: 4000
@@ -38156,7 +38156,7 @@ entries:
       name: LDAP
     attrs:
       authentication_flow: !KeyOf ldap-authentication-flow
-      authorization_flow: !KeyOf ldap-authentication-flow
+      authorization_flow: !KeyOf ldap-authorization-flow
       base_dn: !Context basedn
       bind_mode: cached
       gid_start_number: 4000
@@ -40856,6 +40856,8 @@ def _ensure_ldap_flow_authentication_none():
     try:
         ldap_flow_results = _get('flows/instances/?slug=ldap-authentication-flow').get('results', [])
         ldap_flow = ldap_flow_results[0] if ldap_flow_results else None
+        ldap_authz_flow_results = _get('flows/instances/?slug=ldap-authorization-flow').get('results', [])
+        ldap_authz_flow = ldap_authz_flow_results[0] if ldap_authz_flow_results else None
         default_flow_results = _get('flows/instances/?slug=default-authentication-flow').get('results', [])
         default_flow = default_flow_results[0] if default_flow_results else None
 
@@ -40974,9 +40976,10 @@ def _ensure_ldap_flow_authentication_none():
             ldap_prov = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
             if ldap_prov:
                 try:
+                    ldap_authz_flow_pk = ldap_authz_flow['pk'] if ldap_authz_flow else ldap_flow_pk
                     _patch(f'providers/ldap/{ldap_prov["pk"]}/', {
                         'authentication_flow': ldap_flow_pk,
-                        'authorization_flow': ldap_flow_pk,
+                        'authorization_flow': ldap_authz_flow_pk,
                         'bind_mode': 'cached',
                         'search_mode': 'cached'})
                 except urllib.error.HTTPError as e:
@@ -41021,9 +41024,10 @@ def _ensure_ldap_flow_authentication_none():
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
             ldap_provider = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
             if ldap_provider:
+                ldap_authz_flow_pk = ldap_authz_flow['pk'] if ldap_authz_flow else new_flow_pk
                 _patch(f'providers/ldap/{ldap_provider["pk"]}/', {
                     'authentication_flow': new_flow_pk,
-                    'authorization_flow': new_flow_pk,
+                    'authorization_flow': ldap_authz_flow_pk,
                     'bind_mode': 'cached',
                     'search_mode': 'cached'})
     except urllib.error.HTTPError as e:

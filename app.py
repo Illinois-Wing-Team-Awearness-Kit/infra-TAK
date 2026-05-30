@@ -40514,7 +40514,7 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
     Returns one of:
       'ok'           — bind confirmed (ldapsearch success OR success marker in outpost logs)
       'fail'         — bind confirmed failed (failure markers / credential errors)
-      'inconclusive' — could not determine (ldapsearch unavailable AND no decisive marker)
+      'inconclusive' — could not determine (ldapsearch unavailable, remote mode, or no decisive marker)
 
     Callers must NOT take destructive action on 'inconclusive' — that's the bug that hit
     `responder` (April 2026): missing ldapsearch + recursion-only outpost logs caused a
@@ -40613,7 +40613,12 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
         if has_flow_error:
             saw_spiral = True
 
-    return 'inconclusive' if saw_spiral or not has_ldapsearch else 'fail'
+    # In remote mode ldapsearch is never executed (guarded by `not is_remote` above),
+    # so has_ldapsearch being True on the local machine is irrelevant — we have no
+    # authoritative credential test result.  Treat the absence of decisive log markers
+    # as inconclusive rather than 'fail' to avoid false-failing the bind verification
+    # and triggering destructive user DELETE+POST in the webadmin sync path.
+    return 'inconclusive' if saw_spiral or not has_ldapsearch or is_remote else 'fail'
 
 
 def _test_ldap_bind_dn(bind_dn, bind_pass):

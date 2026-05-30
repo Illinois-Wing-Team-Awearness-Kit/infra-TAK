@@ -43329,6 +43329,19 @@ def takserver_connect_ldap():
             msg += '. For remote Authentik ensure this host can reach the Authentik server on port 9090 (firewall).'
         return jsonify({'success': False, 'message': msg}), 400
     diag.append('Flow: OK')
+    # Ensure reputation policy exists on ldap-authentication-flow with negate=True (fail-open).
+    # Without this, Authentik's ReputationPolicy.passes() returns True only for BAD users —
+    # with negate=False every normal-reputation user gets denied (v0.9.2→v0.9.12 bug).
+    # Run every time Connect LDAP is clicked so remote Authentik setups are covered.
+    try:
+        _rep_log = []
+        _authentik_setup_reputation_policy(lambda m: _rep_log.append(m.strip()))
+        if _rep_log:
+            diag.append('Reputation policy: ' + '; '.join(r for r in _rep_log if r and 'skipping' not in r) or 'OK')
+        else:
+            diag.append('Reputation policy: OK')
+    except Exception as _rep_err:
+        diag.append(f'Reputation policy: {str(_rep_err)[:80]} (non-fatal)')
     # Ensure LDAP app has no restrictive policy (blocks QR registration for non-admin users)
     try:
         settings = load_settings()

@@ -22749,21 +22749,23 @@ volumes:
         nodered_deploy_status.update({'running': False, 'error': True})
         return
 
-    # Ensure Docker on remote (same pattern as CloudTAK / Authentik)
+    # Ensure Docker on remote — use command -v (reliable across SSH PATH envs) to
+    # skip install when Docker is already present (e.g. start.sh --role authentik).
     plog("━━━ Checking Docker (remote) ━━━")
-    ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
-    if not ok or 'Docker version' not in (out or ''):
-        plog("  Docker not found. Installing...")
-        ok, out = _module_run(deploy_cfg, 'curl -fsSL https://get.docker.com | sh 2>&1', timeout=300, log_fn=plog)
-        if not ok:
-            plog("✗ Failed to install Docker on remote")
-            nodered_deploy_status.update({'running': False, 'error': True})
-            return
-        ok, out = _module_run(deploy_cfg, 'docker --version 2>&1', timeout=15)
-        plog(f"  {(out or '').strip()}")
-    else:
-        plog(f"  {(out or '').strip()}")
-    plog("✓ Docker available on remote")
+    docker_cmd = (
+        "if ! command -v docker >/dev/null 2>&1; then "
+        "curl -fsSL https://get.docker.com | sh; "
+        "fi; "
+        "(sudo systemctl enable docker >/dev/null 2>&1 || systemctl enable docker >/dev/null 2>&1 || true); "
+        "(sudo systemctl start docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true); "
+        "docker --version"
+    )
+    ok, out = _module_run(deploy_cfg, docker_cmd, timeout=300, log_fn=plog)
+    if not ok:
+        plog(f"✗ Docker setup failed on remote: {(out or '')[:220]}")
+        nodered_deploy_status.update({'running': False, 'error': True})
+        return
+    plog(f"✓ {((out or '').splitlines()[-1] if out else 'Docker ready')}")
 
     plog("")
     plog("━━━ Docker log limits (remote) ━━━")

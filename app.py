@@ -29504,7 +29504,7 @@ AUTHENTIK_BOOTSTRAP_EMAIL=admin@takwerx.local
 AUTHENTIK_BOOTSTRAP_LDAPSERVICE_USERNAME=adm_ldapservice
 AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD={ldap_svc_pass}
 AUTHENTIK_BOOTSTRAP_LDAP_BASEDN=DC=takldap
-AUTHENTIK_BOOTSTRAP_LDAP_AUTHENTIK_HOST=http://authentik-server-1:9000/
+AUTHENTIK_BOOTSTRAP_LDAP_AUTHENTIK_HOST={ak_base}
 AUTHENTIK_HOST={ak_base}
 AUTHENTIK_TOKEN={bootstrap_token}
 AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128{cookie_line}
@@ -29921,6 +29921,14 @@ networks:
         '      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"',
         '      - "0.0.0.0:${COMPOSE_PORT_HTTP:-9090}:9000"',
     )
+    if ak_base:
+        compose_content = compose_content.replace(
+            '      AUTHENTIK_HOST: http://authentik-server-1:9000',
+            f'      AUTHENTIK_HOST: {ak_base}'
+        ).replace(
+            '      AUTHENTIK_INSECURE: "true"',
+            '      AUTHENTIK_INSECURE: "false"'
+        )
     with open('/tmp/authentik_remote_compose.yml', 'w') as f:
         f.write(compose_content)
     ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote_compose.yml', '/tmp/docker-compose.yml', log_fn=plog)

@@ -22812,7 +22812,7 @@ volumes:
     _ensure_docker_log_limits_remote(deploy_cfg.get('remote', {}), log_fn=plog)
 
     plog("  Starting Node-RED on remote...")
-    ok, out = _module_run(deploy_cfg, f'cd ~/node-red && {compose_cmd} up -d 2>&1', timeout=120, log_fn=plog)
+    ok, out = _module_run(deploy_cfg, f'cd ~/node-red && {compose_cmd} up -d 2>&1', timeout=600, log_fn=plog)
     if not ok:
         plog(f"✗ {compose_cmd} up failed: {(out or '')[:300]}")
         nodered_deploy_status.update({'running': False, 'error': True})

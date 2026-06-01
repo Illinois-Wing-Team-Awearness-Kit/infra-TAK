@@ -22749,23 +22749,40 @@ volumes:
         nodered_deploy_status.update({'running': False, 'error': True})
         return
 
-    # Ensure Docker on remote — use command -v (reliable across SSH PATH envs) to
-    # skip install when Docker is already present (e.g. start.sh --role authentik).
+    # Ensure Docker on remote.
+    # Check at well-known paths first — command -v can miss docker when the SSH
+    # session has a restricted PATH (e.g. non-login shell on some Ubuntu configs).
+    # Only run the get.docker.com installer when docker is genuinely absent.
     plog("━━━ Checking Docker (remote) ━━━")
-    docker_cmd = (
-        "if ! command -v docker >/dev/null 2>&1; then "
-        "curl -fsSL https://get.docker.com | sh; "
-        "fi; "
-        "(sudo systemctl enable docker >/dev/null 2>&1 || systemctl enable docker >/dev/null 2>&1 || true); "
-        "(sudo systemctl start docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true); "
-        "docker --version"
+    docker_present_cmd = (
+        "command -v docker >/dev/null 2>&1 "
+        "|| test -x /usr/bin/docker "
+        "|| test -x /usr/local/bin/docker "
+        "&& echo present || echo absent"
     )
-    ok, out = _module_run(deploy_cfg, docker_cmd, timeout=300, log_fn=plog)
+    _dp_ok, _dp_out = _module_run(deploy_cfg, docker_present_cmd, timeout=10)
+    docker_already_present = _dp_ok and 'present' in (_dp_out or '')
+    if not docker_already_present:
+        plog("  Docker not found — installing via get.docker.com...")
+        ok, out = _module_run(deploy_cfg, 'curl -fsSL https://get.docker.com | sh 2>&1', timeout=300, log_fn=plog)
+        if not ok:
+            plog("✗ Docker install failed. Full output:")
+            for _line in (out or '').splitlines():
+                plog(f"    {_line}")
+            plog("  Tip: if Docker is already installed, run `start.sh --role authentik` on Server 2 first.")
+            nodered_deploy_status.update({'running': False, 'error': True})
+            return
+    # Enable + start service (idempotent — safe even if already running)
+    _module_run(deploy_cfg,
+        '(sudo systemctl enable docker >/dev/null 2>&1 || systemctl enable docker >/dev/null 2>&1 || true); '
+        '(sudo systemctl start docker >/dev/null 2>&1 || systemctl start docker >/dev/null 2>&1 || true)',
+        timeout=15)
+    ok, out = _module_run(deploy_cfg, 'docker --version 2>&1 || /usr/bin/docker --version 2>&1', timeout=10)
     if not ok:
-        plog(f"✗ Docker setup failed on remote: {(out or '')[:220]}")
+        plog(f"✗ Docker not reachable after setup: {(out or '').strip()}")
         nodered_deploy_status.update({'running': False, 'error': True})
         return
-    plog(f"✓ {((out or '').splitlines()[-1] if out else 'Docker ready')}")
+    plog(f"✓ {(out or '').strip()}")
 
     plog("")
     plog("━━━ Docker log limits (remote) ━━━")

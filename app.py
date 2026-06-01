@@ -22766,12 +22766,19 @@ volumes:
         plog("  Docker not found — installing via get.docker.com...")
         ok, out = _module_run(deploy_cfg, 'curl -fsSL https://get.docker.com | sh 2>&1', timeout=300, log_fn=plog)
         if not ok:
-            plog("✗ Docker install failed. Full output:")
-            for _line in (out or '').splitlines():
-                plog(f"    {_line}")
-            plog("  Tip: if Docker is already installed, run `start.sh --role authentik` on Server 2 first.")
-            nodered_deploy_status.update({'running': False, 'error': True})
-            return
+            plog("  get.docker.com failed — falling back to apt-get install docker.io...")
+            ok, out = _module_run(deploy_cfg,
+                'export DEBIAN_FRONTEND=noninteractive; '
+                'apt-get update -qq 2>&1 && '
+                'apt-get install -y docker.io docker-compose-v2 2>&1',
+                timeout=300, log_fn=plog)
+            if not ok:
+                plog("✗ Docker install failed via both get.docker.com and apt. Full output:")
+                for _line in (out or '').splitlines():
+                    plog(f"    {_line}")
+                nodered_deploy_status.update({'running': False, 'error': True})
+                return
+            plog("✓ Docker installed via apt-get")
     # Enable + start service (idempotent — safe even if already running)
     _module_run(deploy_cfg,
         '(sudo systemctl enable docker >/dev/null 2>&1 || systemctl enable docker >/dev/null 2>&1 || true); '

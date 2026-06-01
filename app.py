@@ -22698,7 +22698,8 @@ def _run_nodered_deploy_remote(settings, deploy_cfg, plog):
     # the mount by editing the remote compose post-deploy (see docs/NODERED-DEPLOY.md).
     # Port binding is 0.0.0.0:1880 for remote so Caddy on the console can reach it via
     # reverse_proxy. UFW source-scopes this to the console IP only (see below).
-    compose_yml = """services:
+    compose_yml = """version: '3'
+services:
   node-red:
     image: nodered/node-red:4.0
     container_name: nodered

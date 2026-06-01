@@ -22791,14 +22791,29 @@ volumes:
         return
     plog(f"✓ {(out or '').strip()}")
 
+    # Ensure Docker Compose is available — docker.io (Ubuntu apt) ships without the
+    # Compose v2 plugin. Detect which variant is present and install if missing.
+    plog("━━━ Checking Docker Compose (remote) ━━━")
+    ok, out = _module_run(deploy_cfg, 'docker compose version 2>&1 || docker-compose version 2>&1', timeout=10)
+    if not ok or 'version' not in (out or '').lower():
+        plog("  Docker Compose not found — installing docker-compose via apt...")
+        _module_run(deploy_cfg,
+            'export DEBIAN_FRONTEND=noninteractive; apt-get install -y docker-compose 2>&1',
+            timeout=120, log_fn=plog)
+    # Detect which compose command to use (v2 plugin preferred, v1 standalone fallback)
+    _cv2_ok, _ = _module_run(deploy_cfg, 'docker compose version >/dev/null 2>&1', timeout=5)
+    compose_cmd = 'docker compose' if _cv2_ok else 'docker-compose'
+    ok, out = _module_run(deploy_cfg, f'{compose_cmd} version 2>&1', timeout=5)
+    plog(f"✓ {(out or '').strip()}")
+
     plog("")
     plog("━━━ Docker log limits (remote) ━━━")
     _ensure_docker_log_limits_remote(deploy_cfg.get('remote', {}), log_fn=plog)
 
     plog("  Starting Node-RED on remote...")
-    ok, out = _module_run(deploy_cfg, 'cd ~/node-red && docker compose up -d 2>&1', timeout=120, log_fn=plog)
+    ok, out = _module_run(deploy_cfg, f'cd ~/node-red && {compose_cmd} up -d 2>&1', timeout=120, log_fn=plog)
     if not ok:
-        plog(f"✗ docker compose up failed: {(out or '')[:300]}")
+        plog(f"✗ {compose_cmd} up failed: {(out or '')[:300]}")
         nodered_deploy_status.update({'running': False, 'error': True})
         return
     plog("✓ Node-RED container started on remote")

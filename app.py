@@ -43485,11 +43485,12 @@ def _run_ak_mig_prepare_bg(settings_snap):
             plog('  ✗ Cannot read source docker-compose.yml')
             _ak_mig_status.update({'running': False, 'error': 'Cannot read source docker-compose.yml'})
             return
-        # docker-compose v1 does not support ${VAR:?error} required-variable syntax.
-        # Strip :?message so v1 can interpolate normally — .env is already copied so
-        # all variables are defined.
+        # docker-compose v1 (Python-based) only supports $VAR and ${VAR}.
+        # Strip bash extended forms (:?, :-, :+) that v2 supports but v1 rejects.
+        # The .env is already copied so all variables are defined — dropping the
+        # default/error suffix is safe.
         import re as _re
-        dc_content = _re.sub(r'\$\{(\w+):\?[^}]*\}', r'${\1}', dc_content)
+        dc_content = _re.sub(r'\$\{(\w+):[?+\-][^}]*\}', r'${\1}', dc_content)
         ok_dw, _ = _ak_mig_write_file_remote(dst_cfg, '~/authentik/docker-compose.yml', dc_content)
         if not ok_dw:
             plog('  ✗ Failed to write docker-compose.yml to destination')

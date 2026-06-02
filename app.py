@@ -43329,9 +43329,13 @@ def _ak_mig_write_file_remote(host_cfg, remote_path, content, timeout=20):
     """Write arbitrary text content to a file on a remote host via SSH heredoc."""
     import base64 as _b64
     encoded = _b64.b64encode(content.encode('utf-8', errors='replace')).decode()
+    # Replace ~ with $HOME so the remote shell expands it correctly.
+    # shlex.quote wraps ~ in single quotes which prevents tilde expansion,
+    # causing files to land in a literal ~/path directory instead of $HOME/path.
+    safe_path = remote_path.replace('~/', '$HOME/').replace('~', '$HOME')
     cmd = (
-        f'mkdir -p "$(dirname {shlex.quote(remote_path)})" && '
-        f'echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(remote_path)}'
+        f'mkdir -p "$(dirname {safe_path})" && '
+        f'echo {shlex.quote(encoded)} | base64 -d > {safe_path}'
     )
     return _ssh_probe(host_cfg, cmd, timeout=timeout)
 
@@ -43391,12 +43395,17 @@ def _run_ak_mig_test(src_cfg, dst_cfg, settings):
         issues.append(f'Docker not available on destination: {(out or "")[:100]}')
         issues.append('  → Install Docker: curl -fsSL https://get.docker.com | sh')
 
-    # Dest: docker compose available?
-    ok, out = _ssh_probe(dst_cfg, 'docker compose version 2>&1 || docker-compose --version 2>&1', timeout=10)
-    if ok and ('compose' in (out or '').lower()):
-        info['dst_compose'] = (out or '').strip()[:60]
+    # Dest: docker compose available? Try v2 plugin first, then v1 binary.
+    ok_v2, out_v2 = _ssh_probe(dst_cfg, 'docker compose version 2>&1', timeout=10)
+    if ok_v2 and 'version' in (out_v2 or '').lower():
+        info['dst_compose'] = (out_v2 or '').strip()[:60]
     else:
-        issues.append('docker compose not available on destination')
+        ok_v1, out_v1 = _ssh_probe(dst_cfg, 'docker-compose --version 2>&1', timeout=10)
+        if ok_v1 and 'docker-compose' in (out_v1 or '').lower():
+            info['dst_compose'] = (out_v1 or '').strip()[:60]
+        else:
+            issues.append('docker compose not available on destination')
+            issues.append('  → Ubuntu 20.04: sudo apt-get install -y docker-compose')
 
     # Dest: Postgres already running (warn if so — may conflict)
     ok, out = _ssh_probe(dst_cfg, 'docker ps --filter name=authentik-postgresql --format "{{.Names}}" 2>/dev/null', timeout=10)

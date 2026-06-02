@@ -44170,6 +44170,90 @@ def ak_migration_log_api():
     })
 
 
+_AK_MIG_KEY_PATH = os.path.expanduser('~/.ssh/infra-tak-ak-migration')
+
+
+@app.route('/api/authentik/migration/ensure-ssh-key', methods=['POST'])
+@login_required
+def ak_migration_ensure_ssh_key():
+    kp = _AK_MIG_KEY_PATH
+    pub = kp + '.pub'
+    if not os.path.exists(kp):
+        kdir = os.path.dirname(kp)
+        if kdir and not os.path.isdir(kdir):
+            os.makedirs(kdir, mode=0o700, exist_ok=True)
+        r = subprocess.run(
+            ['ssh-keygen', '-t', 'ed25519', '-N', '', '-f', kp, '-C', 'infra-tak-ak-migration'],
+            capture_output=True, text=True, timeout=30)
+        if r.returncode != 0:
+            return jsonify({'success': False, 'error': (r.stderr or '')[:300]}), 500
+    fp = ''
+    try:
+        r = subprocess.run(['ssh-keygen', '-l', '-f', pub], capture_output=True, text=True, timeout=5)
+        fp = r.stdout.strip() if r.returncode == 0 else ''
+    except Exception:
+        pass
+    pk = ''
+    try:
+        with open(pub) as f:
+            pk = f.read().strip()
+    except Exception:
+        pass
+    settings = load_settings()
+    dst = settings.setdefault('authentik_migration', {}).setdefault('destination', {})
+    dst['ssh_key_path'] = kp
+    dst['auth_method'] = 'ssh_key'
+    save_settings(settings)
+    return jsonify({'success': True, 'key_path': kp, 'public_key': pk, 'fingerprint': fp})
+
+
+@app.route('/api/authentik/migration/install-ssh-key', methods=['POST'])
+@login_required
+def ak_migration_install_ssh_key():
+    data = request.get_json() or {}
+    pwd = (data.get('password') or '').strip()
+    if not pwd:
+        return jsonify({'success': False, 'error': 'Password is required'}), 400
+    settings = load_settings()
+    dst = (settings.get('authentik_migration') or {}).get('destination') or {}
+    host = (dst.get('host') or '').strip()
+    user = (dst.get('ssh_user') or 'root').strip()
+    port = int(dst.get('ssh_port') or 22)
+    if not host:
+        return jsonify({'success': False, 'error': 'Save destination config first'}), 400
+    pub = _AK_MIG_KEY_PATH + '.pub'
+    if not os.path.exists(pub):
+        return jsonify({'success': False, 'error': 'Generate an SSH key first'}), 400
+    if shutil.which('sshpass') is None:
+        return jsonify({'success': False, 'error': 'sshpass not installed on console server'}), 500
+    cmd = ['sshpass', '-e', 'ssh-copy-id', '-i', pub,
+           '-o', 'StrictHostKeyChecking=accept-new', '-p', str(port), f'{user}@{host}']
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                           env={**os.environ, 'SSHPASS': pwd})
+        if r.returncode != 0:
+            return jsonify({'success': False, 'error': (r.stderr or r.stdout or 'ssh-copy-id failed')[:400]}), 400
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]}), 400
+    settings = load_settings()
+    dst = settings.setdefault('authentik_migration', {}).setdefault('destination', {})
+    dst['ssh_key_path'] = _AK_MIG_KEY_PATH
+    dst['auth_method'] = 'ssh_key'
+    save_settings(settings)
+    return jsonify({'success': True, 'message': f'SSH key installed on {host}'})
+
+
+@app.route('/api/authentik/migration/test-ssh', methods=['POST'])
+@login_required
+def ak_migration_test_ssh():
+    settings = load_settings()
+    dst_cfg = _ak_mig_dst_cfg(settings)
+    if not dst_cfg.get('host'):
+        return jsonify({'success': False, 'error': 'Destination host not configured — save config first'}), 400
+    ok, out = _ssh_probe(dst_cfg, 'echo AK_MIG_OK && uname -a', timeout=15)
+    return jsonify({'success': ok and 'AK_MIG_OK' in (out or ''), 'output': (out or '')[:300]})
+
+
 @app.route('/api/authentik/migration/reset', methods=['POST'])
 @login_required
 def ak_migration_reset_api():
@@ -44309,6 +44393,38 @@ input:focus,select:focus{border-color:var(--accent)}
   </div>
 </div>
 
+<!-- SSH Key Setup -->
+<div class="card" id="section-ssh">
+  <div class="card-title">SSH Key Setup — Destination Server</div>
+  <p style="font-size:12px;color:var(--text-secondary);margin-bottom:14px;line-height:1.6">
+    Generate an SSH key on this console server and install it on the destination so the migration wizard can connect without a password.
+    Save the destination config above first.
+  </p>
+  <div class="btn-row" style="margin-top:0">
+    <button class="btn btn-ghost" onclick="ensureSshKey()">⚿ Generate SSH Key</button>
+    <button class="btn btn-ghost" onclick="testSsh()">⚡ Test SSH Connection</button>
+  </div>
+  <div id="ssh-key-box" style="display:none;margin-top:14px">
+    <label>Public Key — paste this into <code>~/.ssh/authorized_keys</code> on the destination, or use Install below</label>
+    <textarea id="ssh-pubkey" rows="3" readonly style="width:100%;margin-top:6px;padding:8px 10px;background:#060a12;border:1px solid var(--border);border-radius:7px;color:#a3b3c9;font-family:var(--mono);font-size:11px;resize:vertical"></textarea>
+    <div style="font-size:11px;color:var(--text-dim);margin-top:4px" id="ssh-fingerprint"></div>
+  </div>
+  <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+    <div style="font-size:12px;font-weight:600;color:var(--text-secondary);margin-bottom:10px">Install via Password (one-time)</div>
+    <div class="row">
+      <div>
+        <label>Destination SSH Password</label>
+        <input type="password" id="ssh-install-pass" placeholder="One-time password — not stored">
+      </div>
+    </div>
+    <div class="btn-row">
+      <button class="btn btn-primary" onclick="installSshKey()">Install Key on Destination →</button>
+      <span id="ssh-install-msg" style="font-size:12px"></span>
+    </div>
+  </div>
+  <div id="ssh-test-result" style="margin-top:12px;display:none"></div>
+</div>
+
 <!-- Step 2: Connectivity results -->
 <div class="card" id="section-test" style="display:none">
   <div class="card-title">Step 2 — Connectivity Test</div>
@@ -44390,6 +44506,55 @@ function toggleAuthFields(){
   var m = document.getElementById('dst-auth').value;
   document.getElementById('dst-key-field').style.display = m === 'ssh_key' ? '' : 'none';
   document.getElementById('dst-pass-field').style.display = m === 'password' ? '' : 'none';
+}
+
+function ensureSshKey(){
+  fetch('/api/authentik/migration/ensure-ssh-key',{method:'POST',credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(d.success){
+      document.getElementById('ssh-key-box').style.display='';
+      document.getElementById('ssh-pubkey').value = d.public_key||'';
+      document.getElementById('ssh-fingerprint').textContent = d.fingerprint ? 'Fingerprint: '+d.fingerprint : '';
+    } else {
+      alert('Key generation failed: '+(d.error||'unknown error'));
+    }
+  }).catch(function(e){alert('Error: '+e);});
+}
+
+function installSshKey(){
+  var pwd = document.getElementById('ssh-install-pass').value;
+  if(!pwd){alert('Enter the destination SSH password');return;}
+  var msg = document.getElementById('ssh-install-msg');
+  msg.textContent = 'Installing...'; msg.style.color='var(--text-dim)';
+  fetch('/api/authentik/migration/install-ssh-key',{method:'POST',credentials:'same-origin',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pwd})})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(d.success){
+      msg.textContent = '✓ '+d.message; msg.style.color='var(--green)';
+      document.getElementById('ssh-install-pass').value='';
+      document.getElementById('dst-auth').value='ssh_key';
+      document.getElementById('dst-key-path').value='~/.ssh/infra-tak-ak-migration';
+      toggleAuthFields();
+    } else {
+      msg.textContent = '✗ '+(d.error||'Failed'); msg.style.color='var(--red)';
+    }
+  }).catch(function(e){msg.textContent='Error: '+e;msg.style.color='var(--red)';});
+}
+
+function testSsh(){
+  var res = document.getElementById('ssh-test-result');
+  res.style.display=''; res.innerHTML='<span style="color:var(--text-dim)">Testing SSH...</span>';
+  fetch('/api/authentik/migration/test-ssh',{method:'POST',credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(d.success){
+      res.innerHTML='<div class="alert alert-ok" style="margin:0">✓ SSH OK — '+escHtml(d.output)+'</div>';
+    } else {
+      res.innerHTML='<div class="alert alert-err" style="margin:0">✗ SSH failed — '+escHtml(d.error||d.output||'')+'</div>';
+    }
+  }).catch(function(e){res.innerHTML='<div class="alert alert-err" style="margin:0">Error: '+escHtml(String(e))+'</div>';});
 }
 
 function saveConfig(){

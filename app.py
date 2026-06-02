@@ -43770,6 +43770,24 @@ def _run_ak_mig_replicate_bg(settings_snap):
             "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
             "WHERE NOT active AND slot_name LIKE 'pg_%_sync_%'",
             db='postgres', settings=settings_snap)
+        # Ensure destination has enough replication slots for origin tracking
+        _ak_mig_psql(dst_cfg, 'ALTER SYSTEM SET max_replication_slots = 20',
+            db='postgres', settings=settings_snap)
+        # Truncate all non-system tables on destination so COPY has no duplicate-key conflicts
+        plog('  Clearing destination tables for clean initial copy...')
+        _ak_mig_psql(dst_cfg,
+            "SELECT 'TRUNCATE TABLE ' || quote_ident(schemaname) || '.' || quote_ident(tablename) || ' CASCADE;' "
+            "FROM pg_tables WHERE schemaname NOT IN ('pg_catalog','information_schema') "
+            "ORDER BY tablename",
+            settings=settings_snap)
+        # Execute the truncates in one shot via a DO block
+        _ak_mig_psql(dst_cfg,
+            "DO $$ DECLARE r RECORD; BEGIN "
+            "FOR r IN SELECT tablename FROM pg_tables "
+            "WHERE schemaname NOT IN ('pg_catalog','information_schema') LOOP "
+            "EXECUTE 'TRUNCATE TABLE ' || quote_ident(r.tablename) || ' CASCADE'; "
+            "END LOOP; END $$",
+            settings=settings_snap)
         plog('  ✓ Cleaned')
 
         # ── 2. Schema-only dump → restore on destination ────────────────────

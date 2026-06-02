@@ -43608,7 +43608,7 @@ def _run_ak_mig_prepare_bg(settings_snap):
             alter_ok = True
             for _sql in (
                 'ALTER SYSTEM SET wal_level = logical',
-                'ALTER SYSTEM SET max_replication_slots = 5',
+                'ALTER SYSTEM SET max_replication_slots = 20',
                 'ALTER SYSTEM SET max_wal_senders = 5',
                 'ALTER SYSTEM SET wal_log_hints = on',
             ):
@@ -43763,8 +43763,13 @@ def _run_ak_mig_replicate_bg(settings_snap):
 
         # ── 1. Drop any stale publication / subscription ─────────────────────
         plog('Cleaning up any stale replication objects...')
-        _ak_mig_psql(src_cfg, f'DROP PUBLICATION IF EXISTS {_AK_MIG_PUB}', settings=settings_snap)
         _ak_mig_psql(dst_cfg, f'DROP SUBSCRIPTION IF EXISTS {_AK_MIG_SUB}', settings=settings_snap)
+        _ak_mig_psql(src_cfg, f'DROP PUBLICATION IF EXISTS {_AK_MIG_PUB}', settings=settings_snap)
+        # Drop stale temp sync slots left over from crashed workers (inactive only)
+        _ak_mig_psql(src_cfg,
+            "SELECT pg_drop_replication_slot(slot_name) FROM pg_replication_slots "
+            "WHERE NOT active AND slot_name LIKE 'pg_%_sync_%'",
+            db='postgres', settings=settings_snap)
         plog('  ✓ Cleaned')
 
         # ── 2. Schema-only dump → restore on destination ────────────────────

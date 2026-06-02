@@ -43471,32 +43471,49 @@ def _run_ak_mig_prepare_bg(settings_snap):
             return
         plog('  ✓ .env written to destination')
 
-        # ── 2. Copy docker-compose.yml ──────────────────────────────────────
-        plog('Copying docker-compose.yml to destination...')
-        # Always read compose from source and rewrite to destination — ensures
-        # v1 interpolation stripping is applied even on retries where the file
-        # was already written by a previous attempt.
-        if src_cfg.get('use_localhost'):
-            dc_path = os.path.expanduser('~/authentik/docker-compose.yml')
-            dc_content = open(dc_path).read() if os.path.exists(dc_path) else ''
-        else:
-            _, dc_content = _ssh_probe(src_cfg, 'cat ~/authentik/docker-compose.yml', timeout=15)
-        if not dc_content:
-            plog('  ✗ Cannot read source docker-compose.yml')
-            _ak_mig_status.update({'running': False, 'error': 'Cannot read source docker-compose.yml'})
-            return
-        # docker-compose v1 (Python-based) only supports $VAR and ${VAR}.
-        # Strip bash extended forms (:?, :-, :+) that v2 supports but v1 rejects.
-        # The .env is already copied so all variables are defined — dropping the
-        # default/error suffix is safe.
-        import re as _re
-        dc_content = _re.sub(r'\$\{(\w+):[?+\-][^}]*\}', r'${\1}', dc_content)
-        ok_dw, _ = _ak_mig_write_file_remote(dst_cfg, '~/authentik/docker-compose.yml', dc_content)
+        # ── 2. Write minimal postgres-only compose to destination ──────────────
+        # The full Authentik compose has too many v2-only features (external
+        # networks, image variable syntax, healthcheck options) that docker-compose
+        # v1 rejects. For the migration we only need PostgreSQL running — generate
+        # a minimal standalone compose with values substituted directly.
+        plog('Writing minimal postgres compose to destination...')
+        pg_image = 'docker.io/library/postgres:16-alpine'
+        try:
+            import yaml as _yaml
+            if src_cfg.get('use_localhost'):
+                _src_dc_txt = open(os.path.expanduser('~/authentik/docker-compose.yml')).read()
+            else:
+                _, _src_dc_txt = _ssh_probe(src_cfg, 'cat ~/authentik/docker-compose.yml', timeout=15)
+            _src_dc = _yaml.safe_load(_src_dc_txt or '')
+            _img = ((_src_dc or {}).get('services', {}).get('postgresql', {}).get('image', '') or '').strip()
+            if _img and '$' not in _img:
+                pg_image = _img
+        except Exception:
+            pass
+        _esc = lambda v: v.replace('\\', '\\\\').replace('"', '\\"')
+        dc_content = '\n'.join([
+            "version: '3'",
+            "services:",
+            "  postgresql:",
+            f"    image: {pg_image}",
+            "    restart: unless-stopped",
+            "    volumes:",
+            "      - database:/var/lib/postgresql/data",
+            "    environment:",
+            f'      POSTGRES_PASSWORD: "{_esc(pg_pass)}"',
+            f'      POSTGRES_USER: "{_esc(pg_user)}"',
+            '      POSTGRES_DB: "authentik"',
+            "volumes:",
+            "  database:",
+            "    driver: local",
+            "",
+        ])
+        ok_dw, dw_out = _ak_mig_write_file_remote(dst_cfg, '~/authentik/docker-compose.yml', dc_content)
         if not ok_dw:
-            plog('  ✗ Failed to write docker-compose.yml to destination')
+            plog(f'  ✗ Failed to write docker-compose.yml: {(dw_out or "")[:200]}')
             _ak_mig_status.update({'running': False, 'error': 'Failed to write docker-compose.yml'})
             return
-        plog('  ✓ docker-compose.yml copied')
+        plog(f'  ✓ docker-compose.yml written (postgres only, {pg_image})')
 
         # ── 3. Start dest Postgres ──────────────────────────────────────────
         plog('Starting PostgreSQL on destination...')

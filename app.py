@@ -43299,14 +43299,33 @@ def _ak_mig_pg_user(settings=None):
     )
 
 
+def _ak_mig_pg_container(host_cfg, timeout=8):
+    """Return the running postgres container name for the authentik project.
+    Handles both docker-compose v2 (authentik-postgresql-1) and v1 (authentik_postgresql_1)."""
+    ok, out = _ssh_probe(host_cfg,
+        'docker ps --filter "label=com.docker.compose.service=postgresql" '
+        '--filter "label=com.docker.compose.project=authentik" '
+        '--format "{{.Names}}" 2>/dev/null | head -1', timeout=timeout)
+    name = (out or '').strip()
+    if ok and name:
+        return name
+    # Fallback: try both naming conventions explicitly
+    for candidate in ('authentik-postgresql-1', 'authentik_postgresql_1'):
+        ok2, _ = _ssh_probe(host_cfg, f'docker inspect {candidate} >/dev/null 2>&1', timeout=5)
+        if ok2:
+            return candidate
+    return 'authentik-postgresql-1'
+
+
 def _ak_mig_psql(host_cfg, sql, db='authentik', settings=None, timeout=30):
-    """Run SQL inside authentik-postgresql-1 on the given host via docker exec."""
+    """Run SQL inside the authentik postgres container on the given host via docker exec."""
     if settings is None:
         settings = load_settings()
     u = _ak_mig_pg_user(settings)
     p = _ak_mig_pg_pass(settings)
+    container = _ak_mig_pg_container(host_cfg)
     cmd = (
-        f'PGPASSWORD={shlex.quote(p)} docker exec authentik-postgresql-1 '
+        f'PGPASSWORD={shlex.quote(p)} docker exec {container} '
         f'psql -U {shlex.quote(u)} {shlex.quote(db)} -t -c {shlex.quote(sql)} 2>&1'
     )
     return _ssh_probe(host_cfg, cmd, timeout=timeout)

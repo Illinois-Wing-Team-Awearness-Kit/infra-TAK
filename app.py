@@ -43272,7 +43272,7 @@ def _ak_mig_dst_cfg(settings=None):
     return {
         'host':         (dst.get('host') or '').strip(),
         'ssh_user':     (dst.get('ssh_user') or 'root').strip(),
-        'ssh_port':     int(dst.get('ssh_port') or 22),
+        'ssh_port':     int(dst.get('ssh_port') or 22) if str(dst.get('ssh_port', '')).strip().isdigit() else 22,
         'auth_method':  (dst.get('auth_method') or 'ssh_key'),
         'ssh_key_path': (dst.get('ssh_key_path') or '~/.ssh/id_rsa'),
         'ssh_password': (dst.get('ssh_password') or ''),
@@ -44244,12 +44244,15 @@ def ak_migration_install_ssh_key():
 @app.route('/api/authentik/migration/test-ssh', methods=['POST'])
 @login_required
 def ak_migration_test_ssh():
-    settings = load_settings()
-    dst_cfg = _ak_mig_dst_cfg(settings)
-    if not dst_cfg.get('host'):
-        return jsonify({'success': False, 'error': 'Destination host not configured — save config first'}), 400
-    ok, out = _ssh_probe(dst_cfg, 'echo AK_MIG_OK && uname -a', timeout=15)
-    return jsonify({'success': ok and 'AK_MIG_OK' in (out or ''), 'output': (out or '')[:300]})
+    try:
+        settings = load_settings()
+        dst_cfg = _ak_mig_dst_cfg(settings)
+        if not dst_cfg.get('host'):
+            return jsonify({'success': False, 'error': 'Destination host not configured — save config first'}), 400
+        ok, out = _ssh_probe(dst_cfg, 'echo AK_MIG_OK && uname -a', timeout=15)
+        return jsonify({'success': ok and 'AK_MIG_OK' in (out or ''), 'output': (out or '')[:300]})
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)[:300]})
 
 
 @app.route('/api/authentik/migration/reset', methods=['POST'])

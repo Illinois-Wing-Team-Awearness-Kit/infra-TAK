@@ -5,10 +5,16 @@
 ---
 
 ## Active branch
-`dev` — VPS pulls from this branch via `git pull && bash nodered/deploy.sh --no-pull`
+`ZeroTierServersSetup` — Server 1 VPS pulls from this branch
 
-## VPS
-- Host: `172.93.50.47` (tak-10)
+## VPS (Server 1)
+- Host: `190.102.110.79` (`ssh.prod.ilwg.us`)
+- Repo path: `/root/infra-TAK`
+- Console: `https://190.102.110.79:5001`
+- Service: `takwerx-console` (gunicorn, port 5001)
+
+## VPS (tak-10 / Node-RED server — separate)
+- Host: `172.93.50.47`
 - Repo path: `/home/takwerx/infra-TAK`
 - Container: `nodered`
 - Configurator: `http://172.93.50.47:1880/configurator`
@@ -16,74 +22,59 @@
 
 ---
 
-## What was just shipped (latest 3 commits)
+## What was just shipped (latest commits on ZeroTierServersSetup)
 
 | Commit | What |
 |--------|------|
-| `22ef1f3` | **fix(authentik):** escape `\\n` in `akUpdate` confirm dialog — literal newline in JS string caused `SyntaxError: Invalid or unexpected token` |
-| `6003575` | **feat(authentik):** add `akUpdate()` spinner + status line on Update button; fix release notes API path (`/core/` → `/outposts/`) |
-| `260d3b6` | **docs:** update v0.9.16 release notes and memory-bank for Caddy update button |
+| `3feb217` | **revert:** remove remote TAK Portal deployment — restore local Server 1 install (ZeroTier Authentik URL fix kept) |
+| `350030d` | **feat:** add ZeroTier install to Server 1 setup flow in start.sh |
+| `5426cfd` | **fix(authentik):** LDAP authorization_flow recursion bug — use ldap-authorization-flow not ldap-authentication-flow |
+| `25dfd8c` | **fix:** enable VBM when installing LE cert on port 8446 |
+| `89e7431` | **fix:** hardcoded localhost Authentik URL in TAK Portal, MediaMTX, and console app deploy |
+| `1f2bb8e` | **feat:** ZeroTier start.sh changes (Server 2/3 support) |
 
 ---
 
-## What we are testing next
+## Architecture — 3-Server Setup
 
-1. **v0.9.16 release** — merged to `main`, tagged `v0.9.16-alpha` ✓ DONE
-2. **LDAP password propagation** — confirmed working on tak-10; new password takes effect immediately, old password rejected within 2 min
+| Server | Role | Host |
+|--------|------|------|
+| Server 1 | TAK Server + TAK Portal + Console | `190.102.110.79` |
+| Server 2 | Authentik (SSO/LDAP) | ZeroTier |
+| Server 3 | CloudTAK | ZeroTier |
 
----
+ZeroTier network ties all three together. Interface: `ztfp6iovwi`
 
-## Architecture summary
-
-### Data sources and their TAK delivery method
-
-| Source | Streaming TCP CoT | DataSync (Mission API) | Notes |
-|--------|:-----------------:|:----------------------:|-------|
-| ArcGIS Feature Service | ✅ (toggle) | ✅ (toggle) | dataSyncEnabled checkbox switches mode |
-| Tablet Command AVL | ✅ | ❌ | strict streaming only |
-| PulsePoint | ✅ | ❌ | strict streaming only |
-| FAA TFR | ✅ | ✅ | both simultaneously |
-| KML Network Link | ✅ | ✅ | both simultaneously |
-
-### Per-source CoT TCP port
-Every source config now saves `cotStreamPort`. build-flows.js resolves port as:
-```
-Number(cfg.cotStreamPort) || Number(tak.streamingPort) || 8089
-```
-Leave blank → falls back to global streaming port in TAK Settings.
-
-### Config persistence
-Configs live in **Node-RED global context**, not in `flows.json`. deploy.sh backs up context via REST API before stopping NR, validates it, then restores after. Persistent host snapshot: `/opt/tak/nodered-ctx-backup.json`.
+### Key ZeroTier fix (commit 89e7431)
+`run_takportal_deploy` uses `_get_authentik_api_url(settings)` instead of
+hardcoded `localhost` — forward-auth setup works when Authentik is on a
+remote ZeroTier IP.
 
 ---
 
-## Key files
-
-| File | Purpose |
-|------|---------|
-| `nodered/configurator.html` | All UI — source panels, TAK settings, saved config cards |
-| `nodered/build-flows.js` | Generates `flows.json` from configurator + engine templates |
-| `nodered/flows.json` | Generated — never edit directly, never `docker cp` directly |
-| `nodered/deploy.sh` | Safe deploy: backup context → merge flows → stop → install → restore → start |
-| `nodered/static/` | Static assets copied to `/data/public/` in container (logos, icons) |
-| `.cursorrules` | Persistent AI rules — read before making changes |
+## What was just completed
+- ✅ Server 1 fresh deploy working (Caddy → full stack via `start.sh`)
+- ✅ ZeroTier install added to Server 1 `start.sh` flow
+- ✅ TAK Portal remote-deploy code reverted — back to local Server 1 install
+- ✅ ZeroTier Authentik URL fix preserved
 
 ---
 
-## Known issues / watch list
-- `Skipped configurator.html template injection (EACCES)` — appears in deploy log when build-flows.js runs inside the container; harmless (template injection already ran on the host side)
-- TLS node shows `tls=undefined` in deploy log for dynamic engine tabs (existing tabs from before the TLS fix) — will resolve once those tabs are rebuilt via Configurator
+## Next steps / watch list
+- TAK Server `.deb` was uploaded as `takserver_5.7-RELEASE32_all.deb` — install via console if not already done
+- Verify TAK Portal deploys successfully end-to-end on Server 1
+- Verify Authentik (Server 2) forward-auth works with TAK Portal on Server 1 over ZeroTier
 
 ---
 
-## Deploy cheat sheet (VPS)
+## Deploy cheat sheet (Server 1)
 ```bash
-# Standard deploy (pull + deploy)
-cd infra-TAK && git pull && bash nodered/deploy.sh --no-pull
+# Standard pull + restart
+cd /root/infra-TAK && git pull && systemctl restart takwerx-console
 
-# If flows.json conflict blocks git pull
-git checkout -- nodered/flows.json && git pull && bash nodered/deploy.sh --no-pull
+# Re-run setup (if needed)
+cd /root/infra-TAK && sudo ./start.sh
 
-# Force fresh install (NO configs will be restored — destructive)
-bash nodered/deploy.sh --force-empty-context
+# Check console logs
+journalctl -u takwerx-console -f
 ```

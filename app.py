@@ -29516,7 +29516,7 @@ AUTHENTIK_BOOTSTRAP_EMAIL=admin@takwerx.local
 AUTHENTIK_BOOTSTRAP_LDAPSERVICE_USERNAME=adm_ldapservice
 AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD={ldap_svc_pass}
 AUTHENTIK_BOOTSTRAP_LDAP_BASEDN=DC=takldap
-AUTHENTIK_BOOTSTRAP_LDAP_AUTHENTIK_HOST=http://authentik-server-1:9000/
+AUTHENTIK_BOOTSTRAP_LDAP_AUTHENTIK_HOST={ak_base}
 AUTHENTIK_HOST={ak_base}
 AUTHENTIK_TOKEN={bootstrap_token}
 AUTHENTIK_LISTEN__TRUSTED_PROXY_CIDRS=172.16.0.0/12,127.0.0.1/32,::1/128{cookie_line}
@@ -29943,6 +29943,14 @@ networks:
         '      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"',
         '      - "0.0.0.0:${COMPOSE_PORT_HTTP:-9090}:9000"',
     )
+    if ak_base:
+        compose_content = compose_content.replace(
+            '      AUTHENTIK_HOST: http://authentik-server-1:9000',
+            f'      AUTHENTIK_HOST: {ak_base}'
+        ).replace(
+            '      AUTHENTIK_INSECURE: "true"',
+            '      AUTHENTIK_INSECURE: "false"'
+        )
     with open('/tmp/authentik_remote_compose.yml', 'w') as f:
         f.write(compose_content)
     ok, _ = _module_copy(deploy_cfg, '/tmp/authentik_remote_compose.yml', '/tmp/docker-compose.yml', log_fn=plog)
@@ -34535,8 +34543,10 @@ def _heal_authentik_proxy_chain_all_services(plog=None, settings=None):
             settings = load_settings()
 
         ak_env_path = os.path.expanduser('~/authentik/.env')
-        if not os.path.exists(ak_env_path):
-            _log("  proxy chain: Authentik not installed locally — skip")
+        _ak_chain_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        _ak_chain_remote = _ak_chain_cfg.get('target_mode') == 'remote' and (_ak_chain_cfg.get('remote', {}).get('host') or '').strip()
+        if not os.path.exists(ak_env_path) and not _ak_chain_remote:
+            _log("  proxy chain: Authentik not installed locally or remotely — skip")
             return summary
 
         fqdn = (settings.get('fqdn') or '').strip()
@@ -37170,12 +37180,13 @@ def _authentik_setup_reputation_policy(plog):
     import urllib.request as _req
     import urllib.error
 
-    ak_env = os.path.expanduser('~/authentik/.env')
-    if not os.path.exists(ak_env):
-        plog("  reputation policy: ~/authentik/.env not found — skipping (Authentik not installed)")
+    settings = load_settings()
+    _ak_rep_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    _ak_rep_remote = _ak_rep_cfg.get('target_mode') == 'remote' and (_ak_rep_cfg.get('remote', {}).get('host') or '').strip()
+    if not os.path.exists(os.path.expanduser('~/authentik/.env')) and not _ak_rep_remote:
+        plog("  reputation policy: Authentik not installed locally or remotely — skipping")
         return False
 
-    settings = load_settings()
     ak_token = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or \
                _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN')
     if not ak_token:
@@ -40654,8 +40665,10 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
     spiral_markers = ('exceeded stage recursion depth', 'nil pointer dereference', 'eof')
 
     # Try to install ldapsearch once at the top — best chance of getting a decisive result.
+    # For remote Authentik, ldapsearch runs on the console host pointing at ldap_host (the
+    # remote IP). UFW on the remote host allows port 389 from the console IP, so this works.
     has_ldapsearch = shutil.which('ldapsearch') is not None
-    if not has_ldapsearch and not is_remote:
+    if not has_ldapsearch:
         try:
             _ensure_ldapsearch()
             has_ldapsearch = shutil.which('ldapsearch') is not None
@@ -40664,7 +40677,7 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
 
     saw_spiral = False
     for _ in range(3):
-        if has_ldapsearch and not is_remote:
+        if has_ldapsearch:
             try:
                 # Search ou=users (not dc= root) so the search itself also succeeds.
                 # Authentik doesn't expose a root object at dc=takldap, so a base-scope
@@ -40971,6 +40984,32 @@ def _ensure_ldap_flow_authentication_none():
                                 pass
                 else:
                     return False, f'LDAP stages not found/created: id={id_stage} pw={pw_stage} login={login_stage}'
+            # Always enforce evaluate_on_plan=False on all stage bindings.
+            # evaluate_on_plan=True + re_evaluate_policies=True (Authentik blueprint default)
+            # causes "exceeded stage recursion depth" on every cache miss (fresh outpost
+            # restart, new bind DN). The result is the flow fails and the LDAP outpost
+            # returns "invalid credentials" even when the password is correct.
+            # Re-fetch ldap_bindings in case the recreate path above replaced them.
+            _refreshed = _get(f'flows/bindings/?target={ldap_flow_pk}&ordering=order&page_size=100').get('results', [])
+            if _refreshed:
+                ldap_bindings = _refreshed
+            for _b in ldap_bindings:
+                if _b.get('evaluate_on_plan') is True:
+                    # PATCH returns 405 on Authentik 2026.x for flow bindings — use DELETE+POST.
+                    try:
+                        _delete(f'flows/bindings/{_b["pk"]}/')
+                        _post('flows/bindings/', {
+                            'target': _b.get('target', ldap_flow_pk),
+                            'stage': _b['stage'],
+                            'order': _b.get('order', 10),
+                            'evaluate_on_plan': False,
+                            're_evaluate_policies': _b.get('re_evaluate_policies', True),
+                            'policy_engine_mode': _b.get('policy_engine_mode', 'any'),
+                            'invalid_response_action': _b.get('invalid_response_action', 'retry'),
+                            'enabled': _b.get('enabled', True),
+                        })
+                    except Exception:
+                        pass
             # Always enforce short session_duration on ldap-authentication-login so password
             # changes propagate within 2 minutes (cached bind mode caches for session lifetime)
             _login_stage_pk = _find_stage('stages/user_login/', 'ldap-authentication-login')
@@ -40982,11 +41021,28 @@ def _ensure_ldap_flow_authentication_none():
             providers = _get('providers/ldap/?search=LDAP').get('results', [])
             ldap_prov = next((p for p in providers if p.get('name') == 'LDAP'), providers[0] if providers else None)
             if ldap_prov:
+                # authorization_flow must be a simple authorization flow, NOT the authentication
+                # flow. Using the same flow for both causes Authentik to re-run the credential
+                # verification on the authorization step (no credentials → identification fails →
+                # bind returns error 49 "invalid credentials"). Known issue: github.com/goauthentik/authentik/issues/9972
+                _authz_candidates = [
+                    'default-provider-authorization-implicit-consent',
+                    'default-provider-authorization-explicit-consent',
+                ]
+                _authz_flow_pk = None
+                for _slug in _authz_candidates:
+                    _r = _get(f'flows/instances/?slug={_slug}').get('results', [])
+                    if _r:
+                        _authz_flow_pk = _r[0]['pk']
+                        break
+                if not _authz_flow_pk:
+                    # Fall back to the authentication flow only if no authorization flow exists.
+                    _authz_flow_pk = ldap_flow_pk
                 try:
                     ldap_authz_flow_pk = ldap_authz_flow['pk'] if ldap_authz_flow else ldap_flow_pk
                     _patch(f'providers/ldap/{ldap_prov["pk"]}/', {
                         'authentication_flow': ldap_flow_pk,
-                        'authorization_flow': ldap_authz_flow_pk,
+                        'authorization_flow': _authz_flow_pk,
                         'bind_mode': 'cached',
                         'search_mode': 'cached'})
                 except urllib.error.HTTPError as e:
@@ -44855,6 +44911,40 @@ def takserver_connect_ldap():
             msg += '. For remote Authentik ensure this host can reach the Authentik server on port 9090 (firewall).'
         return jsonify({'success': False, 'message': msg}), 400
     diag.append('Flow: OK')
+    # Diagnostic: report current evaluate_on_plan state on LDAP flow bindings so we can
+    # confirm the DELETE+POST fix actually applied. A binding with evaluate_on_plan=True
+    # causes "exceeded stage recursion depth" on cold-cache and maps to LDAP error 49.
+    try:
+        import urllib.request as _dq_req
+        _dq_settings = load_settings()
+        _dq_tok = _get_authentik_env_value(_dq_settings, 'AUTHENTIK_BOOTSTRAP_TOKEN') or _get_authentik_env_value(_dq_settings, 'AUTHENTIK_TOKEN')
+        _dq_url = _get_authentik_api_url(_dq_settings)
+        if _dq_tok and _dq_url:
+            _dq_hdrs = {'Authorization': f'Bearer {_dq_tok}', 'Content-Type': 'application/json'}
+            _dq_r = _dq_req.Request(f'{_dq_url}/api/v3/flows/instances/?slug=ldap-authentication-flow', headers=_dq_hdrs)
+            _dq_flow = json.loads(_dq_req.urlopen(_dq_r, timeout=15).read().decode()).get('results', [{}])[0]
+            _dq_fpk = _dq_flow.get('pk', '')
+            if _dq_fpk:
+                _dq_br = _dq_req.Request(f'{_dq_url}/api/v3/flows/bindings/?page_size=500', headers=_dq_hdrs)
+                _dq_bindings = [b for b in json.loads(_dq_req.urlopen(_dq_br, timeout=15).read().decode()).get('results', [])
+                                if str(b.get('target')) == str(_dq_fpk)]
+                _eval_states = [f"order={b.get('order')} eval_on_plan={b.get('evaluate_on_plan')}" for b in _dq_bindings]
+                diag.append(f'Flow bindings ({len(_dq_bindings)}): ' + ('; '.join(_eval_states) if _eval_states else 'none found'))
+    except Exception as _dq_err:
+        diag.append(f'Flow binding diag: {str(_dq_err)[:60]} (non-fatal)')
+    # Ensure reputation policy exists on ldap-authentication-flow with negate=True (fail-open).
+    # Without this, Authentik's ReputationPolicy.passes() returns True only for BAD users —
+    # with negate=False every normal-reputation user gets denied (v0.9.2→v0.9.12 bug).
+    # Run every time Connect LDAP is clicked so remote Authentik setups are covered.
+    try:
+        _rep_log = []
+        _authentik_setup_reputation_policy(lambda m: _rep_log.append(m.strip()))
+        if _rep_log:
+            diag.append('Reputation policy: ' + '; '.join(r for r in _rep_log if r and 'skipping' not in r) or 'OK')
+        else:
+            diag.append('Reputation policy: OK')
+    except Exception as _rep_err:
+        diag.append(f'Reputation policy: {str(_rep_err)[:80]} (non-fatal)')
     # Ensure LDAP app has no restrictive policy (blocks QR registration for non-admin users)
     try:
         settings = load_settings()
@@ -44926,9 +45016,14 @@ def takserver_connect_ldap():
         verify['webadmin_exists_in_authentik'] = bool(ws.get('exists'))
         verify['webadmin_superuser'] = bool(ws.get('is_superuser'))
         ldap_pass = _get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD') or ''
-        verify['service_bind_seen'] = bool(_test_ldap_bind(ldap_pass)) if ldap_pass else False
+        # Use raw verdict (ok/fail/inconclusive) so an inconclusive result on remote
+        # Authentik (ldapsearch can't reach remote LDAP port via ZeroTier src IP)
+        # does not count as a confirmed failure.
+        _sa_verdict = _test_ldap_bind_dn_verdict('cn=adm_ldapservice,ou=users,dc=takldap', ldap_pass) if ldap_pass else 'skip'
+        verify['service_bind_seen'] = _sa_verdict == 'ok'
         wap = (settings.get('webadmin_password') or '').strip()
-        verify['webadmin_bind_seen'] = bool(_test_ldap_bind_dn('cn=webadmin,ou=users,dc=takldap', wap)) if wap else False
+        _wa_verdict = _test_ldap_bind_dn_verdict('cn=webadmin,ou=users,dc=takldap', wap) if wap else 'skip'
+        verify['webadmin_bind_seen'] = _wa_verdict != 'fail'  # ok or inconclusive both pass
         verify['ready'] = all([
             verify['coreconfig_has_ldap'],
             verify['webadmin_exists_in_authentik'],
@@ -53759,9 +53854,11 @@ _startup_harden_cloudtak_ports()
 # Idempotent: no-op once both fields are at safe values.
 def _startup_fix_reputation_policy_drift():
     try:
-        if not os.path.isdir(os.path.expanduser('~/authentik')):
-            return False
         settings = load_settings()
+        _ak_sd_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        _ak_sd_remote = _ak_sd_cfg.get('target_mode') == 'remote' and (_ak_sd_cfg.get('remote', {}).get('host') or '').strip()
+        if not os.path.isdir(os.path.expanduser('~/authentik')) and not _ak_sd_remote:
+            return False
         ak_token = (_get_authentik_env_value(settings, 'AUTHENTIK_BOOTSTRAP_TOKEN')
                     or _get_authentik_env_value(settings, 'AUTHENTIK_TOKEN'))
         if not ak_token:
@@ -55003,8 +55100,13 @@ def _startup_migrations():
 
         # v0.9.2: Create Authentik ReputationPolicy and bind to ldap-authentication-flow.
         # Idempotent — only runs the API calls on first startup per box.
+        # Also applies to remote Authentik (function now handles both local and remote).
         try:
-            if os.path.exists(os.path.expanduser('~/authentik/.env')):
+            _ak_rep_s = load_settings()
+            _ak_rep_c = _get_module_deployment_config(_ak_rep_s, 'authentik_deployment')
+            _ak_rep_ok = (os.path.exists(os.path.expanduser('~/authentik/.env')) or
+                          (_ak_rep_c.get('target_mode') == 'remote' and (_ak_rep_c.get('remote', {}).get('host') or '').strip()))
+            if _ak_rep_ok:
                 _authentik_setup_reputation_policy(lambda m: print(f"Startup migration: {m}", flush=True))
         except Exception as _ak_rep_err:
             print(f"Startup migration: authentik reputation policy error (non-fatal): {_ak_rep_err}")
@@ -55477,8 +55579,13 @@ def _post_update_auto_deploy():
                 print(f"Post-update: fail2ban takserver filter error (non-fatal): {_f2b_tak_err}")
 
             # v0.9.2: Set up Authentik ReputationPolicy on ldap-authentication-flow.
+            # Also applies to remote Authentik (function now handles both local and remote).
             try:
-                if os.path.exists(os.path.expanduser('~/authentik/.env')):
+                _ak_pu_s = load_settings()
+                _ak_pu_c = _get_module_deployment_config(_ak_pu_s, 'authentik_deployment')
+                _ak_pu_ok = (os.path.exists(os.path.expanduser('~/authentik/.env')) or
+                             (_ak_pu_c.get('target_mode') == 'remote' and (_ak_pu_c.get('remote', {}).get('host') or '').strip()))
+                if _ak_pu_ok:
                     _authentik_setup_reputation_policy(lambda m: print(f"Post-update: {m}", flush=True))
             except Exception as _ak_rep_err:
                 print(f"Post-update: authentik reputation policy error (non-fatal): {_ak_rep_err}")

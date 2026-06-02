@@ -43565,48 +43565,33 @@ def _run_ak_mig_prepare_bg(settings_snap):
         plog(f'  Current source wal_level: {wl_current or "(unreadable)"}')
 
         if 'logical' not in wl_current:
-            plog('  wal_level is not "logical" — patching source docker-compose.yml...')
+            plog('  wal_level is not "logical" — setting via ALTER SYSTEM + container restart...')
             plog('  ⚠ Source PostgreSQL will restart briefly (Authentik reconnects automatically)')
-            _wal_flags = ' -c wal_level=logical -c max_replication_slots=5 -c max_wal_senders=5 -c wal_log_hints=on'
-            patch_ok = False
-            try:
-                import yaml as _yaml
-                compose_src = (
-                    open(os.path.expanduser('~/authentik/docker-compose.yml')).read()
-                    if src_cfg.get('use_localhost')
-                    else _ssh_probe(src_cfg, 'cat ~/authentik/docker-compose.yml', timeout=15)[1]
-                )
-                dc = _yaml.safe_load(compose_src)
-                pg_svc = dc.get('services', {}).get('postgresql', {})
-                cur_cmd = str(pg_svc.get('command', ''))
-                if 'wal_level=logical' not in cur_cmd:
-                    pg_svc['command'] = cur_cmd.rstrip() + _wal_flags
-                    dc['services']['postgresql'] = pg_svc
-                    new_compose = _yaml.dump(dc, default_flow_style=False)
-                    if src_cfg.get('use_localhost'):
-                        open(os.path.expanduser('~/authentik/docker-compose.yml'), 'w').write(new_compose)
-                        patch_ok = True
-                    else:
-                        ok_pw, _ = _ak_mig_write_file_remote(src_cfg, '~/authentik/docker-compose.yml', new_compose)
-                        patch_ok = ok_pw
-                    plog('  ✓ docker-compose.yml patched with wal_level=logical')
-                else:
-                    plog('  ✓ wal_level=logical flags already in compose (applying may have been deferred by PG)')
-                    patch_ok = True
-            except Exception as _pe:
-                plog(f'  ✗ Compose patch error: {_pe}')
+            alter_ok = True
+            for _sql in (
+                'ALTER SYSTEM SET wal_level = logical',
+                'ALTER SYSTEM SET max_replication_slots = 5',
+                'ALTER SYSTEM SET max_wal_senders = 5',
+                'ALTER SYSTEM SET wal_log_hints = on',
+            ):
+                _ok_a, _out_a = _ak_mig_psql(src_cfg, _sql, db='postgres', settings=settings_snap)
+                if not _ok_a:
+                    plog(f'  ✗ ALTER SYSTEM failed: {(_out_a or "")[:200]}')
+                    alter_ok = False
+                    break
 
-            if not patch_ok:
-                plog('  ✗ Could not patch source docker-compose.yml automatically')
+            if not alter_ok:
+                plog('  ✗ Could not set wal_level via ALTER SYSTEM')
                 plog('  → Manual fix on source server:')
-                plog('    Edit ~/authentik/docker-compose.yml — under services.postgresql.command add:')
-                plog(f'      {_wal_flags.strip()}')
-                plog('    Then run: cd ~/authentik && docker compose up -d postgresql')
-                _ak_mig_status.update({'running': False, 'error': 'Cannot enable wal_level=logical — manual patch required'})
+                plog('    docker exec <pg-container> psql -U authentik postgres -c "ALTER SYSTEM SET wal_level = logical"')
+                plog('    docker restart <pg-container>')
+                _ak_mig_status.update({'running': False, 'error': 'Cannot enable wal_level=logical'})
                 return
 
-            plog('  Restarting source PostgreSQL...')
-            _ak_mig_compose(src_cfg, 'up -d postgresql', timeout=90)
+            plog('  ✓ WAL parameters set — restarting source PostgreSQL container...')
+            _src_container = _ak_mig_pg_container(src_cfg)
+            _ssh_probe(src_cfg, f'docker restart {_src_container}', timeout=90)
+
             for attempt in range(25):
                 time.sleep(4)
                 ok_r, _ = _ak_mig_psql(src_cfg, 'SHOW wal_level', settings=settings_snap)
@@ -43620,7 +43605,7 @@ def _run_ak_mig_prepare_bg(settings_snap):
             _, wl_new = _ak_mig_psql(src_cfg, 'SHOW wal_level', settings=settings_snap)
             plog(f'  Source wal_level now: {(wl_new or "").strip()}')
             if 'logical' not in (wl_new or '').lower():
-                plog('  ✗ wal_level still not logical — check compose patch manually')
+                plog('  ✗ wal_level still not logical after ALTER SYSTEM + restart')
                 _ak_mig_status.update({'running': False, 'error': 'wal_level not logical after restart'})
                 return
         else:
@@ -43628,18 +43613,19 @@ def _run_ak_mig_prepare_bg(settings_snap):
 
         # ── 5. Allow dest IP in source pg_hba.conf ──────────────────────────
         plog(f'Ensuring source pg_hba.conf allows destination ({dst_host})...')
+        _src_pg_ctr = _ak_mig_pg_container(src_cfg)
         ok_hba, hba_out = _ssh_probe(src_cfg,
-            f'docker exec authentik-postgresql-1 grep -c {shlex.quote(dst_host)} /var/lib/postgresql/data/pg_hba.conf 2>/dev/null || echo 0',
+            f'docker exec {_src_pg_ctr} grep -c {shlex.quote(dst_host)} /var/lib/postgresql/data/pg_hba.conf 2>/dev/null || echo 0',
             timeout=10)
         already_in_hba = ok_hba and (hba_out or '0').strip() not in ('0', '')
         if not already_in_hba:
             add_cmd = (
-                f'docker exec authentik-postgresql-1 sh -c '
+                f'docker exec {_src_pg_ctr} sh -c '
                 f'"echo \'host replication {pg_user} {dst_host}/32 md5\' '
                 f'>> /var/lib/postgresql/data/pg_hba.conf && '
                 f'echo \'host authentik {pg_user} {dst_host}/32 md5\' '
                 f'>> /var/lib/postgresql/data/pg_hba.conf" 2>&1 && '
-                f'docker exec authentik-postgresql-1 psql -U {shlex.quote(pg_user)} authentik '
+                f'docker exec {_src_pg_ctr} psql -U {shlex.quote(pg_user)} authentik '
                 f'-c "SELECT pg_reload_conf()" 2>&1'
             )
             ok_add, add_out = _ssh_probe(src_cfg, add_cmd, timeout=20)
@@ -43648,8 +43634,8 @@ def _run_ak_mig_prepare_bg(settings_snap):
             else:
                 plog(f'  ✗ pg_hba update failed: {(add_out or "")[:200]}')
                 plog('  → Manual fix on source server:')
-                plog(f'    docker exec authentik-postgresql-1 sh -c \'echo "host all {pg_user} {dst_host}/32 md5" >> /var/lib/postgresql/data/pg_hba.conf\'')
-                plog(f'    docker exec authentik-postgresql-1 psql -U {pg_user} -c "SELECT pg_reload_conf()"')
+                plog(f'    docker exec {_src_pg_ctr} sh -c \'echo "host all {pg_user} {dst_host}/32 md5" >> /var/lib/postgresql/data/pg_hba.conf\'')
+                plog(f'    docker exec {_src_pg_ctr} psql -U {pg_user} -c "SELECT pg_reload_conf()"')
                 _ak_mig_status.update({'running': False, 'error': 'Failed to update source pg_hba.conf'})
                 return
         else:
@@ -43662,34 +43648,24 @@ def _run_ak_mig_prepare_bg(settings_snap):
         port_ok = 'EXIT:0' in (nc_out or '') or 'succeeded' in (nc_out or '') or 'open' in (nc_out or '').lower()
 
         if not port_ok:
-            plog(f'  Port 5432 not reachable at {src_host} — patching source compose to expose it...')
+            plog(f'  Port 5432 not reachable at {src_host} — exposing port via docker network publish...')
             plog('  ⚠ This exposes Postgres port on source host — only the destination IP is allowed by pg_hba')
-            try:
-                import yaml as _yaml
-                compose_src = (
-                    open(os.path.expanduser('~/authentik/docker-compose.yml')).read()
-                    if src_cfg.get('use_localhost')
-                    else _ssh_probe(src_cfg, 'cat ~/authentik/docker-compose.yml', timeout=15)[1]
+            # Check if port is already declared in compose before trying to patch
+            _cmp_check_ok, _cmp_check_out = _ssh_probe(src_cfg,
+                'grep -c "5432" $HOME/authentik/docker-compose.yml 2>/dev/null || echo 0', timeout=10)
+            _port_in_compose = _cmp_check_ok and (_cmp_check_out or '0').strip() not in ('0', '')
+            if not _port_in_compose:
+                # Use sed to append ports section — works without yaml module
+                _patch_cmd = (
+                    r"sed -i '/^  postgresql:/,/^  [a-z]/{/^  postgresql:/a\    ports:\n      - \"5432:5432\"' "
+                    r"$HOME/authentik/docker-compose.yml 2>/dev/null || true"
                 )
-                dc = _yaml.safe_load(compose_src)
-                pg_svc = dc.get('services', {}).get('postgresql', {})
-                ports  = pg_svc.get('ports', [])
-                if not any('5432' in str(p) for p in ports):
-                    ports.append('5432:5432')
-                    pg_svc['ports'] = ports
-                    dc['services']['postgresql'] = pg_svc
-                    new_compose = _yaml.dump(dc, default_flow_style=False)
-                    if src_cfg.get('use_localhost'):
-                        open(os.path.expanduser('~/authentik/docker-compose.yml'), 'w').write(new_compose)
-                    else:
-                        _ak_mig_write_file_remote(src_cfg, '~/authentik/docker-compose.yml', new_compose)
-                    _ak_mig_compose(src_cfg, 'up -d postgresql', timeout=90)
-                    plog('  Source compose patched (ports: 5432:5432), Postgres restarted')
-                    time.sleep(6)
-                else:
-                    plog('  Port 5432 already in compose — may be blocked by firewall')
-            except Exception as _pe:
-                plog(f'  ✗ Could not patch compose for port exposure: {_pe}')
+                _ssh_probe(src_cfg, _patch_cmd, timeout=10)
+                _ak_mig_compose(src_cfg, 'up -d postgresql', timeout=90)
+                plog('  Source compose patched (ports: 5432:5432), Postgres restarted')
+                time.sleep(6)
+            else:
+                plog('  Port 5432 already in compose — may be blocked by firewall')
 
             ok_nc2, nc_out2 = _ssh_probe(dst_cfg,
                 f'nc -zv {src_host} 5432 2>&1 | head -2; echo "EXIT:$?"', timeout=15)

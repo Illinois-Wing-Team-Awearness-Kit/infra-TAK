@@ -18712,15 +18712,17 @@ def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, setting
     """Remote-deploy variant: SSH to the Authentik host, patch .env with SMTP settings
     pointing to the console server's Postfix, restart containers, set up recovery flow.
     Returns a status message string. Raises on fatal error."""
-    import base64 as _b64
+    import re as _re
     _log = plog or (lambda msg: None)
     host = (deploy_cfg.get('remote', {}).get('host') or '').strip()
     if not host:
         raise RuntimeError('Remote host not configured in Authentik deployment settings.')
+
     _from = (from_addr or '').strip() or 'authentik@localhost'
     # Email Relay (Postfix) runs on the console server — Authentik must connect to it over the network
     console_ip = (settings.get('server_ip') or '').strip()
     smtp_host = console_ip if console_ip and console_ip not in ('localhost', '127.0.0.1') else host
+
     email_lines = '\n'.join([
         '',
         '# Email — use console server Email Relay (Postfix)',
@@ -18733,6 +18735,7 @@ def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, setting
         'AUTHENTIK_EMAIL__TIMEOUT=10',
         f'AUTHENTIK_EMAIL__FROM={_from}',
     ])
+
     # Read current .env from remote, strip old email settings, append new ones
     _ok, _env_out = _module_run(deploy_cfg, 'cat ~/authentik/.env 2>/dev/null || true', timeout=10)
     env_lines = []
@@ -18742,18 +18745,23 @@ def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, setting
     if env_lines and env_lines[-1].strip() != '':
         env_lines.append('')
     new_env = '\n'.join(env_lines) + email_lines + '\n'
+
+    # Write patched .env back to remote
+    import base64 as _b64
     encoded = _b64.b64encode(new_env.encode()).decode()
     _ok, _out = _module_run(deploy_cfg,
         f"echo '{encoded}' | base64 -d > ~/authentik/.env", timeout=15)
     if not _ok:
         raise RuntimeError(f'Could not write .env on remote host: {_out}')
     _log('  Wrote SMTP settings to remote Authentik .env')
+
     # Open port 25 on the console server for the remote Authentik host
     if host:
         subprocess.run(f'ufw allow from {host} to any port 25 proto tcp 2>/dev/null; true',
                        shell=True, capture_output=True)
         subprocess.run('ufw reload 2>/dev/null; true', shell=True, capture_output=True)
         _log(f'  UFW: allowed {host} → port 25 (console Postfix)')
+
     # Restart Authentik containers on remote
     _log('  Restarting Authentik containers on remote...')
     _ok, _out = _module_run(deploy_cfg,
@@ -18761,11 +18769,13 @@ def _configure_authentik_smtp_and_recovery_remote(deploy_cfg, from_addr, setting
     if not _ok:
         raise RuntimeError(f'Authentik restart failed on remote: {(_out or "")[:300]}')
     _log('  ✓ Authentik restarted')
+
     # Retrieve bootstrap token from remote .env
     _ok2, _tok_out = _module_run(deploy_cfg,
         "grep '^AUTHENTIK_BOOTSTRAP_TOKEN=' ~/authentik/.env | head -1 | cut -d= -f2-",
         timeout=10)
     ak_token = (_tok_out or '').strip().strip('"').strip("'")
+
     message = f'Authentik SMTP configured ({smtp_host}:25).'
     if ak_token:
         ak_url = f'http://{host}:9090'
@@ -29926,8 +29936,9 @@ networks:
         'command: ' + _AUTHENTIK_PG_COMMAND_ENTERPRISE,
         'command: ' + _pg_cmd_remote,
     )
-    # Remote: bind port 9090 on 0.0.0.0 so Caddy on the console can reach
-    # forward_auth. UFW in Step 8 restricts this to the console IP only.
+    # Remote installs: bind HTTP port on 0.0.0.0 so Caddy on the console server
+    # can reach it for forward_auth and reverse_proxy. UFW in Step 8 restricts
+    # this to the console IP only. (Local installs keep 127.0.0.1 — see v0.9.12.)
     compose_content = compose_content.replace(
         '      - "127.0.0.1:${COMPOSE_PORT_HTTP:-9000}:9000"',
         '      - "0.0.0.0:${COMPOSE_PORT_HTTP:-9090}:9000"',
@@ -29995,70 +30006,72 @@ networks:
     else:
         plog("⚠ Authentik not healthy after 5 minutes — may still be starting")
 
-    # Step 6b: Inject LDAP outpost token via SSH curl on remote host.
-    # API calls run on the remote (where 127.0.0.1:9090 is always reachable),
-    # not from the console (which can't reach 127.0.0.1 on the remote host).
+    # Step 6b: Inject LDAP token via curl on the remote host.
+    # Port 9090 is bound to 127.0.0.1 on the Authentik host, so all API
+    # calls must run on that host via _module_run, not from the console.
     plog("")
     plog("━━━ Step 6b/8: LDAP Outpost Token (remote) ━━━")
-    _auth_header = f'Authorization: Bearer {bootstrap_token}'
-    _ak_local_url = 'http://127.0.0.1:9090'
-    # Wait for API readiness via SSH
-    plog("  Waiting for Authentik API on remote (up to 5 min)...")
+    _ak_local_url = "http://localhost:9090"
+    _auth_header = f"Authorization: Bearer {bootstrap_token}"
+    plog("  Waiting for Authentik API...")
     api_ready = False
-    for _api_attempt in range(60):
-        _ok_api, _api_out = _module_run(deploy_cfg,
+    for _attempt in range(90):
+        _ok, _out = _module_run(deploy_cfg,
             f'curl -s -o /dev/null -w "%{{http_code}}" -H "{_auth_header}" '
-            f'"{_ak_local_url}/api/v3/core/users/me/" 2>/dev/null || echo 000',
-            timeout=15)
-        if _ok_api and (_api_out or '').strip() in ('200', '401', '403'):
+            f'{_ak_local_url}/api/v3/core/tokens/ --connect-timeout 5 2>/dev/null',
+            timeout=12)
+        if _ok and (_out or '').strip() == '200':
             api_ready = True
-            plog(f"  ✓ Authentik API is ready ({_api_attempt * 5}s)")
             break
-        if _api_attempt % 6 == 0 and _api_attempt > 0:
-            plog(f"  ⏳ {_api_attempt * 5}s...")
+        if _attempt % 6 == 0 and _attempt > 0:
+            plog(f"  ⏳ Still waiting for API... ({_attempt * 5}s)")
         time.sleep(5)
-    if not api_ready:
-        plog("  ⚠ API not ready after 5 min — LDAP token injection skipped; use Fix LDAP token button")
-    # Wait for LDAP outpost blueprint (up to 5 more minutes via SSH retry)
+    if api_ready:
+        plog("  ✓ Authentik API is ready")
+    else:
+        plog("  ⚠ API timeout — LDAP token injection skipped; use Fix LDAP token on Authentik page")
+    # Blueprints that create the default LDAP outpost can take several minutes
+    # to finish after the API first becomes reachable. Retry for up to 5 minutes.
     ldap_token_key = None
     if api_ready:
         plog("  Waiting for LDAP outpost blueprint (up to 5 min)...")
-        _ldap_found = False
-        for _bp_attempt in range(30):
+        _ldap_outpost_found = False
+        for _bp_attempt in range(30):  # 30 × 10s = 5 minutes
             try:
                 _ok, _out = _module_run(deploy_cfg,
                     f'curl -s -H "{_auth_header}" '
                     f'"{_ak_local_url}/api/v3/outposts/instances/?search=LDAP" 2>/dev/null',
                     timeout=15)
                 if _ok and _out:
-                    _results = json.loads(_out).get('results', [])
-                    _ldap_outpost = next((o for o in _results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
-                    if _ldap_outpost:
-                        _tid = _ldap_outpost.get('token_identifier') or _ldap_outpost.get('token')
-                        if not _tid:
+                    results = json.loads(_out).get('results', [])
+                    ldap_outpost = next((o for o in results if o.get('name') == 'LDAP' and o.get('type') == 'ldap'), None)
+                    if ldap_outpost:
+                        outpost_token_id = ldap_outpost.get('token_identifier') or ldap_outpost.get('token')
+                        if not outpost_token_id:
                             _ok2, _out2 = _module_run(deploy_cfg,
                                 f'curl -s -H "{_auth_header}" '
-                                f'"{_ak_local_url}/api/v3/outposts/instances/{_ldap_outpost["pk"]}/" 2>/dev/null',
+                                f'"{_ak_local_url}/api/v3/outposts/instances/{ldap_outpost["pk"]}/" 2>/dev/null',
                                 timeout=10)
                             if _ok2 and _out2:
-                                _tid = json.loads(_out2).get('token_identifier') or json.loads(_out2).get('token')
-                        if _tid:
+                                detail = json.loads(_out2)
+                                outpost_token_id = detail.get('token_identifier') or detail.get('token')
+                        if outpost_token_id:
                             _ok3, _out3 = _module_run(deploy_cfg,
                                 f'curl -s -H "{_auth_header}" '
-                                f'"{_ak_local_url}/api/v3/core/tokens/{_tid}/view_key/" 2>/dev/null',
+                                f'"{_ak_local_url}/api/v3/core/tokens/{outpost_token_id}/view_key/" 2>/dev/null',
                                 timeout=10)
                             if _ok3 and _out3:
                                 ldap_token_key = json.loads(_out3).get('key', '')
                                 if ldap_token_key:
-                                    plog(f"  ✓ LDAP outpost token retrieved ({_bp_attempt * 10}s after API ready)")
-                                    _ldap_found = True
+                                    plog(f"  ✓ Retrieved LDAP outpost token from API ({_bp_attempt * 10}s after API ready)")
+                                    _ldap_outpost_found = True
                                     break
-            except Exception as _bp_e:
-                plog(f"  ⚠ Attempt {_bp_attempt + 1}: {str(_bp_e)[:80]}")
+            except Exception as e:
+                plog(f"  ⚠ Token fetch attempt {_bp_attempt + 1}: {str(e)[:100]}")
             if _bp_attempt % 3 == 2:
                 plog(f"  ⏳ Waiting for LDAP blueprint... ({(_bp_attempt + 1) * 10}s)")
             time.sleep(10)
-        if not _ldap_found:
+        if not _ldap_outpost_found:
             plog("  ⚠ LDAP outpost not found after 5 min — token injection skipped")
     if ldap_token_key:
         try:
@@ -40624,7 +40637,7 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
     Returns one of:
       'ok'           — bind confirmed (ldapsearch success OR success marker in outpost logs)
       'fail'         — bind confirmed failed (failure markers / credential errors)
-      'inconclusive' — could not determine (ldapsearch unavailable AND no decisive marker)
+      'inconclusive' — could not determine (ldapsearch unavailable, remote mode, or no decisive marker)
 
     Callers must NOT take destructive action on 'inconclusive' — that's the bug that hit
     `responder` (April 2026): missing ldapsearch + recursion-only outpost logs caused a
@@ -40725,11 +40738,11 @@ def _test_ldap_bind_dn_verdict(bind_dn, bind_pass):
         if has_flow_error:
             saw_spiral = True
 
-    # For remote Authentik, ldapsearch may be installed but unreachable (ZeroTier
-    # source IP vs. public IP in UFW allowlist). A connection failure is not a
-    # credential failure — fall back to 'inconclusive' so callers don't treat it
-    # as a confirmed bad password. Only 'invalid credentials' in ldapsearch output
-    # (already returned 'fail' early above) is a definitive remote failure.
+    # In remote mode ldapsearch is never executed (guarded by `not is_remote` above),
+    # so has_ldapsearch being True on the local machine is irrelevant — we have no
+    # authoritative credential test result.  Treat the absence of decisive log markers
+    # as inconclusive rather than 'fail' to avoid false-failing the bind verification
+    # and triggering destructive user DELETE+POST in the webadmin sync path.
     return 'inconclusive' if saw_spiral or not has_ldapsearch or is_remote else 'fail'
 
 
@@ -43234,6 +43247,1527 @@ def authentik_recover_admin_api():
     return jsonify({'success': ok, 'message': msg, 'method': method}), status
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Authentik Live Migration Wizard  (v1.0)
+#
+# Moves a running Authentik instance to a new server using Postgres logical
+# replication.  Flow:
+#   1. Configure — save destination SSH creds
+#   2. Test     — verify connectivity, versions, disk space
+#   3. Prepare  — copy .env + compose, start dest Postgres, enable wal_level=logical
+#   4. Replicate— schema copy + publication/subscription; initial table sync
+#   5. Monitor  — poll replication lag; enable Cutover when lag = 0
+#   6. Cutover  — stop source Authentik, verify lag=0, drop sub, start dest full stack
+#   Rollback    — restart source Authentik if anything goes wrong
+# ─────────────────────────────────────────────────────────────────────────────
+
+_ak_mig_log    = []
+_ak_mig_status = {
+    'phase':     'idle',   # idle|testing|prepared|replicating|monitoring|cutting_over|done|error|rolled_back
+    'step':      0,
+    'running':   False,
+    'complete':  False,
+    'error':     None,
+    'lag_bytes': None,
+    'lag_ready': False,
+    'can_rollback': False,
+}
+_ak_mig_lock = threading.Lock()
+
+_AK_MIG_PUB  = 'authentik_mig_pub'
+_AK_MIG_SUB  = 'authentik_mig_sub'
+
+_ak_mig_compose_cache = {}   # host key → 'docker compose' | 'docker-compose'
+
+
+def _ak_mig_compose(host_cfg, args, timeout=90):
+    """Run docker compose (v2 plugin) or docker-compose (v1 binary) on the given host.
+
+    Detects which is available on first call per host and caches the result.
+    Eliminates 'unknown shorthand flag: d' errors on servers that only have v1.
+    """
+    key = host_cfg.get('host', 'local') if not host_cfg.get('use_localhost') else 'local'
+    if key not in _ak_mig_compose_cache:
+        ok_v2, _ = _ssh_probe(host_cfg, 'docker compose version >/dev/null 2>&1', timeout=8)
+        _ak_mig_compose_cache[key] = 'docker compose' if ok_v2 else 'docker-compose'
+    bin_ = _ak_mig_compose_cache[key]
+    cmd  = f'cd ~/authentik && {bin_} {args} 2>&1'
+    return _ssh_probe(host_cfg, cmd, timeout=timeout)
+
+
+def _ak_mig_plog(msg):
+    ts = datetime.utcnow().strftime('%H:%M:%S')
+    _ak_mig_log.append(f'[{ts}] {msg}')
+
+
+def _ak_mig_src_cfg(settings=None):
+    """SSH config for the SOURCE Authentik server (current deployment)."""
+    if settings is None:
+        settings = load_settings()
+    ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+    if ak_cfg.get('target_mode') == 'remote':
+        r = ak_cfg.get('remote', {})
+        return {
+            'host': (r.get('host') or '').strip(),
+            'ssh_user': (r.get('ssh_user') or 'root').strip(),
+            'ssh_port': int(r.get('ssh_port') or 22),
+            'auth_method': r.get('auth_method', 'ssh_key'),
+            'ssh_key_path': r.get('ssh_key_path', '~/.ssh/id_rsa'),
+            'ssh_password': r.get('ssh_password', ''),
+        }
+    return {'use_localhost': True, 'host': '127.0.0.1'}
+
+
+def _ak_mig_dst_cfg(settings=None):
+    """SSH config for the DESTINATION server."""
+    if settings is None:
+        settings = load_settings()
+    dst = (settings.get('authentik_migration') or {}).get('destination') or {}
+    if not (dst.get('host') or '').strip():
+        return {}
+    return {
+        'host':         (dst.get('host') or '').strip(),
+        'ssh_user':     (dst.get('ssh_user') or 'root').strip(),
+        'ssh_port':     int(dst.get('ssh_port') or 22),
+        'auth_method':  (dst.get('auth_method') or 'ssh_key'),
+        'ssh_key_path': (dst.get('ssh_key_path') or '~/.ssh/id_rsa'),
+        'ssh_password': (dst.get('ssh_password') or ''),
+    }
+
+
+def _ak_mig_pg_pass(settings=None):
+    if settings is None:
+        settings = load_settings()
+    return (
+        _get_authentik_env_value(settings, 'POSTGRES_PASSWORD') or
+        _get_authentik_env_value(settings, 'AUTHENTIK_POSTGRESQL__PASSWORD') or
+        'authentik'
+    )
+
+
+def _ak_mig_pg_user(settings=None):
+    if settings is None:
+        settings = load_settings()
+    return (
+        _get_authentik_env_value(settings, 'POSTGRES_USER') or
+        _get_authentik_env_value(settings, 'AUTHENTIK_POSTGRESQL__USER') or
+        'authentik'
+    )
+
+
+def _ak_mig_psql(host_cfg, sql, db='authentik', settings=None, timeout=30):
+    """Run SQL inside authentik-postgresql-1 on the given host via docker exec."""
+    if settings is None:
+        settings = load_settings()
+    u = _ak_mig_pg_user(settings)
+    p = _ak_mig_pg_pass(settings)
+    cmd = (
+        f'PGPASSWORD={shlex.quote(p)} docker exec authentik-postgresql-1 '
+        f'psql -U {shlex.quote(u)} {shlex.quote(db)} -t -c {shlex.quote(sql)} 2>&1'
+    )
+    return _ssh_probe(host_cfg, cmd, timeout=timeout)
+
+
+def _ak_mig_get_env_content(src_cfg):
+    """Read ~/authentik/.env from source, return (ok, content)."""
+    if src_cfg.get('use_localhost'):
+        p = os.path.expanduser('~/authentik/.env')
+        if os.path.exists(p):
+            try:
+                return True, open(p).read()
+            except Exception as e:
+                return False, str(e)
+        return False, '~/authentik/.env not found on local host'
+    return _ssh_probe(src_cfg, 'cat ~/authentik/.env', timeout=15)
+
+
+def _ak_mig_write_file_remote(host_cfg, remote_path, content, timeout=20):
+    """Write arbitrary text content to a file on a remote host via SSH heredoc."""
+    import base64 as _b64
+    encoded = _b64.b64encode(content.encode('utf-8', errors='replace')).decode()
+    cmd = (
+        f'mkdir -p "$(dirname {shlex.quote(remote_path)})" && '
+        f'echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(remote_path)}'
+    )
+    return _ssh_probe(host_cfg, cmd, timeout=timeout)
+
+
+# ── Step 1: Connectivity Test (synchronous) ──────────────────────────────────
+
+def _run_ak_mig_test(src_cfg, dst_cfg, settings):
+    """Run all connectivity/compatibility checks. Returns (ok, issues_list, info_dict)."""
+    issues = []
+    info   = {}
+
+    # Source SSH
+    ok, out = _ssh_probe(src_cfg, 'echo ok', timeout=10)
+    if not ok:
+        issues.append(f'Cannot SSH to source: {(out or "")[:120]}')
+    else:
+        info['src_ssh'] = 'ok'
+
+    # Dest SSH
+    if not dst_cfg or not dst_cfg.get('host'):
+        issues.append('Destination host not configured')
+    else:
+        ok, out = _ssh_probe(dst_cfg, 'echo ok', timeout=10)
+        if not ok:
+            issues.append(f'Cannot SSH to destination ({dst_cfg["host"]}): {(out or "")[:120]}')
+        else:
+            info['dst_ssh'] = 'ok'
+
+    # Source: Authentik running?
+    ok, out = _ssh_probe(src_cfg, 'docker ps --filter name=authentik-server --format "{{.Names}}" 2>/dev/null | head -3', timeout=10)
+    if ok and 'authentik' in (out or ''):
+        info['src_authentik'] = 'running'
+    else:
+        issues.append('Source: Authentik server container not running')
+
+    # Source: Postgres version
+    ok, ver = _ak_mig_psql(src_cfg, 'SELECT version()', settings=settings)
+    if ok:
+        v = (ver or '').strip()
+        info['src_pg_version'] = v[:60]
+        maj = ''
+        try:
+            import re as _re
+            m = _re.search(r'PostgreSQL (\d+)', v)
+            maj = m.group(1) if m else ''
+        except Exception:
+            pass
+        info['src_pg_major'] = maj
+    else:
+        issues.append(f'Cannot connect to source PostgreSQL: {(ver or "")[:100]}')
+
+    # Dest: Docker available?
+    ok, out = _ssh_probe(dst_cfg, 'docker --version 2>&1', timeout=10)
+    if ok and 'Docker' in (out or ''):
+        info['dst_docker'] = (out or '').strip()[:60]
+    else:
+        issues.append(f'Docker not available on destination: {(out or "")[:100]}')
+        issues.append('  → Install Docker: curl -fsSL https://get.docker.com | sh')
+
+    # Dest: docker compose available?
+    ok, out = _ssh_probe(dst_cfg, 'docker compose version 2>&1 || docker-compose --version 2>&1', timeout=10)
+    if ok and ('compose' in (out or '').lower()):
+        info['dst_compose'] = (out or '').strip()[:60]
+    else:
+        issues.append('docker compose not available on destination')
+
+    # Dest: Postgres already running (warn if so — may conflict)
+    ok, out = _ssh_probe(dst_cfg, 'docker ps --filter name=authentik-postgresql --format "{{.Names}}" 2>/dev/null', timeout=10)
+    if ok and 'postgresql' in (out or ''):
+        info['dst_pg_running'] = 'yes'
+
+    # Dest: disk space (need > 2x source DB size, or at least 2 GB)
+    ok, out = _ssh_probe(dst_cfg, "df -BG / 2>/dev/null | awk 'NR==2{print $4}' | tr -d 'G'", timeout=10)
+    if ok:
+        try:
+            gb = int((out or '0').strip())
+            info['dst_free_gb'] = gb
+            if gb < 2:
+                issues.append(f'Destination has only {gb} GB free — need at least 2 GB')
+        except Exception:
+            pass
+
+    # Dest: no existing Authentik data (warn if ~/authentik exists with data)
+    ok, out = _ssh_probe(dst_cfg, 'test -f ~/authentik/.env && echo exists || echo empty', timeout=10)
+    if ok and 'exists' in (out or ''):
+        info['dst_has_env'] = True
+
+    # Source: .env readable?
+    ok_env, _ = _ak_mig_get_env_content(src_cfg)
+    if not ok_env:
+        issues.append('Cannot read ~/authentik/.env from source — check permissions')
+    else:
+        info['src_env_readable'] = True
+
+    return len(issues) == 0, issues, info
+
+
+# ── Step 3: Prepare destination (background) ─────────────────────────────────
+
+def _run_ak_mig_prepare_bg(settings_snap):
+    plog = _ak_mig_plog
+    try:
+        _ak_mig_status.update({'phase': 'preparing', 'running': True, 'error': None})
+        src_cfg  = _ak_mig_src_cfg(settings_snap)
+        dst_cfg  = _ak_mig_dst_cfg(settings_snap)
+        pg_user  = _ak_mig_pg_user(settings_snap)
+        pg_pass  = _ak_mig_pg_pass(settings_snap)
+        dst_host = dst_cfg.get('host', '')
+        src_host = src_cfg.get('host', '127.0.0.1') if not src_cfg.get('use_localhost') else '127.0.0.1'
+
+        plog('━━━ Step 2: Prepare Destination ━━━')
+
+        # ── 1. Copy .env ────────────────────────────────────────────────────
+        plog('Reading .env from source...')
+        ok_env, env_content = _ak_mig_get_env_content(src_cfg)
+        if not ok_env or not env_content.strip():
+            plog(f'  ✗ Cannot read source .env: {(env_content or "")[:200]}')
+            _ak_mig_status.update({'running': False, 'error': 'Cannot read source .env'})
+            return
+        plog(f'  ✓ .env read ({len(env_content.splitlines())} lines)')
+
+        plog('Writing .env to destination...')
+        _ssh_probe(dst_cfg, 'mkdir -p ~/authentik', timeout=10)
+        ok_ew, ew_out = _ak_mig_write_file_remote(dst_cfg, '~/authentik/.env', env_content)
+        if not ok_ew:
+            plog(f'  ✗ Failed to write .env: {(ew_out or "")[:200]}')
+            _ak_mig_status.update({'running': False, 'error': 'Failed to write .env to destination'})
+            return
+        plog('  ✓ .env written to destination')
+
+        # ── 2. Copy docker-compose.yml ──────────────────────────────────────
+        plog('Copying docker-compose.yml to destination...')
+        ok_dc_exists, dc_out = _ssh_probe(dst_cfg,
+            'test -f ~/authentik/docker-compose.yml && echo exists || echo missing', timeout=10)
+        if 'missing' in (dc_out or ''):
+            if src_cfg.get('use_localhost'):
+                dc_path = os.path.expanduser('~/authentik/docker-compose.yml')
+                dc_content = open(dc_path).read() if os.path.exists(dc_path) else ''
+            else:
+                _, dc_content = _ssh_probe(src_cfg, 'cat ~/authentik/docker-compose.yml', timeout=15)
+            if not dc_content:
+                plog('  ✗ Cannot read source docker-compose.yml')
+                _ak_mig_status.update({'running': False, 'error': 'Cannot read source docker-compose.yml'})
+                return
+            ok_dw, _ = _ak_mig_write_file_remote(dst_cfg, '~/authentik/docker-compose.yml', dc_content)
+            if not ok_dw:
+                plog('  ✗ Failed to write docker-compose.yml to destination')
+                _ak_mig_status.update({'running': False, 'error': 'Failed to write docker-compose.yml'})
+                return
+            plog('  ✓ docker-compose.yml copied')
+        else:
+            plog('  ✓ docker-compose.yml already present on destination')
+
+        # ── 3. Start dest Postgres ──────────────────────────────────────────
+        plog('Starting PostgreSQL on destination...')
+        ok_up, up_out = _ak_mig_compose(dst_cfg, 'up -d postgresql', timeout=90)
+        if not ok_up:
+            plog(f'  ✗ docker compose up failed: {(up_out or "")[:300]}')
+            plog('  → Check: ssh root@dest "docker logs authentik-postgresql-1 --tail=30"')
+            _ak_mig_status.update({'running': False, 'error': 'Failed to start destination PostgreSQL'})
+            return
+        plog('  Waiting for destination PostgreSQL to accept connections...')
+        for attempt in range(30):
+            time.sleep(3)
+            ok_rdy, _ = _ak_mig_psql(dst_cfg, 'SELECT 1', settings=settings_snap)
+            if ok_rdy:
+                plog(f'  ✓ Destination PostgreSQL ready (after {(attempt+1)*3}s)')
+                break
+        else:
+            plog('  ✗ Destination PostgreSQL not ready after 90 seconds')
+            plog('  → Check logs: ssh root@dest "docker logs authentik-postgresql-1 --tail=30"')
+            plog('  → Common causes: port conflict, wrong Postgres image, out of disk')
+            _ak_mig_status.update({'running': False, 'error': 'Destination PostgreSQL did not start in 90s'})
+            return
+
+        # ── 4. Enable wal_level=logical on source ───────────────────────────
+        plog('Checking wal_level on source PostgreSQL...')
+        ok_wl, wl_out = _ak_mig_psql(src_cfg, 'SHOW wal_level', settings=settings_snap)
+        wl_current = (wl_out or '').strip().lower()
+        plog(f'  Current source wal_level: {wl_current or "(unreadable)"}')
+
+        if 'logical' not in wl_current:
+            plog('  wal_level is not "logical" — patching source docker-compose.yml...')
+            plog('  ⚠ Source PostgreSQL will restart briefly (Authentik reconnects automatically)')
+            _wal_flags = ' -c wal_level=logical -c max_replication_slots=5 -c max_wal_senders=5 -c wal_log_hints=on'
+            patch_ok = False
+            try:
+                import yaml as _yaml
+                compose_src = (
+                    open(os.path.expanduser('~/authentik/docker-compose.yml')).read()
+                    if src_cfg.get('use_localhost')
+                    else _ssh_probe(src_cfg, 'cat ~/authentik/docker-compose.yml', timeout=15)[1]
+                )
+                dc = _yaml.safe_load(compose_src)
+                pg_svc = dc.get('services', {}).get('postgresql', {})
+                cur_cmd = str(pg_svc.get('command', ''))
+                if 'wal_level=logical' not in cur_cmd:
+                    pg_svc['command'] = cur_cmd.rstrip() + _wal_flags
+                    dc['services']['postgresql'] = pg_svc
+                    new_compose = _yaml.dump(dc, default_flow_style=False)
+                    if src_cfg.get('use_localhost'):
+                        open(os.path.expanduser('~/authentik/docker-compose.yml'), 'w').write(new_compose)
+                        patch_ok = True
+                    else:
+                        ok_pw, _ = _ak_mig_write_file_remote(src_cfg, '~/authentik/docker-compose.yml', new_compose)
+                        patch_ok = ok_pw
+                    plog('  ✓ docker-compose.yml patched with wal_level=logical')
+                else:
+                    plog('  ✓ wal_level=logical flags already in compose (applying may have been deferred by PG)')
+                    patch_ok = True
+            except Exception as _pe:
+                plog(f'  ✗ Compose patch error: {_pe}')
+
+            if not patch_ok:
+                plog('  ✗ Could not patch source docker-compose.yml automatically')
+                plog('  → Manual fix on source server:')
+                plog('    Edit ~/authentik/docker-compose.yml — under services.postgresql.command add:')
+                plog(f'      {_wal_flags.strip()}')
+                plog('    Then run: cd ~/authentik && docker compose up -d postgresql')
+                _ak_mig_status.update({'running': False, 'error': 'Cannot enable wal_level=logical — manual patch required'})
+                return
+
+            plog('  Restarting source PostgreSQL...')
+            _ak_mig_compose(src_cfg, 'up -d postgresql', timeout=90)
+            for attempt in range(25):
+                time.sleep(4)
+                ok_r, _ = _ak_mig_psql(src_cfg, 'SHOW wal_level', settings=settings_snap)
+                if ok_r:
+                    break
+            else:
+                plog('  ✗ Source Postgres did not come back in 100s after restart')
+                _ak_mig_status.update({'running': False, 'error': 'Source Postgres not ready after wal_level restart'})
+                return
+
+            _, wl_new = _ak_mig_psql(src_cfg, 'SHOW wal_level', settings=settings_snap)
+            plog(f'  Source wal_level now: {(wl_new or "").strip()}')
+            if 'logical' not in (wl_new or '').lower():
+                plog('  ✗ wal_level still not logical — check compose patch manually')
+                _ak_mig_status.update({'running': False, 'error': 'wal_level not logical after restart'})
+                return
+        else:
+            plog('  ✓ wal_level=logical already enabled')
+
+        # ── 5. Allow dest IP in source pg_hba.conf ──────────────────────────
+        plog(f'Ensuring source pg_hba.conf allows destination ({dst_host})...')
+        ok_hba, hba_out = _ssh_probe(src_cfg,
+            f'docker exec authentik-postgresql-1 grep -c {shlex.quote(dst_host)} /var/lib/postgresql/data/pg_hba.conf 2>/dev/null || echo 0',
+            timeout=10)
+        already_in_hba = ok_hba and (hba_out or '0').strip() not in ('0', '')
+        if not already_in_hba:
+            add_cmd = (
+                f'docker exec authentik-postgresql-1 sh -c '
+                f'"echo \'host replication {pg_user} {dst_host}/32 md5\' '
+                f'>> /var/lib/postgresql/data/pg_hba.conf && '
+                f'echo \'host authentik {pg_user} {dst_host}/32 md5\' '
+                f'>> /var/lib/postgresql/data/pg_hba.conf" 2>&1 && '
+                f'docker exec authentik-postgresql-1 psql -U {shlex.quote(pg_user)} authentik '
+                f'-c "SELECT pg_reload_conf()" 2>&1'
+            )
+            ok_add, add_out = _ssh_probe(src_cfg, add_cmd, timeout=20)
+            if ok_add:
+                plog(f'  ✓ pg_hba.conf updated for {dst_host}')
+            else:
+                plog(f'  ✗ pg_hba update failed: {(add_out or "")[:200]}')
+                plog('  → Manual fix on source server:')
+                plog(f'    docker exec authentik-postgresql-1 sh -c \'echo "host all {pg_user} {dst_host}/32 md5" >> /var/lib/postgresql/data/pg_hba.conf\'')
+                plog(f'    docker exec authentik-postgresql-1 psql -U {pg_user} -c "SELECT pg_reload_conf()"')
+                _ak_mig_status.update({'running': False, 'error': 'Failed to update source pg_hba.conf'})
+                return
+        else:
+            plog(f'  ✓ {dst_host} already in pg_hba.conf')
+
+        # ── 6. Ensure source Postgres port 5432 is reachable from dest ──────
+        plog(f'Testing TCP connectivity: destination → source:{src_host}:5432...')
+        ok_nc, nc_out = _ssh_probe(dst_cfg,
+            f'nc -zv {src_host} 5432 2>&1 | head -2; echo "EXIT:$?"', timeout=15)
+        port_ok = 'EXIT:0' in (nc_out or '') or 'succeeded' in (nc_out or '') or 'open' in (nc_out or '').lower()
+
+        if not port_ok:
+            plog(f'  Port 5432 not reachable at {src_host} — patching source compose to expose it...')
+            plog('  ⚠ This exposes Postgres port on source host — only the destination IP is allowed by pg_hba')
+            try:
+                import yaml as _yaml
+                compose_src = (
+                    open(os.path.expanduser('~/authentik/docker-compose.yml')).read()
+                    if src_cfg.get('use_localhost')
+                    else _ssh_probe(src_cfg, 'cat ~/authentik/docker-compose.yml', timeout=15)[1]
+                )
+                dc = _yaml.safe_load(compose_src)
+                pg_svc = dc.get('services', {}).get('postgresql', {})
+                ports  = pg_svc.get('ports', [])
+                if not any('5432' in str(p) for p in ports):
+                    ports.append('5432:5432')
+                    pg_svc['ports'] = ports
+                    dc['services']['postgresql'] = pg_svc
+                    new_compose = _yaml.dump(dc, default_flow_style=False)
+                    if src_cfg.get('use_localhost'):
+                        open(os.path.expanduser('~/authentik/docker-compose.yml'), 'w').write(new_compose)
+                    else:
+                        _ak_mig_write_file_remote(src_cfg, '~/authentik/docker-compose.yml', new_compose)
+                    _ak_mig_compose(src_cfg, 'up -d postgresql', timeout=90)
+                    plog('  Source compose patched (ports: 5432:5432), Postgres restarted')
+                    time.sleep(6)
+                else:
+                    plog('  Port 5432 already in compose — may be blocked by firewall')
+            except Exception as _pe:
+                plog(f'  ✗ Could not patch compose for port exposure: {_pe}')
+
+            ok_nc2, nc_out2 = _ssh_probe(dst_cfg,
+                f'nc -zv {src_host} 5432 2>&1 | head -2; echo "EXIT:$?"', timeout=15)
+            if 'EXIT:0' not in (nc_out2 or '') and 'succeeded' not in (nc_out2 or ''):
+                plog(f'  ✗ Still cannot reach {src_host}:5432 from destination')
+                plog(f'  → On source server run: ufw allow from {dst_host} to any port 5432')
+                plog(f'  → Then verify from dest: nc -zv {src_host} 5432')
+                _ak_mig_status.update({
+                    'running': False,
+                    'error':   f'Port 5432 unreachable at {src_host}. Run on source: ufw allow from {dst_host} to any port 5432'
+                })
+                return
+            plog(f'  ✓ Port 5432 now reachable at {src_host} from destination')
+        else:
+            plog(f'  ✓ Port 5432 reachable at {src_host} from destination')
+
+        # Save state
+        settings_cur = load_settings()
+        mig = settings_cur.setdefault('authentik_migration', {})
+        mig['prepared'] = True
+        mig['src_host_for_replication'] = src_host
+        save_settings(settings_cur)
+
+        _ak_mig_status.update({'phase': 'prepared', 'step': 2, 'running': False, 'error': None})
+        plog('')
+        plog('✓ Destination prepared successfully')
+        plog('  Next: click "Start Replication" to begin live data sync')
+
+    except Exception as e:
+        _ak_mig_plog(f'✗ Prepare failed: {e}')
+        _ak_mig_status.update({'running': False, 'error': str(e)[:250]})
+
+
+# ── Step 4: Start logical replication (background) ───────────────────────────
+
+def _run_ak_mig_replicate_bg(settings_snap):
+    plog = _ak_mig_plog
+    try:
+        _ak_mig_status.update({'phase': 'replicating', 'running': True, 'error': None})
+        src_cfg  = _ak_mig_src_cfg(settings_snap)
+        dst_cfg  = _ak_mig_dst_cfg(settings_snap)
+        pg_user  = _ak_mig_pg_user(settings_snap)
+        pg_pass  = _ak_mig_pg_pass(settings_snap)
+        mig      = (settings_snap.get('authentik_migration') or {})
+        src_host = mig.get('src_host_for_replication') or src_cfg.get('host', '127.0.0.1')
+
+        plog('━━━ Step 3: Start Replication ━━━')
+
+        # ── 1. Drop any stale publication / subscription ─────────────────────
+        plog('Cleaning up any stale replication objects...')
+        _ak_mig_psql(src_cfg, f'DROP PUBLICATION IF EXISTS {_AK_MIG_PUB}', settings=settings_snap)
+        _ak_mig_psql(dst_cfg, f'DROP SUBSCRIPTION IF EXISTS {_AK_MIG_SUB}', settings=settings_snap)
+        plog('  ✓ Cleaned')
+
+        # ── 2. Schema-only dump → restore on destination ────────────────────
+        plog('Dumping schema from source (schema-only)...')
+        u = shlex.quote(pg_user)
+        p_env = f'PGPASSWORD={shlex.quote(pg_pass)}'
+        schema_cmd = f'{p_env} docker exec authentik-postgresql-1 pg_dump -U {u} authentik --schema-only --no-owner --no-acl 2>&1'
+        ok_sd, schema_sql = _ssh_probe(src_cfg, schema_cmd, timeout=120)
+        if not ok_sd or not schema_sql or 'error' in (schema_sql or '').lower()[:80]:
+            plog(f'  ✗ Schema dump failed: {(schema_sql or "")[:300]}')
+            _ak_mig_status.update({'running': False, 'error': 'Schema dump from source failed'})
+            return
+        plog(f'  ✓ Schema dumped ({len(schema_sql):,} bytes)')
+
+        plog('Restoring schema on destination...')
+        ok_sr, sr_out = _ak_mig_write_file_remote(dst_cfg, '/tmp/ak_schema.sql', schema_sql, timeout=30)
+        if not ok_sr:
+            plog(f'  ✗ Failed to write schema to destination: {(sr_out or "")[:200]}')
+            _ak_mig_status.update({'running': False, 'error': 'Failed to transfer schema to destination'})
+            return
+        restore_cmd = (
+            f'{p_env} docker exec -i authentik-postgresql-1 psql -U {u} authentik '
+            f'< /tmp/ak_schema.sql 2>&1 || true'
+        )
+        # Run on dest host (not inside docker directly, need to mount the file)
+        restore_cmd2 = (
+            f'docker cp /tmp/ak_schema.sql authentik-postgresql-1:/tmp/ak_schema.sql 2>&1 && '
+            f'{p_env} docker exec authentik-postgresql-1 psql -U {u} authentik '
+            f'-f /tmp/ak_schema.sql 2>&1'
+        )
+        ok_rs, rs_out = _ssh_probe(dst_cfg, restore_cmd2, timeout=120)
+        # Schema restore may emit benign "already exists" notices — that's fine
+        if not ok_rs:
+            plog(f'  ✗ Schema restore returned error: {(rs_out or "")[:300]}')
+            plog('  This may be OK if tables already exist — continuing...')
+        else:
+            plog('  ✓ Schema restored on destination')
+
+        # ── 3. Create publication on source ──────────────────────────────────
+        plog(f'Creating publication "{_AK_MIG_PUB}" on source...')
+        ok_pub, pub_out = _ak_mig_psql(src_cfg,
+            f'CREATE PUBLICATION {_AK_MIG_PUB} FOR ALL TABLES', settings=settings_snap)
+        if not ok_pub:
+            plog(f'  ✗ CREATE PUBLICATION failed: {(pub_out or "")[:200]}')
+            _ak_mig_status.update({'running': False, 'error': 'CREATE PUBLICATION failed on source'})
+            return
+        plog(f'  ✓ Publication "{_AK_MIG_PUB}" created')
+
+        # ── 4. Create subscription on destination ────────────────────────────
+        plog(f'Creating subscription "{_AK_MIG_SUB}" on destination...')
+        conn_str = (
+            f"host={src_host} port=5432 dbname=authentik "
+            f"user={pg_user} password={pg_pass}"
+        )
+        sub_sql = (
+            f"CREATE SUBSCRIPTION {_AK_MIG_SUB} "
+            f"CONNECTION '{conn_str}' "
+            f"PUBLICATION {_AK_MIG_PUB} "
+            f"WITH (copy_data = true, enabled = true)"
+        )
+        ok_sub, sub_out = _ak_mig_psql(dst_cfg, sub_sql, settings=settings_snap, timeout=60)
+        if not ok_sub:
+            plog(f'  ✗ CREATE SUBSCRIPTION failed: {(sub_out or "")[:300]}')
+            plog('  Common causes:')
+            plog(f'  • Source {src_host}:5432 not reachable from dest Docker network')
+            plog(f'  • pg_hba.conf does not allow {dst_cfg.get("host","dest")} to connect')
+            plog(f'  • pg_pass wrong (check POSTGRES_PASSWORD in .env)')
+            plog(f'  • wal_level not yet logical (may need more time after restart)')
+            # Cleanup
+            _ak_mig_psql(src_cfg, f'DROP PUBLICATION IF EXISTS {_AK_MIG_PUB}', settings=settings_snap)
+            _ak_mig_status.update({'running': False, 'error': f'CREATE SUBSCRIPTION failed: {(sub_out or "")[:120]}'})
+            return
+        plog(f'  ✓ Subscription "{_AK_MIG_SUB}" created — initial table copy starting')
+
+        # ── 5. Monitor initial sync ───────────────────────────────────────────
+        plog('Monitoring initial table sync (this may take a few minutes)...')
+        for poll in range(120):  # up to 10 minutes
+            time.sleep(5)
+            ok_sync, sync_out = _ak_mig_psql(dst_cfg,
+                "SELECT count(*), string_agg(DISTINCT srstate::text, ',') "
+                "FROM pg_subscription_rel",
+                settings=settings_snap)
+            plog(f'  [{poll*5}s] Sync state: {(sync_out or "").strip()[:80]}')
+            # All tables in state 'r' (ready) = initial copy complete
+            if ok_sync and 'r' in (sync_out or '') and 'd' not in (sync_out or '') and 'i' not in (sync_out or ''):
+                plog('  ✓ All tables synced (initial copy complete)')
+                break
+            # Also accept: no rows in pg_subscription_rel yet (small DB copies instantly)
+            if ok_sync and not (sync_out or '').strip():
+                plog('  ✓ No pending tables (all synced instantly)')
+                break
+        else:
+            plog('  ⚠ Still syncing after 10 minutes — replication is running but slow')
+            plog('  → Check source disk I/O; consider monitoring lag and proceeding')
+
+        # Save state
+        settings_cur = load_settings()
+        mig2 = settings_cur.setdefault('authentik_migration', {})
+        mig2['replication_started'] = True
+        save_settings(settings_cur)
+
+        _ak_mig_status.update({'phase': 'monitoring', 'step': 3, 'running': False, 'error': None})
+        plog('')
+        plog('✓ Replication established — now monitoring lag')
+        plog('  Watch the lag counter below. When it reaches 0 bytes you can cut over.')
+        plog('  Normal writes from Authentik will continue replicating in real time.')
+
+    except Exception as e:
+        _ak_mig_plog(f'✗ Replication setup failed: {e}')
+        _ak_mig_status.update({'running': False, 'error': str(e)[:250]})
+
+
+# ── Step 5: Cutover (background) ─────────────────────────────────────────────
+
+def _run_ak_mig_cutover_bg(settings_snap):
+    plog = _ak_mig_plog
+    try:
+        _ak_mig_status.update({'phase': 'cutting_over', 'running': True, 'error': None, 'can_rollback': False})
+        src_cfg  = _ak_mig_src_cfg(settings_snap)
+        dst_cfg  = _ak_mig_dst_cfg(settings_snap)
+        pg_user  = _ak_mig_pg_user(settings_snap)
+        pg_pass  = _ak_mig_pg_pass(settings_snap)
+        dst_host = dst_cfg.get('host', '')
+
+        plog('━━━ Step 4: Cutover ━━━')
+        plog('⚠ Stopping source Authentik (server + worker)...')
+        plog('  PostgreSQL on source will keep running for replication catch-up')
+        _ak_mig_compose(src_cfg, 'stop server worker', timeout=60)
+        plog('  ✓ Source Authentik server and worker stopped')
+
+        # Wait for lag to drain to zero
+        plog('Waiting for replication lag to reach zero...')
+        ok_drain = False
+        for attempt in range(60):  # up to 5 minutes
+            time.sleep(5)
+            ok_lag, lag_out = _ak_mig_psql(src_cfg,
+                f"SELECT COALESCE((sent_lsn - replay_lsn)::bigint, -1) "
+                f"FROM pg_stat_replication WHERE application_name='{_AK_MIG_SUB}'",
+                settings=settings_snap)
+            lag_val = (lag_out or '').strip()
+            plog(f'  [{attempt*5}s] Lag: {lag_val} bytes')
+            try:
+                if int(lag_val) == 0:
+                    ok_drain = True
+                    break
+            except (ValueError, TypeError):
+                if not lag_val or lag_val == '-1':
+                    # No replication entry = already drained
+                    ok_drain = True
+                    break
+        if not ok_drain:
+            plog('  ⚠ Lag did not reach 0 in 5 minutes — proceeding anyway (last value may be acceptable)')
+        else:
+            plog('  ✓ Replication lag = 0 — data is fully in sync')
+
+        # Drop subscription on dest (makes it standalone)
+        plog(f'Dropping subscription on destination...')
+        ok_ds, ds_out = _ak_mig_psql(dst_cfg,
+            f'DROP SUBSCRIPTION IF EXISTS {_AK_MIG_SUB}', settings=settings_snap, timeout=30)
+        plog(f'  {"✓" if ok_ds else "⚠"} Subscription dropped: {(ds_out or "").strip()[:80]}')
+
+        # Drop publication on source
+        _ak_mig_psql(src_cfg, f'DROP PUBLICATION IF EXISTS {_AK_MIG_PUB}', settings=settings_snap)
+        plog('  ✓ Publication dropped on source')
+
+        # Revert port exposure on source if we added it
+        plog('Reverting source postgres port exposure (security cleanup)...')
+        try:
+            import yaml as _yaml
+            compose_src = (
+                open(os.path.expanduser('~/authentik/docker-compose.yml')).read()
+                if src_cfg.get('use_localhost')
+                else _ssh_probe(src_cfg, 'cat ~/authentik/docker-compose.yml', timeout=15)[1]
+            )
+            dc = _yaml.safe_load(compose_src)
+            pg_svc = dc.get('services', {}).get('postgresql', {})
+            ports  = [p for p in pg_svc.get('ports', []) if '5432' not in str(p)]
+            if len(ports) != len(pg_svc.get('ports', [])):
+                pg_svc['ports'] = ports
+                dc['services']['postgresql'] = pg_svc
+                new_compose = _yaml.dump(dc, default_flow_style=False)
+                if src_cfg.get('use_localhost'):
+                    open(os.path.expanduser('~/authentik/docker-compose.yml'), 'w').write(new_compose)
+                else:
+                    _ak_mig_write_file_remote(src_cfg, '~/authentik/docker-compose.yml', new_compose)
+                plog('  ✓ Source compose reverted (port 5432 un-exposed)')
+        except Exception as _pe:
+            plog(f'  ⚠ Could not revert port exposure: {_pe} (non-fatal)')
+
+        # Enable rollback from this point
+        _ak_mig_status['can_rollback'] = True
+
+        # Start full Authentik stack on destination
+        plog('Starting full Authentik stack on destination...')
+        ok_dst, dst_up = _ak_mig_compose(dst_cfg, 'up -d', timeout=120)
+        if not ok_dst:
+            plog(f'  ✗ Failed to start destination Authentik: {(dst_up or "")[:300]}')
+            plog('  → Manually run: cd ~/authentik && docker compose up -d  (or docker-compose up -d)')
+            plog('  → Use Rollback button if needed to restart source')
+            _ak_mig_status.update({'running': False, 'error': 'Failed to start destination Authentik stack'})
+            return
+        plog('  ✓ Destination stack starting...')
+
+        # Wait for Authentik API health on dest
+        plog('Waiting for destination Authentik to pass health check...')
+        import urllib.request as _ur
+        dst_url = f'http://{dst_host}:9090/-/health/ready/'
+        for attempt in range(40):
+            time.sleep(6)
+            try:
+                resp = _ur.urlopen(_ur.Request(dst_url), timeout=4)
+                if resp.status == 200:
+                    plog(f'  ✓ Destination Authentik health check passed (attempt {attempt+1})')
+                    break
+            except Exception:
+                plog(f'  [{attempt*6}s] Waiting...')
+        else:
+            plog('  ⚠ Health check timed out — stack may still be starting')
+            plog(f'  → Check: ssh root@dest "docker compose -f ~/authentik/docker-compose.yml logs server --tail=20"')
+
+        # Update infra-TAK settings to point at new Authentik host
+        plog(f'Updating infra-TAK settings to use destination Authentik ({dst_host})...')
+        try:
+            settings_cur = load_settings()
+            ak_dep = _get_module_deployment_config(settings_cur, 'authentik_deployment')
+            ak_dep['target_mode'] = 'remote'
+            ak_dep.setdefault('remote', {})['host'] = dst_host
+            # Preserve other SSH settings from dest config
+            for k in ('ssh_user', 'ssh_port', 'auth_method', 'ssh_key_path', 'ssh_password'):
+                dst_v = dst_cfg.get(k)
+                if dst_v:
+                    ak_dep['remote'][k] = dst_v
+            settings_cur = _set_module_deployment_config(settings_cur, 'authentik_deployment', ak_dep)
+            settings_cur.setdefault('authentik_migration', {})['done'] = True
+            save_settings(settings_cur)
+            plog('  ✓ Settings updated — infra-TAK now points at destination')
+        except Exception as _se:
+            plog(f'  ⚠ Could not update settings: {_se} — update manually in Settings > Authentik')
+
+        # Verify LDAP bind on new host
+        plog('Verifying LDAP bind via new host...')
+        ldap_pass = _get_authentik_env_value(settings_snap, 'AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD') or ''
+        if ldap_pass:
+            time.sleep(8)
+            ok_bind, bind_msg = _ensure_authentik_ldap_service_account()
+            if ok_bind:
+                plog(f'  ✓ LDAP bind verified on destination')
+            else:
+                plog(f'  ⚠ LDAP bind not yet verified ({bind_msg}) — may need a moment to start')
+                plog('  → Run "Resync LDAP" from the main Authentik section if login fails')
+        else:
+            plog('  (LDAP pass not in settings — skipping bind check)')
+
+        _ak_mig_status.update({'phase': 'done', 'step': 5, 'running': False,
+                                'complete': True, 'error': None, 'can_rollback': True})
+        plog('')
+        plog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+        plog('✓ Migration complete!')
+        plog(f'  Authentik is now running on {dst_host}')
+        plog('  Source Authentik (server + worker) is stopped — Postgres still running')
+        plog('  Once you confirm everything works: ssh source "cd ~/authentik && docker compose down"')
+        plog('━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━')
+
+    except Exception as e:
+        _ak_mig_plog(f'✗ Cutover failed: {e}')
+        _ak_mig_status.update({'running': False, 'error': str(e)[:250]})
+
+
+# ── Rollback (background) ─────────────────────────────────────────────────────
+
+def _run_ak_mig_rollback_bg(settings_snap):
+    plog = _ak_mig_plog
+    try:
+        _ak_mig_status.update({'phase': 'rolling_back', 'running': True, 'error': None})
+        src_cfg = _ak_mig_src_cfg(settings_snap)
+        dst_cfg = _ak_mig_dst_cfg(settings_snap)
+
+        plog('━━━ Rollback ━━━')
+        # Stop dest Authentik
+        plog('Stopping destination Authentik...')
+        _ak_mig_compose(dst_cfg, 'stop server worker ldap', timeout=60)
+        plog('  ✓ Destination Authentik stopped')
+
+        # Drop subscription/publication if still present
+        _ak_mig_psql(dst_cfg, f'DROP SUBSCRIPTION IF EXISTS {_AK_MIG_SUB}', settings=settings_snap)
+        _ak_mig_psql(src_cfg, f'DROP PUBLICATION IF EXISTS {_AK_MIG_PUB}', settings=settings_snap)
+        plog('  ✓ Replication objects cleaned up')
+
+        # Restart source Authentik
+        plog('Restarting source Authentik (server + worker)...')
+        ok_rb, rb_out = _ak_mig_compose(src_cfg, 'up -d', timeout=120)
+        if ok_rb:
+            plog('  ✓ Source Authentik restarted')
+        else:
+            plog(f'  ✗ Source restart failed: {(rb_out or "")[:300]}')
+            plog('  → Manual: ssh source "cd ~/authentik && docker compose up -d  (or docker-compose up -d)"')
+
+        # Revert infra-TAK settings back to source
+        try:
+            settings_cur = load_settings()
+            mig = settings_cur.get('authentik_migration') or {}
+            orig_mode = mig.get('orig_target_mode')
+            if orig_mode:
+                ak_dep = _get_module_deployment_config(settings_cur, 'authentik_deployment')
+                ak_dep['target_mode'] = orig_mode
+                settings_cur = _set_module_deployment_config(settings_cur, 'authentik_deployment', ak_dep)
+                save_settings(settings_cur)
+                plog('  ✓ Settings reverted to original Authentik host')
+        except Exception as _re:
+            plog(f'  ⚠ Could not revert settings: {_re}')
+
+        _ak_mig_status.update({'phase': 'rolled_back', 'running': False, 'error': None, 'can_rollback': False})
+        plog('')
+        plog('✓ Rollback complete — source Authentik is running again')
+
+    except Exception as e:
+        _ak_mig_plog(f'✗ Rollback error: {e}')
+        _ak_mig_status.update({'running': False, 'error': str(e)[:250]})
+
+
+# ── API routes ────────────────────────────────────────────────────────────────
+
+@app.route('/api/authentik/migration/config', methods=['GET', 'POST'])
+@login_required
+def ak_migration_config_api():
+    settings = load_settings()
+    if request.method == 'POST':
+        data = request.get_json() or {}
+        mig  = settings.setdefault('authentik_migration', {})
+        dst  = mig.setdefault('destination', {})
+        for k in ('host', 'ssh_user', 'ssh_port', 'auth_method', 'ssh_key_path', 'ssh_password'):
+            if k in data:
+                dst[k] = data[k]
+        # Snapshot original target mode for rollback
+        ak_cfg = _get_module_deployment_config(settings, 'authentik_deployment')
+        mig.setdefault('orig_target_mode', ak_cfg.get('target_mode', 'local'))
+        save_settings(settings)
+        return jsonify({'success': True})
+    mig = settings.get('authentik_migration') or {}
+    dst = mig.get('destination') or {}
+    return jsonify({'destination': dst, 'status': _ak_mig_status, 'prepared': mig.get('prepared', False)})
+
+
+@app.route('/api/authentik/migration/test', methods=['POST'])
+@login_required
+def ak_migration_test_api():
+    if _ak_mig_status.get('running'):
+        return jsonify({'success': False, 'error': 'Another migration operation is running'}), 409
+    settings = load_settings()
+    src_cfg  = _ak_mig_src_cfg(settings)
+    dst_cfg  = _ak_mig_dst_cfg(settings)
+    if not dst_cfg or not dst_cfg.get('host'):
+        return jsonify({'success': False, 'issues': ['Destination host not configured — save config first'], 'info': {}})
+    _ak_mig_log.clear()
+    _ak_mig_status.update({'phase': 'testing', 'running': False, 'error': None})
+    _ak_mig_plog('━━━ Step 1: Connectivity Test ━━━')
+    ok, issues, info = _run_ak_mig_test(src_cfg, dst_cfg, settings)
+    for iss in issues:
+        _ak_mig_plog(f'  ✗ {iss}')
+    for k, v in info.items():
+        _ak_mig_plog(f'  ✓ {k}: {v}')
+    if ok:
+        _ak_mig_status.update({'phase': 'tested', 'step': 1})
+        _ak_mig_plog('✓ All connectivity checks passed — ready to prepare destination')
+    else:
+        _ak_mig_status.update({'phase': 'idle', 'error': f'{len(issues)} check(s) failed'})
+        _ak_mig_plog(f'✗ {len(issues)} check(s) failed — resolve above issues and retest')
+    return jsonify({'success': ok, 'issues': issues, 'info': info})
+
+
+@app.route('/api/authentik/migration/prepare', methods=['POST'])
+@login_required
+def ak_migration_prepare_api():
+    if _ak_mig_status.get('running'):
+        return jsonify({'success': False, 'error': 'Another migration operation is running'}), 409
+    settings = load_settings()
+    dst_cfg  = _ak_mig_dst_cfg(settings)
+    if not dst_cfg.get('host'):
+        return jsonify({'success': False, 'error': 'Destination not configured'}), 400
+    threading.Thread(target=_run_ak_mig_prepare_bg, args=(dict(settings),), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/authentik/migration/start-replication', methods=['POST'])
+@login_required
+def ak_migration_replicate_api():
+    if _ak_mig_status.get('running'):
+        return jsonify({'success': False, 'error': 'Another migration operation is running'}), 409
+    if not (load_settings().get('authentik_migration') or {}).get('prepared'):
+        return jsonify({'success': False, 'error': 'Run Prepare Destination first'}), 400
+    threading.Thread(target=_run_ak_mig_replicate_bg, args=(dict(load_settings()),), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/authentik/migration/lag')
+@login_required
+def ak_migration_lag_api():
+    """Poll live replication lag from source pg_stat_replication."""
+    settings = load_settings()
+    src_cfg  = _ak_mig_src_cfg(settings)
+    ok, out  = _ak_mig_psql(src_cfg,
+        f"SELECT COALESCE((sent_lsn - replay_lsn)::bigint, -1) AS lag_bytes, "
+        f"write_lag::text, flush_lag::text, replay_lag::text "
+        f"FROM pg_stat_replication WHERE application_name='{_AK_MIG_SUB}'",
+        settings=settings, timeout=10)
+    if not ok:
+        return jsonify({'ok': False, 'error': (out or '')[:120]})
+    row = (out or '').strip()
+    lag_bytes = None
+    write_lag = flush_lag = replay_lag = None
+    try:
+        parts = [p.strip() for p in row.split('|')]
+        lag_bytes  = int(parts[0]) if parts else None
+        write_lag  = parts[1] if len(parts) > 1 else None
+        flush_lag  = parts[2] if len(parts) > 2 else None
+        replay_lag = parts[3] if len(parts) > 3 else None
+    except (ValueError, IndexError):
+        pass
+    ready = lag_bytes is not None and lag_bytes == 0
+    _ak_mig_status['lag_bytes'] = lag_bytes
+    _ak_mig_status['lag_ready'] = ready
+    return jsonify({'ok': True, 'lag_bytes': lag_bytes, 'write_lag': write_lag,
+                    'flush_lag': flush_lag, 'replay_lag': replay_lag, 'ready': ready})
+
+
+@app.route('/api/authentik/migration/cutover', methods=['POST'])
+@login_required
+def ak_migration_cutover_api():
+    if _ak_mig_status.get('running'):
+        return jsonify({'success': False, 'error': 'Another migration operation is running'}), 409
+    phase = _ak_mig_status.get('phase', '')
+    if phase not in ('monitoring', 'replicating'):
+        return jsonify({'success': False, 'error': f'Cannot cut over from phase "{phase}"'}), 400
+    threading.Thread(target=_run_ak_mig_cutover_bg, args=(dict(load_settings()),), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/authentik/migration/rollback', methods=['POST'])
+@login_required
+def ak_migration_rollback_api():
+    if _ak_mig_status.get('running'):
+        return jsonify({'success': False, 'error': 'Migration operation is running — wait for it to finish first'}), 409
+    if not _ak_mig_status.get('can_rollback'):
+        return jsonify({'success': False, 'error': 'Rollback not available in current phase'}), 400
+    threading.Thread(target=_run_ak_mig_rollback_bg, args=(dict(load_settings()),), daemon=True).start()
+    return jsonify({'success': True})
+
+
+@app.route('/api/authentik/migration/log')
+@login_required
+def ak_migration_log_api():
+    idx = int(request.args.get('index', 0))
+    return jsonify({
+        'entries':      _ak_mig_log[idx:],
+        'total':        len(_ak_mig_log),
+        'running':      _ak_mig_status.get('running', False),
+        'complete':     _ak_mig_status.get('complete', False),
+        'error':        _ak_mig_status.get('error'),
+        'phase':        _ak_mig_status.get('phase', 'idle'),
+        'step':         _ak_mig_status.get('step', 0),
+        'lag_ready':    _ak_mig_status.get('lag_ready', False),
+        'can_rollback': _ak_mig_status.get('can_rollback', False),
+    })
+
+
+@app.route('/api/authentik/migration/reset', methods=['POST'])
+@login_required
+def ak_migration_reset_api():
+    if _ak_mig_status.get('running'):
+        return jsonify({'success': False, 'error': 'Cannot reset while running'}), 409
+    _ak_mig_log.clear()
+    _ak_mig_status.update({'phase': 'idle', 'step': 0, 'running': False, 'complete': False,
+                            'error': None, 'lag_bytes': None, 'lag_ready': False, 'can_rollback': False})
+    settings = load_settings()
+    mig = settings.get('authentik_migration', {})
+    mig.pop('prepared', None)
+    mig.pop('replication_started', None)
+    mig.pop('src_host_for_replication', None)
+    settings['authentik_migration'] = mig
+    save_settings(settings)
+    return jsonify({'success': True})
+
+
+# ── Migration Wizard page ─────────────────────────────────────────────────────
+
+_AK_MIG_PAGE = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Authentik Migration Wizard</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+:root{
+  --bg:#0b0f17;--bg-card:#111827;--bg-surface:#1a2235;--border:#1e2d45;
+  --text:#f3f4f6;--text-secondary:#9ca3af;--text-dim:#6b7280;
+  --accent:#3b82f6;--cyan:#22d3ee;--green:#10b981;--red:#ef4444;--amber:#f59e0b;
+  --mono:'JetBrains Mono',monospace;
+}
+body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Arial,sans-serif;min-height:100vh;padding:24px 16px}
+a{color:var(--cyan);text-decoration:none}
+h1{font-size:22px;font-weight:700;margin-bottom:4px}
+.sub{font-size:13px;color:var(--text-secondary);margin-bottom:28px}
+.card{background:var(--bg-card);border:1px solid var(--border);border-radius:12px;padding:20px 24px;margin-bottom:20px}
+.card-title{font-size:13px;font-weight:700;letter-spacing:.06em;color:var(--text-secondary);text-transform:uppercase;margin-bottom:14px}
+label{display:block;font-size:12px;color:var(--text-secondary);margin-bottom:5px;margin-top:12px}
+label:first-child{margin-top:0}
+input,select{width:100%;padding:8px 12px;background:var(--bg-surface);border:1px solid var(--border);border-radius:7px;color:var(--text);font-size:13px;font-family:var(--mono);outline:none}
+input:focus,select:focus{border-color:var(--accent)}
+.row{display:flex;gap:12px;flex-wrap:wrap}
+.row>*{flex:1;min-width:160px}
+.btn{display:inline-flex;align-items:center;gap:6px;padding:9px 18px;border:none;border-radius:8px;font-size:13px;font-weight:600;cursor:pointer;font-family:inherit;transition:.15s}
+.btn-primary{background:linear-gradient(135deg,#1e40af,#0e7490);color:#fff}
+.btn-success{background:rgba(16,185,129,.2);color:var(--green);border:1px solid var(--border)}
+.btn-danger{background:rgba(239,68,68,.2);color:var(--red);border:1px solid var(--border)}
+.btn-ghost{background:rgba(255,255,255,.05);color:var(--text-secondary);border:1px solid var(--border)}
+.btn:disabled{opacity:.4;cursor:not-allowed}
+.btn-row{display:flex;flex-wrap:wrap;gap:10px;margin-top:16px;align-items:center}
+/* Steps */
+.steps{display:flex;gap:0;margin-bottom:28px;position:relative}
+.steps::before{content:'';position:absolute;top:18px;left:18px;right:18px;height:2px;background:var(--border);z-index:0}
+.step-item{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;position:relative;z-index:1}
+.step-dot{width:36px;height:36px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:13px;font-weight:700;border:2px solid var(--border);background:var(--bg);transition:.3s}
+.step-dot.active{background:var(--accent);border-color:var(--accent);color:#fff}
+.step-dot.done{background:var(--green);border-color:var(--green);color:#fff}
+.step-dot.error{background:var(--red);border-color:var(--red);color:#fff}
+.step-label{font-size:11px;color:var(--text-dim);text-align:center}
+/* Log */
+.log-box{background:#060a12;border:1px solid var(--border);border-radius:8px;padding:14px 16px;font-family:var(--mono);font-size:12px;line-height:1.6;color:#a3b3c9;max-height:400px;overflow-y:auto;white-space:pre-wrap;word-break:break-word}
+.log-box .ok{color:#34d399}
+.log-box .err{color:#f87171}
+.log-box .warn{color:#fbbf24}
+.log-box .section{color:#60a5fa;font-weight:700}
+/* Lag bar */
+.lag-bar-outer{width:100%;height:6px;background:rgba(59,130,246,.1);border-radius:3px;overflow:hidden;margin-top:8px}
+.lag-bar-inner{height:100%;border-radius:3px;background:linear-gradient(90deg,var(--accent),var(--cyan));transition:width .4s}
+.lag-val{font-family:var(--mono);font-size:22px;font-weight:700;color:var(--cyan)}
+.lag-label{font-size:12px;color:var(--text-secondary);margin-top:4px}
+.pill{display:inline-block;padding:2px 8px;border-radius:99px;font-size:11px;font-weight:600;font-family:var(--mono)}
+.pill-green{background:rgba(16,185,129,.15);color:var(--green);border:1px solid rgba(16,185,129,.3)}
+.pill-amber{background:rgba(245,158,11,.15);color:var(--amber);border:1px solid rgba(245,158,11,.3)}
+.pill-red{background:rgba(239,68,68,.15);color:var(--red);border:1px solid rgba(239,68,68,.3)}
+.pill-blue{background:rgba(59,130,246,.15);color:var(--accent);border:1px solid rgba(59,130,246,.3)}
+.alert{padding:12px 16px;border-radius:8px;font-size:13px;margin-bottom:14px}
+.alert-warn{background:rgba(245,158,11,.08);border:1px solid rgba(245,158,11,.3);color:var(--amber)}
+.alert-err{background:rgba(239,68,68,.08);border:1px solid rgba(239,68,68,.3);color:#f87171}
+.alert-ok{background:rgba(16,185,129,.08);border:1px solid rgba(16,185,129,.3);color:var(--green)}
+#back-link{font-size:13px;color:var(--text-secondary);margin-bottom:20px;display:inline-block}
+</style>
+</head>
+<body>
+<a href="/" id="back-link">← Back to console</a>
+<h1>Authentik Migration Wizard</h1>
+<p class="sub">Move a running Authentik instance to a new server with near-zero downtime using Postgres logical replication.</p>
+
+<!-- Step progress -->
+<div class="steps" id="steps-bar">
+  <div class="step-item"><div class="step-dot" id="sdot-1">1</div><div class="step-label">Configure</div></div>
+  <div class="step-item"><div class="step-dot" id="sdot-2">2</div><div class="step-label">Test</div></div>
+  <div class="step-item"><div class="step-dot" id="sdot-3">3</div><div class="step-label">Prepare</div></div>
+  <div class="step-item"><div class="step-dot" id="sdot-4">4</div><div class="step-label">Replicate</div></div>
+  <div class="step-item"><div class="step-dot" id="sdot-5">5</div><div class="step-label">Cut Over</div></div>
+</div>
+
+<!-- Step 1: Configure destination -->
+<div class="card" id="section-config">
+  <div class="card-title">Step 1 — Destination Server</div>
+  <div class="row">
+    <div>
+      <label>Hostname / IP</label>
+      <input type="text" id="dst-host" placeholder="192.168.1.50 or new-server.example.com">
+    </div>
+    <div style="flex:0 0 120px">
+      <label>SSH Port</label>
+      <input type="number" id="dst-port" value="22" min="1" max="65535" style="width:100%">
+    </div>
+    <div style="flex:0 0 140px">
+      <label>SSH User</label>
+      <input type="text" id="dst-user" value="root">
+    </div>
+  </div>
+  <div class="row" style="margin-top:12px">
+    <div>
+      <label>Auth Method</label>
+      <select id="dst-auth" onchange="toggleAuthFields()">
+        <option value="ssh_key">SSH Key</option>
+        <option value="password">Password</option>
+      </select>
+    </div>
+    <div id="dst-key-field">
+      <label>SSH Key Path</label>
+      <input type="text" id="dst-key-path" value="~/.ssh/id_rsa" placeholder="~/.ssh/id_rsa">
+    </div>
+    <div id="dst-pass-field" style="display:none">
+      <label>SSH Password</label>
+      <input type="password" id="dst-pass" placeholder="SSH password">
+    </div>
+  </div>
+  <div class="btn-row">
+    <button class="btn btn-primary" onclick="saveConfig()">Save &amp; Test Connectivity →</button>
+    <span id="config-msg" style="font-size:12px;color:var(--text-dim)"></span>
+  </div>
+</div>
+
+<!-- Step 2: Connectivity results -->
+<div class="card" id="section-test" style="display:none">
+  <div class="card-title">Step 2 — Connectivity Test</div>
+  <div id="test-results" style="font-family:var(--mono);font-size:12px;margin-bottom:14px"></div>
+  <div class="btn-row">
+    <button class="btn btn-primary" id="btn-prepare" onclick="startPrepare()" disabled>Prepare Destination →</button>
+    <button class="btn btn-ghost" onclick="retest()">Re-test</button>
+  </div>
+</div>
+
+<!-- Step 3/4: Prepare + Replicate log -->
+<div class="card" id="section-ops" style="display:none">
+  <div class="card-title" id="ops-title">Operation Log</div>
+  <div class="log-box" id="ops-log"></div>
+  <div id="ops-error" class="alert alert-err" style="margin-top:12px;display:none"></div>
+  <div class="btn-row" id="ops-btn-row">
+    <button class="btn btn-primary" id="btn-replicate" onclick="startReplication()" style="display:none">Start Replication →</button>
+    <button class="btn btn-primary" id="btn-cutover-go" onclick="showCutoverConfirm()" style="display:none" disabled>Cut Over to Destination →</button>
+    <span id="ops-msg" style="font-size:12px;color:var(--text-dim)"></span>
+  </div>
+</div>
+
+<!-- Lag monitor -->
+<div class="card" id="section-lag" style="display:none">
+  <div class="card-title">Replication Lag</div>
+  <div class="lag-val" id="lag-val">—</div>
+  <div class="lag-label">bytes behind source</div>
+  <div class="lag-bar-outer"><div class="lag-bar-inner" id="lag-bar" style="width:0%"></div></div>
+  <div style="margin-top:10px;font-size:12px;color:var(--text-dim);font-family:var(--mono)" id="lag-detail"></div>
+  <div id="lag-ready-badge" style="margin-top:10px;display:none">
+    <span class="pill pill-green">✓ Lag = 0 — ready to cut over</span>
+  </div>
+</div>
+
+<!-- Cutover confirmation modal -->
+<div id="cutover-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.8);z-index:100;display:none;align-items:center;justify-content:center">
+  <div class="card" style="width:460px;max-width:92vw;border-color:rgba(239,68,68,.4)">
+    <div class="card-title" style="color:var(--red)">Confirm Cutover</div>
+    <p style="font-size:13px;color:var(--text-secondary);margin-bottom:12px;line-height:1.6">
+      This will <strong>stop Authentik on the source server</strong> and start it on the destination.<br>
+      Users will experience a brief interruption (typically &lt; 30 seconds).
+    </p>
+    <div class="alert alert-warn" style="margin-bottom:12px">
+      ⚠ Make sure you have tested login on the destination via a different browser first, or rollback will be your only recovery option.
+    </div>
+    <div class="btn-row" style="justify-content:flex-end">
+      <button class="btn btn-ghost" onclick="hideCutoverConfirm()">Cancel</button>
+      <button class="btn btn-danger" onclick="startCutover()">Yes, Cut Over Now</button>
+    </div>
+  </div>
+</div>
+
+<!-- Rollback / reset -->
+<div class="card" id="section-rollback" style="display:none">
+  <div class="card-title" style="color:var(--amber)">Recovery Options</div>
+  <div style="font-size:13px;color:var(--text-secondary);margin-bottom:14px;line-height:1.6">
+    If the migration has not yet succeeded, you can roll back to restore the source Authentik.
+  </div>
+  <div class="btn-row">
+    <button class="btn btn-danger" id="btn-rollback" onclick="startRollback()">↩ Rollback to Source</button>
+    <button class="btn btn-ghost" onclick="resetWizard()">Reset Wizard</button>
+  </div>
+  <div id="rollback-msg" style="font-size:12px;color:var(--text-dim);margin-top:8px"></div>
+</div>
+
+<!-- Done banner -->
+<div class="alert alert-ok" id="section-done" style="display:none">
+  <strong>✓ Migration complete.</strong>
+  Authentik is now running on the destination server. Source Authentik server + worker are stopped (Postgres still running for safety).
+  Once you confirm everything is working: <code>ssh root@source "cd ~/authentik && docker compose down"</code>
+</div>
+
+<script>
+var _logIdx = 0;
+var _lagTimer = null;
+var _lagPeak = 0;
+
+function toggleAuthFields(){
+  var m = document.getElementById('dst-auth').value;
+  document.getElementById('dst-key-field').style.display = m === 'ssh_key' ? '' : 'none';
+  document.getElementById('dst-pass-field').style.display = m === 'password' ? '' : 'none';
+}
+
+function saveConfig(){
+  var host = document.getElementById('dst-host').value.trim();
+  if(!host){document.getElementById('config-msg').textContent='Hostname required';return;}
+  var payload = {
+    host: host,
+    ssh_port: parseInt(document.getElementById('dst-port').value)||22,
+    ssh_user: document.getElementById('dst-user').value.trim()||'root',
+    auth_method: document.getElementById('dst-auth').value,
+    ssh_key_path: document.getElementById('dst-key-path').value.trim(),
+    ssh_password: document.getElementById('dst-pass').value,
+  };
+  document.getElementById('config-msg').textContent = 'Saving...';
+  fetch('/api/authentik/migration/config',{method:'POST',credentials:'same-origin',
+    headers:{'Content-Type':'application/json'},body:JSON.stringify(payload)})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(d.success){
+      document.getElementById('config-msg').textContent = 'Saved';
+      runTest();
+    } else {
+      document.getElementById('config-msg').textContent = d.error||'Save failed';
+    }
+  }).catch(function(e){document.getElementById('config-msg').textContent='Error: '+e;});
+}
+
+function runTest(){
+  document.getElementById('section-test').style.display = '';
+  document.getElementById('test-results').innerHTML = '<span style="color:var(--text-dim)">Testing connectivity...</span>';
+  document.getElementById('btn-prepare').disabled = true;
+  updateStepDot(2,'active');
+  fetch('/api/authentik/migration/test',{method:'POST',credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    var html = '';
+    (d.issues||[]).forEach(function(iss){
+      html += '<div style="color:var(--red);margin-bottom:3px">✗ '+escHtml(iss)+'</div>';
+    });
+    Object.keys(d.info||{}).forEach(function(k){
+      html += '<div style="color:var(--green);margin-bottom:3px">✓ '+escHtml(k)+': '+escHtml(String(d.info[k]))+'</div>';
+    });
+    document.getElementById('test-results').innerHTML = html||'<span style="color:var(--text-dim)">No details</span>';
+    if(d.success){
+      document.getElementById('btn-prepare').disabled = false;
+      updateStepDot(2,'done');
+    } else {
+      updateStepDot(2,'error');
+    }
+  }).catch(function(e){
+    document.getElementById('test-results').innerHTML='<span style="color:var(--red)">Fetch error: '+escHtml(String(e))+'</span>';
+    updateStepDot(2,'error');
+  });
+}
+
+function retest(){runTest();}
+
+function startPrepare(){
+  document.getElementById('section-ops').style.display='';
+  document.getElementById('ops-title').textContent='Step 3 — Prepare Destination';
+  document.getElementById('btn-prepare').disabled=true;
+  document.getElementById('btn-replicate').style.display='none';
+  document.getElementById('section-rollback').style.display='';
+  updateStepDot(3,'active');
+  fetch('/api/authentik/migration/prepare',{method:'POST',credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(!d.success){showOpsError(d.error||'Start failed');}
+    else{startLogPoll('prepare');}
+  });
+}
+
+function startReplication(){
+  document.getElementById('btn-replicate').disabled=true;
+  document.getElementById('ops-title').textContent='Step 4 — Replication';
+  updateStepDot(4,'active');
+  fetch('/api/authentik/migration/start-replication',{method:'POST',credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(!d.success){showOpsError(d.error||'Start failed');}
+    else{startLogPoll('replicate');}
+  });
+}
+
+function startLogPoll(mode){
+  document.getElementById('ops-log').textContent='';
+  _logIdx=0;
+  pollLog(mode);
+}
+
+function pollLog(mode){
+  fetch('/api/authentik/migration/log?index='+_logIdx,{credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(d.entries&&d.entries.length){
+      var el=document.getElementById('ops-log');
+      d.entries.forEach(function(line){
+        var span=document.createElement('span');
+        if(line.indexOf('✓')!==-1||line.indexOf('━━━')!==-1) span.className='ok';
+        else if(line.indexOf('✗')!==-1) span.className='err';
+        else if(line.indexOf('⚠')!==-1) span.className='warn';
+        else if(line.indexOf('Step ')!==-1) span.className='section';
+        span.textContent=line+'\n';
+        el.appendChild(span);
+        el.scrollTop=el.scrollHeight;
+      });
+      _logIdx=d.total;
+    }
+    if(d.error){showOpsError(d.error);}
+    if(d.running){
+      setTimeout(function(){pollLog(mode);},800);
+      return;
+    }
+    // Phase transitions
+    var phase=d.phase||'';
+    if(mode==='prepare'){
+      if(phase==='prepared'){
+        updateStepDot(3,'done');
+        updateStepDot(4,'');
+        document.getElementById('btn-replicate').style.display='';
+        document.getElementById('btn-replicate').disabled=false;
+        document.getElementById('ops-msg').textContent='Destination ready — click Start Replication';
+      } else if(!d.running&&phase!=='preparing'){
+        updateStepDot(3,'error');
+      }
+    } else if(mode==='replicate'){
+      if(phase==='monitoring'){
+        updateStepDot(4,'done');
+        document.getElementById('section-lag').style.display='';
+        document.getElementById('btn-cutover-go').style.display='';
+        startLagPoll();
+        document.getElementById('ops-msg').textContent='Replication live — monitoring lag below';
+      } else if(!d.running&&phase!=='replicating'){
+        updateStepDot(4,'error');
+      }
+    } else if(mode==='cutover'){
+      if(phase==='done'){
+        updateStepDot(5,'done');
+        document.getElementById('section-done').style.display='';
+        document.getElementById('btn-cutover-go').disabled=false;
+        document.getElementById('btn-cutover-go').style.display='none';
+        stopLagPoll();
+      } else if(!d.running&&phase!=='cutting_over'){
+        updateStepDot(5,'error');
+        document.getElementById('btn-cutover-go').disabled=false;
+      }
+    } else if(mode==='rollback'){
+      document.getElementById('rollback-msg').textContent=
+        phase==='rolled_back'?'✓ Rolled back — source Authentik is running':'Rollback ended (check log)';
+    }
+  }).catch(function(e){
+    document.getElementById('ops-log').textContent+='[poll error: '+e+']\n';
+    setTimeout(function(){pollLog(mode);},3000);
+  });
+}
+
+function startLagPoll(){
+  _lagPeak=0;
+  pollLag();
+}
+function stopLagPoll(){if(_lagTimer){clearTimeout(_lagTimer);_lagTimer=null;}}
+function pollLag(){
+  fetch('/api/authentik/migration/lag',{credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(!d.ok){
+      document.getElementById('lag-val').textContent='?';
+      document.getElementById('lag-detail').textContent='Cannot reach source Postgres: '+(d.error||'');
+    } else {
+      var lb=d.lag_bytes;
+      if(lb===null||lb===-1){
+        document.getElementById('lag-val').textContent='?';
+        document.getElementById('lag-detail').textContent='No replication slot found — check subscription is running';
+      } else {
+        if(lb>_lagPeak)_lagPeak=lb;
+        document.getElementById('lag-val').textContent=fmtBytes(lb);
+        var pct=_lagPeak>0?Math.max(0,100-(lb/_lagPeak*100)):100;
+        document.getElementById('lag-bar').style.width=pct+'%';
+        document.getElementById('lag-detail').textContent=
+          'write_lag='+formatLag(d.write_lag)+' flush_lag='+formatLag(d.flush_lag)+' replay_lag='+formatLag(d.replay_lag);
+        var readyBadge=document.getElementById('lag-ready-badge');
+        var cutBtn=document.getElementById('btn-cutover-go');
+        if(d.ready){
+          readyBadge.style.display='';
+          cutBtn.disabled=false;
+          cutBtn.classList.add('btn-success');
+          cutBtn.classList.remove('btn-primary');
+        } else {
+          readyBadge.style.display='none';
+        }
+      }
+    }
+    _lagTimer=setTimeout(pollLag,4000);
+  }).catch(function(){_lagTimer=setTimeout(pollLag,6000);});
+}
+
+function fmtBytes(b){
+  if(b===0)return '0';
+  if(b<1024)return b+' B';
+  if(b<1048576)return (b/1024).toFixed(1)+' KB';
+  return (b/1048576).toFixed(1)+' MB';
+}
+function formatLag(v){return v&&v!=='null'&&v!=='None'?v:'0s';}
+function escHtml(s){
+  return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function showCutoverConfirm(){
+  document.getElementById('cutover-modal').style.display='flex';
+}
+function hideCutoverConfirm(){
+  document.getElementById('cutover-modal').style.display='none';
+}
+function startCutover(){
+  hideCutoverConfirm();
+  updateStepDot(5,'active');
+  document.getElementById('btn-cutover-go').disabled=true;
+  stopLagPoll();
+  document.getElementById('ops-title').textContent='Step 5 — Cut Over';
+  fetch('/api/authentik/migration/cutover',{method:'POST',credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(!d.success){
+      showOpsError(d.error||'Cutover start failed');
+      document.getElementById('btn-cutover-go').disabled=false;
+    } else {
+      startLogPoll('cutover');
+    }
+  });
+}
+
+function startRollback(){
+  document.getElementById('rollback-msg').textContent='Rolling back...';
+  fetch('/api/authentik/migration/rollback',{method:'POST',credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(!d.success){document.getElementById('rollback-msg').textContent=d.error||'Rollback failed';}
+    else{startLogPoll('rollback');}
+  });
+}
+
+function resetWizard(){
+  if(!confirm('Reset the wizard? This clears all progress.'))return;
+  fetch('/api/authentik/migration/reset',{method:'POST',credentials:'same-origin'})
+  .then(function(){location.reload();});
+}
+
+function showOpsError(msg){
+  var el=document.getElementById('ops-error');
+  el.style.display='';
+  el.textContent='Error: '+msg;
+}
+
+function updateStepDot(n,state){
+  var el=document.getElementById('sdot-'+n);
+  if(!el)return;
+  el.className='step-dot'+(state?' '+state:'');
+  if(state==='done')el.textContent='✓';
+  else el.textContent=n;
+}
+
+// On load: restore state
+(function init(){
+  fetch('/api/authentik/migration/config',{credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    var dst=d.destination||{};
+    if(dst.host)document.getElementById('dst-host').value=dst.host;
+    if(dst.ssh_port)document.getElementById('dst-port').value=dst.ssh_port;
+    if(dst.ssh_user)document.getElementById('dst-user').value=dst.ssh_user;
+    if(dst.auth_method){document.getElementById('dst-auth').value=dst.auth_method;toggleAuthFields();}
+    if(dst.ssh_key_path)document.getElementById('dst-key-path').value=dst.ssh_key_path;
+    var s=d.status||{};
+    var phase=s.phase||'idle';
+    // Restore UI to current phase
+    if(phase==='tested'||phase==='prepared'||phase==='monitoring'||phase==='done'){
+      updateStepDot(1,'done');updateStepDot(2,'done');
+      document.getElementById('section-test').style.display='';
+      document.getElementById('btn-prepare').disabled=(phase!=='tested');
+    }
+    if(phase==='prepared'||phase==='monitoring'||phase==='done'){
+      updateStepDot(3,'done');
+      document.getElementById('section-ops').style.display='';
+      document.getElementById('btn-replicate').style.display='';
+      document.getElementById('btn-replicate').disabled=(phase!=='prepared');
+      document.getElementById('section-rollback').style.display='';
+    }
+    if(phase==='monitoring'||phase==='done'){
+      updateStepDot(4,'done');
+      document.getElementById('section-lag').style.display='';
+      document.getElementById('btn-cutover-go').style.display='';
+      if(phase==='monitoring'){startLagPoll();}
+    }
+    if(phase==='done'){
+      updateStepDot(5,'done');
+      document.getElementById('section-done').style.display='';
+    }
+    if(phase==='error'||phase==='rolled_back'){
+      document.getElementById('section-rollback').style.display='';
+    }
+    if(s.running){startLogPoll('restore');}
+    if(s.can_rollback){document.getElementById('section-rollback').style.display='';}
+    // Load existing log
+    if(phase!=='idle'){
+      fetch('/api/authentik/migration/log?index=0',{credentials:'same-origin'})
+      .then(function(r){return r.json();})
+      .then(function(ld){
+        if(ld.entries&&ld.entries.length){
+          document.getElementById('section-ops').style.display='';
+          var el=document.getElementById('ops-log');
+          ld.entries.forEach(function(line){
+            var span=document.createElement('span');
+            if(line.indexOf('✓')!==-1||line.indexOf('━━━')!==-1)span.className='ok';
+            else if(line.indexOf('✗')!==-1)span.className='err';
+            else if(line.indexOf('⚠')!==-1)span.className='warn';
+            span.textContent=line+'\n';el.appendChild(span);
+          });
+          el.scrollTop=el.scrollHeight;
+          _logIdx=ld.total;
+        }
+      });
+    }
+  }).catch(function(){});
+})();
+</script>
+</body>
+</html>
+"""
+
+
+@app.route('/authentik/migration')
+@login_required
+def authentik_migration_page():
+    return render_template_string(_AK_MIG_PAGE)
+
+
 @app.route('/api/takserver/webadmin-password')
 @login_required
 def takserver_webadmin_password():
@@ -43534,7 +45068,12 @@ def takserver_ldap_drift_check():
                 with open(portal_env) as f:
                     for line in f:
                         if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
-                            env_pass = line.strip().split('=', 1)[1].strip()
+                            _v = line.strip().split('=', 1)[1].strip()
+                            if _v.startswith('"') and _v.endswith('"'):
+                                _v = _v[1:-1]
+                            elif _v.startswith("'") and _v.endswith("'"):
+                                _v = _v[1:-1]
+                            env_pass = _v
                             env_src = portal_env
                             break
             except Exception:
@@ -51271,6 +52810,7 @@ function takPurgeFailed(){
 <div style="margin-top:12px;display:flex;align-items:center;gap:12px;flex-wrap:wrap">
 <button type="button" id="resync-ldap-btn" onclick="resyncLdap()" style="padding:8px 16px;background:rgba(16,185,129,.2);color:var(--green);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Resync LDAP to TAK Server</button>
 <button type="button" id="sync-webadmin-btn" onclick="syncWebadmin()" style="padding:8px 16px;background:rgba(59,130,246,.2);color:var(--cyan);border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer">Sync webadmin to Authentik</button>
+<a href="/authentik/migration" style="padding:8px 16px;background:rgba(139,92,246,.15);color:#a78bfa;border:1px solid var(--border);border-radius:8px;font-family:'JetBrains Mono',monospace;font-size:12px;font-weight:600;cursor:pointer;text-decoration:none;display:inline-flex;align-items:center;gap:5px">↗ Migration Wizard</a>
 <span id="sync-webadmin-msg" style="font-size:12px;color:var(--text-dim)"></span><span id="resync-ldap-msg" style="font-size:12px;color:var(--text-dim)"></span>
 </div>
 <p style="font-size:11px;color:var(--text-dim);margin-top:6px;margin-bottom:4px"><strong>Resync LDAP</strong> — Re-runs the full flow (fix blueprint if needed, restart Authentik worker, ensure service account &amp; webadmin, sync CoreConfig). Use after pulling console updates or if QR/login fails.</p>

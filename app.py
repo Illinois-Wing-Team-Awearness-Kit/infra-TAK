@@ -44894,16 +44894,8 @@ function pollLag(){
         document.getElementById('lag-bar').style.width=pct+'%';
         document.getElementById('lag-detail').textContent=
           'write_lag='+formatLag(d.write_lag)+' flush_lag='+formatLag(d.flush_lag)+' replay_lag='+formatLag(d.replay_lag);
-        var readyBadge=document.getElementById('lag-ready-badge');
-        var cutBtn=document.getElementById('btn-cutover-go');
-        if(d.ready){
-          readyBadge.style.display='';
-          cutBtn.disabled=false;
-          cutBtn.classList.add('btn-success');
-          cutBtn.classList.remove('btn-primary');
-        } else {
-          readyBadge.style.display='none';
-        }
+        _lagReady = !!d.ready;
+        checkCutoverReady();
       }
     }
     _lagTimer=setTimeout(pollLag,4000);
@@ -44976,6 +44968,22 @@ function updateStepDot(n,state){
 }
 
 var _syncTimer = null;
+var _syncComplete = false;
+var _lagReady = false;
+function checkCutoverReady(){
+  var cutBtn=document.getElementById('btn-cutover-go');
+  var readyBadge=document.getElementById('lag-ready-badge');
+  if(_syncComplete && _lagReady){
+    cutBtn.disabled=false;
+    cutBtn.classList.add('btn-success');
+    cutBtn.classList.remove('btn-primary');
+    readyBadge.style.display='';
+  } else {
+    cutBtn.disabled=true;
+    cutBtn.classList.remove('btn-success');
+    cutBtn.classList.add('btn-primary');
+  }
+}
 function startSyncPoll(){
   document.getElementById('section-sync').style.display='';
   if(_syncTimer){clearTimeout(_syncTimer);_syncTimer=null;}
@@ -44998,10 +45006,12 @@ function pollSync(){
     document.getElementById('sync-detail').textContent=
       'ready: '+c.r+'  copying: '+c.d+'  initializing: '+c.i;
     if(d.complete){
+      _syncComplete = true;
       document.getElementById('sync-complete-badge').style.display='';
       document.getElementById('btn-speed-sync').disabled=true;
       document.getElementById('sync-speed-msg').textContent='';
       stopSyncPoll();
+      checkCutoverReady();
     } else {
       _syncTimer=setTimeout(pollSync,3000);
     }

@@ -4,8 +4,8 @@
 
 ## Current status
 
-- **Released (`main`):** `v0.9.4-alpha` (2026-05-08).
-- **In flight (`dev`):** `v0.9.5-alpha` — see `docs/PLAN-v0.9.5.md` and `activeContext.md`. Several commits already on `dev`; not yet tagged.
+- **Released (`main`):** `v0.9.41-alpha` (2026-05-28). Main tip: `2916efd`.
+- **In flight (`dev`):** `v0.9.42-alpha` complete — TAK Video Restreamer module. Ready for selective merge to `main`.
 
 ## What works (production-validated)
 
@@ -36,7 +36,7 @@
 
 ### TAK Server
 - `.deb` upload + deploy from browser.
-- CoreConfig.xml generated/patched automatically.
+- CoreConfig.xml generated/patched automatically. All password writes use `html.escape(pass, quote=True)` — safe for any character including `&`.
 - Cert chain (CA, server, admin, optional `nodered`) generated via `makeCert.sh`.
 - LDAP auth wiring (with optional flat-file fallback).
 - JVM heap tuning button (writes `-Xms`/`-Xmx` to `/opt/tak/setenv.sh`).
@@ -45,7 +45,7 @@
 - Plugins (v0.9.2): JAR + YAML upload, inline editor, restart banner.
 - Two-server topology (Server One = DB, Server Two = TAK).
 - External DB support (AWS RDS, Azure DB for PG, GCP Cloud SQL, etc.) — `docs/EXTERNAL-DB-SETUP.md`.
-- Snapshot upload progress bar (v0.9.5 in flight).
+  - **v0.9.41 hardening:** provision hard-fail on missing Azure extensions; deploy gate (provision + test connection must pass first); SchemaManager cwd fix (`cd /opt/tak`); uninstall cleans local PG side-effect; XML-escape password in CoreConfig.xml.
 
 ### TAK Portal
 - Auto-configured `settings.json` (Authentik URL/token, TAK Server connection).
@@ -80,6 +80,17 @@
 - Compose-driven deploy with Authentik forward auth options.
 - RTSP fail2ban jail with watching panel + manual ban (v0.9.4).
 - Pill-style UI on the console.
+- Mutually exclusive with TAK Video Restreamer (same streaming ports). Marketplace blocks both ways.
+
+### TAK Video Restreamer (v0.9.42)
+- Docker-based deploy from Marketplace. Clones `raytheonbbn/tak-video-restreamer`, builds image, starts container.
+- Host port **3100** → container port 3000 (TAK Portal owns 3000).
+- Caddy at `stream.<FQDN>` — same subdomain as MediaMTX (mutually exclusive, can't conflict).
+- Own Flask login (admin / generated password). No Authentik SSO — TVR has built-in auth.
+- Change password from UI: patches `ADMIN_PASSWORD` in docker-compose.yml, `docker compose up -d` (no rebuild).
+- Guard Dog: `tvr_http` monitor on `GET /login` port 3100.
+- Update Now: `git pull --ff-only` + `docker compose up -d --build` with live log.
+- Console card: name, git SHA version, update badge vs upstream main.
 
 ### Federation Hub
 - Local deployment (v0.9.4) — same machine as console, no SSH.
@@ -149,10 +160,11 @@
 - `tak-10` (SSDNodes, single-server) — primary maintainer test VPS, tracks `dev`. ✅
 - `responder` (busy, Mission API / DataSync load) — secondary test VPS. ✅
 - `tak-test-3` (Azure D8as_v5, P10 64 GiB OS disk, ~145 MB/s sync write) — Azure NAT validation done in v0.8.6. ✅
+- `tak-test-8` (`20.228.119.196`, Azure VM + Azure PostgreSQL Flexible Server PG 18.3) — External DB full deploy validated in v0.9.41 (2026-05-28). ✅
 - DigitalOcean fast-disk VPS — clean baseline. ✅
 - Various `ssdnodes` slow-disk VPS — caught the v0.8.8 LDAP recursion and v0.8.x Authentik tunings.
 
 ## Pending validation
 
-- v0.9.5 changes on `tak-10` (just pulled `dev` and restarted the console; next "Update Now" or restart will fire the v0.9.5 migrations).
 - Phase 0 flat-file spike (six curl tests) — never run.
+- Azure External DB on PostgreSQL 15 (tak-test-8 used PG 18.3; recommend PG 15 for production).

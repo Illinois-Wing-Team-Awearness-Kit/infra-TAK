@@ -75,6 +75,7 @@ The list lives in `start.sh` (apt + pip) — no `requirements.txt` is committed 
 | Authentik | `9443` | HTTPS | Direct, rarely needed |
 | LDAP outpost | `389` / `636` | TCP | TAK Server uses for auth |
 | TAK Portal | `3000` | HTTP | Proxied via Caddy |
+| TAK Video Restreamer | `3100` | HTTP | Flask web UI — loopback only, proxied via Caddy at `stream.<FQDN>` |
 | Email Relay | `25` | SMTP | localhost only |
 | Node-RED | `1880` | HTTP | Proxied via Caddy on FQDN, direct on IP-mode |
 | MediaMTX | `8554` / `8889` / `5080` | RTSP / WebRTC+HLS / HTTP | Editor on `:5080` |
@@ -93,7 +94,105 @@ The list lives in `start.sh` (apt + pip) — no `requirements.txt` is committed 
 - **VPS — `tak-10` (`172.93.50.47`):** maintainer's primary test box. SSDNodes. Tracks `dev` branch. Repo at `/home/takwerx/infra-TAK` — **BUT NEVER HARDCODE THIS PATH**. Always resolve via `grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service`. Pull command: `cd $(grep -oP 'WorkingDirectory=\K.*' /etc/systemd/system/takwerx-console.service) && git fetch origin dev && git checkout -B dev origin/dev && sudo systemctl restart takwerx-console`. Configurator at `http://172.93.50.47:1880/configurator`.
 - **VPS — `responder`:** secondary test box, busier (Mission API / DataSync load) — used for spiral-detection / load testing.
 - **Azure / AWS test boxes:** spun up ad hoc for fresh-install validation, especially around NAT (`start.sh` shows public IP via `curl api.ipify.org`) and slow disks.
+- **Azure — `tak-test-7` (`104.42.50.111`, West US):** Azure VM for External DB / Azure PostgreSQL Flexible Server validation. SSH config: `Host tak-test-7 / HostName 104.42.50.111 / User takwerx / IdentityFile ~/.ssh/tak-test7_key.pem`. External DB: `tak-test7-db.postgres.database.azure.com`, admin user `pgadmin`. The paired Azure PostgreSQL Flexible Server lives in the same VNet, West US region.
+- **Azure — `tak-test-8` (`20.228.119.196`, East US):** Azure VM used for v0.9.41 External DB hardening validation. SSH config: `Host tak-test-8 / HostName 20.228.119.196 / User takwerx / IdentityFile ~/.ssh/tak-test-8_key.pem`. External DB: `tak-test-8-db.postgres.database.azure.com`, admin user `pgadmin`. PostgreSQL Flexible Server PG **18.3** (note: PG 15 recommended for production — 18.3 is outside TAK Server 5.7's tested envelope; Flyway warns but migrations apply).
 - Maintainer dev machine: macOS (this workspace is `/Users/andreasjohansson/GitHub/infra-TAK`). Code is edited locally, pushed to `dev`, pulled on VPS.
+
+---
+
+## Azure deployment guide (External DB / PostgreSQL Flexible Server)
+
+Field-validated on `tak-test-7` (v0.9.40, 2026-05-26) and `tak-test-8` (v0.9.41, 2026-05-28). All lessons below are hard-won from live debugging.
+
+### VNet / Subnet layout
+
+Azure PostgreSQL Flexible Server with VNet integration requires a **dedicated delegated subnet** — no other resources can live in it. Plan two subnets when creating the VNet:
+
+| Subnet | Purpose | Recommended CIDR |
+|---|---|---|
+| `default` (or `vm-subnet`) | TAK Server VM | `10.0.0.0/24` |
+| `postgres-subnet` | PostgreSQL Flexible Server only | `10.0.1.0/28` (min) or `/24` |
+| VNet address space | Covers both | `10.0.0.0/16` |
+
+**Create both subnets upfront** before deploying anything. The `/28` minimum is what Azure requires for the delegated subnet (16 addresses; Azure uses ~5). During DB creation the wizard picks the `postgres-subnet` and delegates it to `Microsoft.DBforPostgreSQL/flexibleServers`.
+
+**Region must match.** VM and PostgreSQL Flexible Server must be in the same Azure region. Mixed regions (e.g. West US 2 VM + West US DB) fail at VNet integration. Use West US consistently (West US 2 has SKU restrictions on some subscription tiers).
+
+### NSG (Network Security Group)
+
+Use the ARM template at `docs/azure-nsg-infra-tak.json`. Deploy it via Azure Portal → Deploy a custom template → Build your own template → paste/upload the file. Set:
+- `adminSourceIP`: your public IP (NOT `*` — scope it)
+- `location`: match your VM's region exactly (e.g. `westus`, not `West US`)
+
+The `location` field must be the programmatic name, not the display name. This trips people up — if the template deploys but rules don't appear, the location mismatch silently succeeds without applying rules.
+
+### PostgreSQL Flexible Server setup (Azure Portal)
+
+1. **Create server** in the same region as the VM. Pick the dedicated `postgres-subnet` for VNet integration — private access only (no public endpoint needed).
+2. **Admin login**: use `pgadmin` (not `postgres`; Azure reserves `postgres` as a system user). Set a strong password. Note it — infra-TAK will need it.
+3. **Server parameters → `azure.extensions`**: add all 5 required extensions BEFORE provisioning from infra-TAK:
+   ```
+   FUZZYSTRMATCH, POSTGIS, POSTGIS_TOPOLOGY, ADDRESS_STANDARDIZER, PGCRYPTO
+   ```
+   These must be whitelisted here or TAK Server's SchemaManager will fail with `ERROR: extension "..." is not allow-listed` during deploy. infra-TAK's provisioner pre-creates them as admin, but Azure must whitelist them first.
+4. **No public access needed.** The VM and DB are in the same VNet — all traffic is private.
+
+### infra-TAK External DB deploy flow (v0.9.41+)
+
+**Required sequence — enforced by UI gates since v0.9.41:**
+
+1. **Save Config** — enter:
+   - Host: `<server-name>.postgres.database.azure.com`
+   - Database: `cot` (infra-TAK creates this)
+   - Admin username: `pgadmin` (the Azure admin, NOT `martiuser`)
+   - Admin password: the pgadmin password set at server creation
+2. **Provision Database** — does all of this automatically:
+   - Connects to `postgres` system database (not `cot`) as admin
+   - Creates the `cot` database if it doesn't exist
+   - Creates the `martiuser` app user with a generated password
+   - Grants `azure_pg_admin` to `martiuser` (required — without this, extension creation fails)
+   - Pre-creates all 5 extensions (`fuzzystrmatch`, `postgis`, `postgis_topology`, `address_standardizer`, `pgcrypto`) as admin
+   - Grants `martiuser` full privileges on `cot`
+   - **Hard-fails if any extension can't be created** (Azure extension whitelist not set) — returns `success: false` with portal instructions. Step cannot be skipped.
+3. **Test Connection** — must show `[OK]` for TCP, pg_isready, auth, and Azure extensions. Sets `window._edbTestAllOk = true` on the frontend. **Deploy button is blocked until this passes.**
+4. **Deploy TAK Server** — backend also gates: blocks deploy if no host or no martiuser password stored. Proceeds normally using `martiuser` credentials stored from provisioning.
+
+**Password / XML safety (v0.9.41):** Generated passwords no longer contain `&`. All CoreConfig.xml writes use `html.escape(password, quote=True)` — safe for any password including those with `&`, `<`, `>`, `"`. TAK Server's XML parser unescapes at read time, so the correct password reaches PostgreSQL. Pre-v0.9.41: passwords with `&` produced malformed XML → config service crash → WebGUI inaccessible (~1-in-3 deploys).
+
+**SchemaManager (v0.9.41):** Always runs with `cd /opt/tak && java -jar ...`. SchemaManager does NOT accept JDBC CLI arguments — it reads `CoreConfig.xml` from the working directory. Running without the `cd` caused it to fall back to `CoreConfig.example.xml` (pointing at `127.0.0.1`) and write schema to local PG instead of the Azure RDS.
+
+**Uninstall behavior (v0.9.41+):** Removing TAK Server in external_db mode drops the remote `cot` database, clears the saved host/password from settings, AND drops the local `cot` DB + `martiuser` left by the `.deb` postinstall side effect — giving a clean slate for re-deploy.
+
+**PostgreSQL version:** Use **PG 15** for production Azure Flexible Server deployments. TAK Server 5.7's bundled Flyway is tested against PG 15. PG 18 (Azure default) triggers Flyway version warnings but migrations apply; production behavior with PG 18 is untested beyond the schema migration step.
+
+### Chrome autofill on Azure Portal
+
+Azure Portal fields (especially username/password) get aggressively autofilled by Chrome. To disable for a session: Chrome Settings → Autofill and passwords → Password Manager → turn off "Offer to save passwords." Alternatively use an incognito window.
+
+### CloudTAK first-time setup (Azure context)
+
+After deploying CloudTAK on an Azure-hosted TAK Server:
+
+1. In TAK Portal: create user `cloudtakadmin` — regular user (not admin), assign to an agency + at least one group, set a password. TAK Portal appends an org suffix, so the actual username becomes `cloudtakadmin-orgname`. Note this suffix.
+2. Go to TAK Portal → Certificates → find and download `user.p12`. Note the cert password (shown on the Certificates page near the cert file).
+3. Open `cloudtak.<fqdn>` → Setup page. If it doesn't appear, force-reload: `Cmd+Shift+R` (Mac) / `Ctrl+Shift+R` (Windows).
+   - TAK Server address: `takserver.<fqdn>` (NOT `map.<fqdn>`)
+   - Username: `cloudtakadmin-orgname` (include the suffix)
+   - Password: the password set in step 1
+   - Upload `user.p12` and enter the cert password
+4. CloudTAK saves and resets. Subsequent users log in with username + password only — no `.p12` required after bootstrap.
+
+### SSH config snippet (for `~/.ssh/config` on any dev machine)
+
+```
+Host tak-test-7
+    HostName 104.42.50.111
+    User takwerx
+    IdentityFile ~/.ssh/tak-test7_key.pem
+    ServerAliveInterval 60
+```
+
+The `.pem` key is downloaded from Azure during VM creation. Store it in `~/.ssh/` with `chmod 600`.
 
 ## Constraints
 

@@ -1,0 +1,15 @@
+[Unit]
+Description=TAK-Esri — ArcGIS Feature Layer append loop (conda env)
+After=network.target
+
+[Service]
+ExecStart=/root/miniconda/bin/conda run --no-capture-output -n arcgis_env python /opt/TAK-Esri/ArcGIS/append.py
+WorkingDirectory=/opt/TAK-Esri/ArcGIS
+StandardOutput=journal
+StandardError=journal
+Restart=on-failure
+RestartSec=30
+User=root
+
+[Install]
+WantedBy=multi-user.target

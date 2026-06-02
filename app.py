@@ -43849,7 +43849,7 @@ def _run_ak_mig_replicate_bg(settings_snap):
         for poll in range(120):  # up to 10 minutes
             time.sleep(5)
             ok_sync, sync_out = _ak_mig_psql(dst_cfg,
-                "SELECT count(*), string_agg(DISTINCT srstate::text, ',') "
+                "SELECT count(*), string_agg(DISTINCT srsubstate::text, ',') "
                 "FROM pg_subscription_rel",
                 settings=settings_snap)
             plog(f'  [{poll*5}s] Sync state: {(sync_out or "").strip()[:80]}')

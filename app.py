@@ -43648,24 +43648,34 @@ def _run_ak_mig_prepare_bg(settings_snap):
         port_ok = 'EXIT:0' in (nc_out or '') or 'succeeded' in (nc_out or '') or 'open' in (nc_out or '').lower()
 
         if not port_ok:
-            plog(f'  Port 5432 not reachable at {src_host} — exposing port via docker network publish...')
+            plog(f'  Port 5432 not reachable at {src_host} — checking source compose for port mapping...')
             plog('  ⚠ This exposes Postgres port on source host — only the destination IP is allowed by pg_hba')
-            # Check if port is already declared in compose before trying to patch
+            # Grep specifically for a port-mapping line (e.g. "5432:5432"), not env vars
             _cmp_check_ok, _cmp_check_out = _ssh_probe(src_cfg,
-                'grep -c "5432" $HOME/authentik/docker-compose.yml 2>/dev/null || echo 0', timeout=10)
+                r"grep -cE '^\s*-\s*[\"'"'"']?5432:5432' $HOME/authentik/docker-compose.yml 2>/dev/null || echo 0",
+                timeout=10)
             _port_in_compose = _cmp_check_ok and (_cmp_check_out or '0').strip() not in ('0', '')
             if not _port_in_compose:
-                # Use sed to append ports section — works without yaml module
-                _patch_cmd = (
-                    r"sed -i '/^  postgresql:/,/^  [a-z]/{/^  postgresql:/a\    ports:\n      - \"5432:5432\"' "
-                    r"$HOME/authentik/docker-compose.yml 2>/dev/null || true"
+                plog('  Port 5432 not mapped — patching source compose with python3...')
+                # Use python3 (stdlib only, no yaml) to add the port mapping
+                _py_patch = (
+                    "python3 -c \""
+                    "import re, sys; "
+                    "f = open(sys.argv[1]); txt = f.read(); f.close(); "
+                    "patched = re.sub(r'( {2}postgresql:)', r'\\\\1\\n    ports:\\n      - \\\"5432:5432\\\"', txt, count=1) "
+                    "if '5432:5432' not in txt else txt; "
+                    "open(sys.argv[1], 'w').write(patched); "
+                    "print('patched' if '5432:5432' in patched else 'no-change')"
+                    "\" $HOME/authentik/docker-compose.yml"
                 )
-                _ssh_probe(src_cfg, _patch_cmd, timeout=10)
+                _pk_ok, _pk_out = _ssh_probe(src_cfg, _py_patch, timeout=15)
+                plog(f'  Compose patch result: {(_pk_out or "").strip()[:80]}')
                 _ak_mig_compose(src_cfg, 'up -d postgresql', timeout=90)
-                plog('  Source compose patched (ports: 5432:5432), Postgres restarted')
+                plog('  Source PostgreSQL restarted with port 5432 published')
                 time.sleep(6)
             else:
-                plog('  Port 5432 already in compose — may be blocked by firewall')
+                plog('  Port 5432:5432 mapping already in compose — port may be blocked by firewall')
+                plog(f'  → On source server run: ufw allow from {dst_host} to any port 5432')
 
             ok_nc2, nc_out2 = _ssh_probe(dst_cfg,
                 f'nc -zv {src_host} 5432 2>&1 | head -2; echo "EXIT:$?"', timeout=15)

@@ -43340,7 +43340,12 @@ def takserver_ldap_drift_check():
                 with open(portal_env) as f:
                     for line in f:
                         if line.strip().startswith('AUTHENTIK_BOOTSTRAP_LDAPSERVICE_PASSWORD='):
-                            env_pass = line.strip().split('=', 1)[1].strip()
+                            _v = line.strip().split('=', 1)[1].strip()
+                            if _v.startswith('"') and _v.endswith('"'):
+                                _v = _v[1:-1]
+                            elif _v.startswith("'") and _v.endswith("'"):
+                                _v = _v[1:-1]
+                            env_pass = _v
                             env_src = portal_env
                             break
             except Exception:

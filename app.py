@@ -43845,24 +43845,25 @@ def _run_ak_mig_replicate_bg(settings_snap):
         plog(f'  ✓ Subscription "{_AK_MIG_SUB}" created — initial table copy starting')
 
         # ── 5. Monitor initial sync ───────────────────────────────────────────
-        plog('Monitoring initial table sync (this may take a few minutes)...')
-        for poll in range(120):  # up to 10 minutes
+        plog('Monitoring initial table sync (this may take several minutes for large databases)...')
+        plog('  States: i=initializing  d=copying data  r=ready (synced)')
+        for poll in range(240):  # up to 20 minutes
             time.sleep(5)
             ok_sync, sync_out = _ak_mig_psql(dst_cfg,
-                "SELECT count(*), string_agg(DISTINCT srsubstate::text, ',') "
-                "FROM pg_subscription_rel",
+                "SELECT string_agg(srsubstate::text || ':' || cnt::text, '  ' ORDER BY srsubstate) "
+                "FROM (SELECT srsubstate, count(*) AS cnt FROM pg_subscription_rel GROUP BY srsubstate) t",
                 settings=settings_snap)
-            plog(f'  [{poll*5}s] Sync state: {(sync_out or "").strip()[:80]}')
-            # All tables in state 'r' (ready) = initial copy complete
-            if ok_sync and 'r' in (sync_out or '') and 'd' not in (sync_out or '') and 'i' not in (sync_out or ''):
+            state_str = (sync_out or '').strip()
+            all_ready = ok_sync and state_str and 'd' not in state_str and 'i' not in state_str
+            plog(f'  [{poll*5}s] {state_str or "(no rows — all synced)"}')
+            if all_ready:
                 plog('  ✓ All tables synced (initial copy complete)')
                 break
-            # Also accept: no rows in pg_subscription_rel yet (small DB copies instantly)
-            if ok_sync and not (sync_out or '').strip():
+            if ok_sync and not state_str:
                 plog('  ✓ No pending tables (all synced instantly)')
                 break
         else:
-            plog('  ⚠ Still syncing after 10 minutes — replication is running but slow')
+            plog('  ⚠ Still syncing after 20 minutes — replication is running but slow')
             plog('  → Check source disk I/O; consider monitoring lag and proceeding')
 
         # Save state

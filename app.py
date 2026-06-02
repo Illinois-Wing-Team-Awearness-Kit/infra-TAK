@@ -44219,6 +44219,50 @@ def ak_migration_lag_api():
                     'flush_lag': flush_lag, 'replay_lag': replay_lag, 'ready': ready})
 
 
+@app.route('/api/authentik/migration/sync-status')
+@login_required
+def ak_migration_sync_status_api():
+    """Return pg_subscription_rel state counts from destination."""
+    settings = load_settings()
+    dst_cfg = _ak_mig_dst_cfg(settings)
+    ok, out = _ak_mig_psql(dst_cfg,
+        'SELECT srsubstate, count(*) FROM pg_subscription_rel GROUP BY srsubstate',
+        settings=settings, timeout=15)
+    if not ok:
+        return jsonify({'ok': False, 'error': (out or '')[:200]})
+    counts = {'r': 0, 'd': 0, 'i': 0}
+    for line in (out or '').splitlines():
+        if '|' in line:
+            parts = line.split('|')
+            if len(parts) == 2:
+                state = parts[0].strip()
+                try:
+                    cnt = int(parts[1].strip())
+                    if state in counts:
+                        counts[state] = cnt
+                except ValueError:
+                    pass
+    total = sum(counts.values())
+    complete = total > 0 and counts['d'] == 0 and counts['i'] == 0
+    return jsonify({'ok': True, 'counts': counts, 'total': total, 'complete': complete})
+
+
+@app.route('/api/authentik/migration/speed-sync', methods=['POST'])
+@login_required
+def ak_migration_speed_sync_api():
+    """Set max_sync_workers_per_subscription=6 on destination and reload config."""
+    settings = load_settings()
+    dst_cfg = _ak_mig_dst_cfg(settings)
+    ok1, e1 = _ak_mig_psql(dst_cfg,
+        'ALTER SYSTEM SET max_sync_workers_per_subscription = 6',
+        db='postgres', settings=settings, timeout=10)
+    if not ok1:
+        return jsonify({'success': False, 'error': (e1 or '')[:200]})
+    ok2, e2 = _ak_mig_psql(dst_cfg, 'SELECT pg_reload_conf()',
+        db='postgres', settings=settings, timeout=10)
+    return jsonify({'success': ok2, 'error': (e2 or '')[:200] if not ok2 else None})
+
+
 @app.route('/api/authentik/migration/cutover', methods=['POST'])
 @login_required
 def ak_migration_cutover_api():
@@ -44539,6 +44583,28 @@ input:focus,select:focus{border-color:var(--accent)}
   </div>
 </div>
 
+<!-- Sync progress panel -->
+<div class="card" id="section-sync" style="display:none">
+  <div class="card-title">Initial Table Copy</div>
+  <div style="display:flex;align-items:center;gap:20px;flex-wrap:wrap">
+    <div style="text-align:center;min-width:90px">
+      <div class="lag-val" id="sync-pct">—</div>
+      <div class="lag-label">tables ready</div>
+    </div>
+    <div style="flex:1;min-width:200px">
+      <div class="lag-bar-outer"><div class="lag-bar-inner" id="sync-bar" style="width:0%;background:linear-gradient(90deg,var(--green),var(--cyan))"></div></div>
+      <div style="font-family:var(--mono);font-size:12px;color:var(--text-dim);margin-top:8px" id="sync-detail">—</div>
+    </div>
+  </div>
+  <div id="sync-complete-badge" style="display:none;margin-top:10px">
+    <span class="pill pill-green">✓ All tables synced — replication is live</span>
+  </div>
+  <div class="btn-row" style="margin-top:14px">
+    <button class="btn btn-ghost" id="btn-speed-sync" onclick="speedUpSync()">⚡ Speed Up (6 workers)</button>
+    <span id="sync-speed-msg" style="font-size:12px;color:var(--text-dim)"></span>
+  </div>
+</div>
+
 <!-- Lag monitor -->
 <div class="card" id="section-lag" style="display:none">
   <div class="card-title">Replication Lag</div>
@@ -44778,6 +44844,7 @@ function pollLog(mode){
         document.getElementById('section-lag').style.display='';
         document.getElementById('btn-cutover-go').style.display='';
         startLagPoll();
+        startSyncPoll();
         document.getElementById('ops-msg').textContent='Replication live — monitoring lag below';
       } else if(!d.running&&phase!=='replicating'){
         updateStepDot(4,'error');
@@ -44908,6 +44975,57 @@ function updateStepDot(n,state){
   else el.textContent=n;
 }
 
+var _syncTimer = null;
+function startSyncPoll(){
+  document.getElementById('section-sync').style.display='';
+  if(_syncTimer){clearTimeout(_syncTimer);_syncTimer=null;}
+  pollSync();
+}
+function stopSyncPoll(){if(_syncTimer){clearTimeout(_syncTimer);_syncTimer=null;}}
+function pollSync(){
+  fetch('/api/authentik/migration/sync-status',{credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(!d.ok){
+      document.getElementById('sync-detail').textContent='Error reading sync state: '+(d.error||'');
+      _syncTimer=setTimeout(pollSync,8000);
+      return;
+    }
+    var c=d.counts; var total=d.total;
+    var pct=total>0?Math.round(c.r/total*100):0;
+    document.getElementById('sync-pct').textContent=c.r+'/'+total;
+    document.getElementById('sync-bar').style.width=pct+'%';
+    document.getElementById('sync-detail').textContent=
+      'ready: '+c.r+'  copying: '+c.d+'  initializing: '+c.i;
+    if(d.complete){
+      document.getElementById('sync-complete-badge').style.display='';
+      document.getElementById('btn-speed-sync').disabled=true;
+      document.getElementById('sync-speed-msg').textContent='';
+      stopSyncPoll();
+    } else {
+      _syncTimer=setTimeout(pollSync,3000);
+    }
+  }).catch(function(){_syncTimer=setTimeout(pollSync,8000);});
+}
+function speedUpSync(){
+  var msg=document.getElementById('sync-speed-msg');
+  var btn=document.getElementById('btn-speed-sync');
+  btn.disabled=true; msg.textContent='Applying...'; msg.style.color='var(--text-dim)';
+  fetch('/api/authentik/migration/speed-sync',{method:'POST',credentials:'same-origin'})
+  .then(function(r){return r.json();})
+  .then(function(d){
+    if(d.success){
+      msg.textContent='✓ 6 workers active'; msg.style.color='var(--green)';
+    } else {
+      msg.textContent='✗ '+(d.error||'Failed'); msg.style.color='var(--red)';
+      btn.disabled=false;
+    }
+  }).catch(function(e){
+    msg.textContent='Error: '+e; msg.style.color='var(--red)';
+    btn.disabled=false;
+  });
+}
+
 // On load: restore state
 (function init(){
   fetch('/api/authentik/migration/config',{credentials:'same-origin'})
@@ -44938,7 +45056,8 @@ function updateStepDot(n,state){
       updateStepDot(4,'done');
       document.getElementById('section-lag').style.display='';
       document.getElementById('btn-cutover-go').style.display='';
-      if(phase==='monitoring'){startLagPoll();}
+      document.getElementById('section-sync').style.display='';
+      if(phase==='monitoring'){startLagPoll();startSyncPoll();}
     }
     if(phase==='done'){
       updateStepDot(5,'done');

@@ -43284,6 +43284,7 @@ def _ak_mig_pg_pass(settings=None):
         settings = load_settings()
     return (
         _get_authentik_env_value(settings, 'POSTGRES_PASSWORD') or
+        _get_authentik_env_value(settings, 'PG_PASS') or          # Authentik default .env key
         _get_authentik_env_value(settings, 'AUTHENTIK_POSTGRESQL__PASSWORD') or
         'authentik'
     )
@@ -43649,34 +43650,36 @@ def _run_ak_mig_prepare_bg(settings_snap):
             plog('  ✓ wal_level=logical already enabled')
 
         # ── 5. Allow dest IP in source pg_hba.conf ──────────────────────────
-        plog(f'Ensuring source pg_hba.conf allows destination ({dst_host})...')
+        plog(f'Ensuring source pg_hba.conf allows destination ({dst_host}) with scram-sha-256...')
         _src_pg_ctr = _ak_mig_pg_container(src_cfg)
-        ok_hba, hba_out = _ssh_probe(src_cfg,
-            f'docker exec {_src_pg_ctr} grep -c {shlex.quote(dst_host)} /var/lib/postgresql/data/pg_hba.conf 2>/dev/null || echo 0',
-            timeout=10)
-        already_in_hba = ok_hba and (hba_out or '0').strip() not in ('0', '')
-        if not already_in_hba:
-            add_cmd = (
-                f'docker exec {_src_pg_ctr} sh -c '
-                f'"echo \'host replication {pg_user} {dst_host}/32 md5\' '
-                f'>> /var/lib/postgresql/data/pg_hba.conf && '
-                f'echo \'host authentik {pg_user} {dst_host}/32 md5\' '
-                f'>> /var/lib/postgresql/data/pg_hba.conf" 2>&1 && '
-                f'docker exec {_src_pg_ctr} psql -U {shlex.quote(pg_user)} authentik '
-                f'-c "SELECT pg_reload_conf()" 2>&1'
-            )
-            ok_add, add_out = _ssh_probe(src_cfg, add_cmd, timeout=20)
-            if ok_add:
-                plog(f'  ✓ pg_hba.conf updated for {dst_host}')
-            else:
-                plog(f'  ✗ pg_hba update failed: {(add_out or "")[:200]}')
-                plog('  → Manual fix on source server:')
-                plog(f'    docker exec {_src_pg_ctr} sh -c \'echo "host all {pg_user} {dst_host}/32 md5" >> /var/lib/postgresql/data/pg_hba.conf\'')
-                plog(f'    docker exec {_src_pg_ctr} psql -U {pg_user} -c "SELECT pg_reload_conf()"')
-                _ak_mig_status.update({'running': False, 'error': 'Failed to update source pg_hba.conf'})
-                return
+        # Always remove stale entries for this dst_host and re-add with correct auth method.
+        # md5 entries from a previous run won't work on PG14+ which stores passwords as scram-sha-256.
+        _hba_path = '/var/lib/postgresql/data/pg_hba.conf'
+        _clean_cmd = (
+            f'docker exec {_src_pg_ctr} sh -c '
+            f'"grep -v {shlex.quote(dst_host)} {_hba_path} > /tmp/_hba_new && '
+            f'mv /tmp/_hba_new {_hba_path}" 2>&1'
+        )
+        _ssh_probe(src_cfg, _clean_cmd, timeout=15)
+        add_cmd = (
+            f'docker exec {_src_pg_ctr} sh -c '
+            f'"echo \'host replication {pg_user} {dst_host}/32 scram-sha-256\' '
+            f'>> {_hba_path} && '
+            f'echo \'host authentik {pg_user} {dst_host}/32 scram-sha-256\' '
+            f'>> {_hba_path}" 2>&1 && '
+            f'docker exec {_src_pg_ctr} psql -U {shlex.quote(pg_user)} authentik '
+            f'-c "SELECT pg_reload_conf()" 2>&1'
+        )
+        ok_add, add_out = _ssh_probe(src_cfg, add_cmd, timeout=20)
+        if ok_add:
+            plog(f'  ✓ pg_hba.conf updated for {dst_host} (scram-sha-256)')
         else:
-            plog(f'  ✓ {dst_host} already in pg_hba.conf')
+            plog(f'  ✗ pg_hba update failed: {(add_out or "")[:200]}')
+            plog('  → Manual fix on source server:')
+            plog(f'    docker exec {_src_pg_ctr} sh -c \'echo "host all {pg_user} {dst_host}/32 scram-sha-256" >> {_hba_path}\'')
+            plog(f'    docker exec {_src_pg_ctr} psql -U {pg_user} -c "SELECT pg_reload_conf()"')
+            _ak_mig_status.update({'running': False, 'error': 'Failed to update source pg_hba.conf'})
+            return
 
         # ── 6. Ensure source Postgres port 5432 is reachable from dest ──────
         plog(f'Testing TCP connectivity: destination → source:{src_host}:5432...')
@@ -43768,7 +43771,11 @@ def _run_ak_mig_replicate_bg(settings_snap):
         plog('Dumping schema from source (schema-only)...')
         u = shlex.quote(pg_user)
         p_env = f'PGPASSWORD={shlex.quote(pg_pass)}'
-        schema_cmd = f'{p_env} docker exec authentik-postgresql-1 pg_dump -U {u} authentik --schema-only --no-owner --no-acl 2>&1'
+        _src_pg_ctr_repl = _ak_mig_pg_container(src_cfg)
+        schema_cmd = (
+            f'{p_env} docker exec {_src_pg_ctr_repl} '
+            f'pg_dump -U {u} authentik --schema-only --no-owner --no-acl 2>&1'
+        )
         ok_sd, schema_sql = _ssh_probe(src_cfg, schema_cmd, timeout=120)
         if not ok_sd or not schema_sql or 'error' in (schema_sql or '').lower()[:80]:
             plog(f'  ✗ Schema dump failed: {(schema_sql or "")[:300]}')
@@ -43777,19 +43784,15 @@ def _run_ak_mig_replicate_bg(settings_snap):
         plog(f'  ✓ Schema dumped ({len(schema_sql):,} bytes)')
 
         plog('Restoring schema on destination...')
-        ok_sr, sr_out = _ak_mig_write_file_remote(dst_cfg, '/tmp/ak_schema.sql', schema_sql, timeout=30)
+        _dst_pg_ctr = _ak_mig_pg_container(dst_cfg)
+        ok_sr, sr_out = _ak_mig_write_file_remote(dst_cfg, '/tmp/ak_schema.sql', schema_sql, timeout=60)
         if not ok_sr:
             plog(f'  ✗ Failed to write schema to destination: {(sr_out or "")[:200]}')
             _ak_mig_status.update({'running': False, 'error': 'Failed to transfer schema to destination'})
             return
-        restore_cmd = (
-            f'{p_env} docker exec -i authentik-postgresql-1 psql -U {u} authentik '
-            f'< /tmp/ak_schema.sql 2>&1 || true'
-        )
-        # Run on dest host (not inside docker directly, need to mount the file)
         restore_cmd2 = (
-            f'docker cp /tmp/ak_schema.sql authentik-postgresql-1:/tmp/ak_schema.sql 2>&1 && '
-            f'{p_env} docker exec authentik-postgresql-1 psql -U {u} authentik '
+            f'docker cp /tmp/ak_schema.sql {_dst_pg_ctr}:/tmp/ak_schema.sql 2>&1 && '
+            f'{p_env} docker exec {_dst_pg_ctr} psql -U {u} authentik '
             f'-f /tmp/ak_schema.sql 2>&1'
         )
         ok_rs, rs_out = _ssh_probe(dst_cfg, restore_cmd2, timeout=120)
@@ -43812,13 +43815,18 @@ def _run_ak_mig_replicate_bg(settings_snap):
 
         # ── 4. Create subscription on destination ────────────────────────────
         plog(f'Creating subscription "{_AK_MIG_SUB}" on destination...')
+        # Escape password for libpq connection string (single-quote the value,
+        # backslash-escape any single quotes and backslashes inside it).
+        def _pgconn_val(v):
+            return "'" + v.replace('\\', '\\\\').replace("'", "\\'") + "'"
         conn_str = (
             f"host={src_host} port=5432 dbname=authentik "
-            f"user={pg_user} password={pg_pass}"
+            f"user={_pgconn_val(pg_user)} password={_pgconn_val(pg_pass)}"
         )
+        # Dollar-quote the CONNECTION string so the libpq escapes aren't re-interpreted by SQL
         sub_sql = (
             f"CREATE SUBSCRIPTION {_AK_MIG_SUB} "
-            f"CONNECTION '{conn_str}' "
+            f"CONNECTION $pgmig${conn_str}$pgmig$ "
             f"PUBLICATION {_AK_MIG_PUB} "
             f"WITH (copy_data = true, enabled = true)"
         )
@@ -43828,7 +43836,7 @@ def _run_ak_mig_replicate_bg(settings_snap):
             plog('  Common causes:')
             plog(f'  • Source {src_host}:5432 not reachable from dest Docker network')
             plog(f'  • pg_hba.conf does not allow {dst_cfg.get("host","dest")} to connect')
-            plog(f'  • pg_pass wrong (check POSTGRES_PASSWORD in .env)')
+            plog(f'  • pg_pass wrong (check PG_PASS in source .env)')
             plog(f'  • wal_level not yet logical (may need more time after restart)')
             # Cleanup
             _ak_mig_psql(src_cfg, f'DROP PUBLICATION IF EXISTS {_AK_MIG_PUB}', settings=settings_snap)

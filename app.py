@@ -43345,18 +43345,55 @@ def _ak_mig_get_env_content(src_cfg):
 
 
 def _ak_mig_write_file_remote(host_cfg, remote_path, content, timeout=20):
-    """Write arbitrary text content to a file on a remote host via SSH heredoc."""
-    import base64 as _b64
-    encoded = _b64.b64encode(content.encode('utf-8', errors='replace')).decode()
-    # Replace ~ with $HOME so the remote shell expands it correctly.
-    # shlex.quote wraps ~ in single quotes which prevents tilde expansion,
-    # causing files to land in a literal ~/path directory instead of $HOME/path.
+    """Write text content to a remote file by piping through SSH stdin (no ARG_MAX limit)."""
     safe_path = remote_path.replace('~/', '$HOME/').replace('~', '$HOME')
-    cmd = (
-        f'mkdir -p "$(dirname {safe_path})" && '
-        f'echo {shlex.quote(encoded)} | base64 -d > {safe_path}'
-    )
-    return _ssh_probe(host_cfg, cmd, timeout=timeout)
+    remote_cmd = f'mkdir -p "$(dirname {safe_path})" && cat > {safe_path}'
+    content_bytes = content.encode('utf-8', errors='replace')
+
+    host = (host_cfg.get('host') or '').strip()
+    user = (host_cfg.get('ssh_user') or 'root').strip() or 'root'
+    port = int(host_cfg.get('ssh_port') or 22)
+    is_local = bool(host_cfg.get('use_localhost')) or host in ('127.0.0.1', 'localhost', '::1')
+
+    if is_local:
+        try:
+            r = subprocess.run(remote_cmd, shell=True, input=content_bytes,
+                               capture_output=True, timeout=timeout)
+            return r.returncode == 0, (r.stderr or b'').decode(errors='replace').strip() or None
+        except Exception as e:
+            return False, str(e)
+
+    auth_method = (host_cfg.get('auth_method') or 'ssh_key').strip().lower()
+    batch_mode = 'no' if auth_method == 'password' else 'yes'
+    ssh_cmd = [
+        'ssh',
+        '-o', f'BatchMode={batch_mode}',
+        '-o', 'StrictHostKeyChecking=accept-new',
+        '-o', f'ConnectTimeout={max(3, min(10, timeout))}',
+        '-p', str(port),
+    ]
+    run_kw = dict(input=content_bytes, capture_output=True, timeout=timeout)
+    key_path = (host_cfg.get('ssh_key_path') or '').strip()
+    if auth_method == 'password':
+        ssh_password = (host_cfg.get('ssh_password') or '').strip()
+        if not ssh_password:
+            return False, 'auth_method=password but ssh_password is empty'
+        if shutil.which('sshpass') is None:
+            return False, 'sshpass not installed on infra host'
+        ssh_cmd = ['sshpass', '-e'] + ssh_cmd
+        run_kw['env'] = {**os.environ, 'SSHPASS': ssh_password}
+    elif key_path:
+        expanded = os.path.expanduser(key_path)
+        if os.path.exists(expanded):
+            ssh_cmd.extend(['-i', expanded])
+        else:
+            return False, f'ssh key not found: {expanded}'
+    ssh_cmd.extend([f'{user}@{host}', remote_cmd])
+    try:
+        r = subprocess.run(ssh_cmd, **run_kw)
+        return r.returncode == 0, (r.stderr or b'').decode(errors='replace').strip() or None
+    except Exception as e:
+        return False, str(e)
 
 
 # ── Step 1: Connectivity Test (synchronous) ──────────────────────────────────

@@ -43517,7 +43517,9 @@ def _run_ak_mig_prepare_bg(settings_snap):
 
         # ── 3. Start dest Postgres ──────────────────────────────────────────
         plog('Starting PostgreSQL on destination...')
-        ok_up, up_out = _ak_mig_compose(dst_cfg, 'up -d postgresql', timeout=90)
+        plog('  Pulling postgres image (may take a few minutes on first run)...')
+        _ak_mig_compose(dst_cfg, f'pull postgresql', timeout=600)
+        ok_up, up_out = _ak_mig_compose(dst_cfg, 'up -d postgresql', timeout=120)
         if not ok_up:
             plog(f'  ✗ docker compose up failed: {(up_out or "")[:300]}')
             plog('  → Check: ssh root@dest "docker logs authentik-postgresql-1 --tail=30"')

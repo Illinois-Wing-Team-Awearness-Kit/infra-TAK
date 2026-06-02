@@ -43109,6 +43109,23 @@ _ak_mig_lock = threading.Lock()
 _AK_MIG_PUB  = 'authentik_mig_pub'
 _AK_MIG_SUB  = 'authentik_mig_sub'
 
+_ak_mig_compose_cache = {}   # host key → 'docker compose' | 'docker-compose'
+
+
+def _ak_mig_compose(host_cfg, args, timeout=90):
+    """Run docker compose (v2 plugin) or docker-compose (v1 binary) on the given host.
+
+    Detects which is available on first call per host and caches the result.
+    Eliminates 'unknown shorthand flag: d' errors on servers that only have v1.
+    """
+    key = host_cfg.get('host', 'local') if not host_cfg.get('use_localhost') else 'local'
+    if key not in _ak_mig_compose_cache:
+        ok_v2, _ = _ssh_probe(host_cfg, 'docker compose version >/dev/null 2>&1', timeout=8)
+        _ak_mig_compose_cache[key] = 'docker compose' if ok_v2 else 'docker-compose'
+    bin_ = _ak_mig_compose_cache[key]
+    cmd  = f'cd ~/authentik && {bin_} {args} 2>&1'
+    return _ssh_probe(host_cfg, cmd, timeout=timeout)
+
 
 def _ak_mig_plog(msg):
     ts = datetime.utcnow().strftime('%H:%M:%S')
@@ -43358,8 +43375,7 @@ def _run_ak_mig_prepare_bg(settings_snap):
 
         # ── 3. Start dest Postgres ──────────────────────────────────────────
         plog('Starting PostgreSQL on destination...')
-        ok_up, up_out = _ssh_probe(dst_cfg,
-            'cd ~/authentik && docker compose up -d postgresql 2>&1', timeout=90)
+        ok_up, up_out = _ak_mig_compose(dst_cfg, 'up -d postgresql', timeout=90)
         if not ok_up:
             plog(f'  ✗ docker compose up failed: {(up_out or "")[:300]}')
             plog('  → Check: ssh root@dest "docker logs authentik-postgresql-1 --tail=30"')
@@ -43427,7 +43443,7 @@ def _run_ak_mig_prepare_bg(settings_snap):
                 return
 
             plog('  Restarting source PostgreSQL...')
-            _ssh_probe(src_cfg, 'cd ~/authentik && docker compose up -d postgresql 2>&1', timeout=90)
+            _ak_mig_compose(src_cfg, 'up -d postgresql', timeout=90)
             for attempt in range(25):
                 time.sleep(4)
                 ok_r, _ = _ak_mig_psql(src_cfg, 'SHOW wal_level', settings=settings_snap)
@@ -43504,7 +43520,7 @@ def _run_ak_mig_prepare_bg(settings_snap):
                         open(os.path.expanduser('~/authentik/docker-compose.yml'), 'w').write(new_compose)
                     else:
                         _ak_mig_write_file_remote(src_cfg, '~/authentik/docker-compose.yml', new_compose)
-                    _ssh_probe(src_cfg, 'cd ~/authentik && docker compose up -d postgresql 2>&1', timeout=90)
+                    _ak_mig_compose(src_cfg, 'up -d postgresql', timeout=90)
                     plog('  Source compose patched (ports: 5432:5432), Postgres restarted')
                     time.sleep(6)
                 else:
@@ -43690,7 +43706,7 @@ def _run_ak_mig_cutover_bg(settings_snap):
         plog('━━━ Step 4: Cutover ━━━')
         plog('⚠ Stopping source Authentik (server + worker)...')
         plog('  PostgreSQL on source will keep running for replication catch-up')
-        _ssh_probe(src_cfg, 'cd ~/authentik && docker compose stop server worker 2>&1', timeout=60)
+        _ak_mig_compose(src_cfg, 'stop server worker', timeout=60)
         plog('  ✓ Source Authentik server and worker stopped')
 
         # Wait for lag to drain to zero
@@ -43757,11 +43773,10 @@ def _run_ak_mig_cutover_bg(settings_snap):
 
         # Start full Authentik stack on destination
         plog('Starting full Authentik stack on destination...')
-        ok_dst, dst_up = _ssh_probe(dst_cfg,
-            'cd ~/authentik && docker compose up -d 2>&1', timeout=120)
+        ok_dst, dst_up = _ak_mig_compose(dst_cfg, 'up -d', timeout=120)
         if not ok_dst:
             plog(f'  ✗ Failed to start destination Authentik: {(dst_up or "")[:300]}')
-            plog('  → Manually run: cd ~/authentik && docker compose up -d')
+            plog('  → Manually run: cd ~/authentik && docker compose up -d  (or docker-compose up -d)')
             plog('  → Use Rollback button if needed to restart source')
             _ak_mig_status.update({'running': False, 'error': 'Failed to start destination Authentik stack'})
             return
@@ -43844,7 +43859,7 @@ def _run_ak_mig_rollback_bg(settings_snap):
         plog('━━━ Rollback ━━━')
         # Stop dest Authentik
         plog('Stopping destination Authentik...')
-        _ssh_probe(dst_cfg, 'cd ~/authentik && docker compose stop server worker ldap 2>&1', timeout=60)
+        _ak_mig_compose(dst_cfg, 'stop server worker ldap', timeout=60)
         plog('  ✓ Destination Authentik stopped')
 
         # Drop subscription/publication if still present
@@ -43854,12 +43869,12 @@ def _run_ak_mig_rollback_bg(settings_snap):
 
         # Restart source Authentik
         plog('Restarting source Authentik (server + worker)...')
-        ok_rb, rb_out = _ssh_probe(src_cfg, 'cd ~/authentik && docker compose up -d 2>&1', timeout=120)
+        ok_rb, rb_out = _ak_mig_compose(src_cfg, 'up -d', timeout=120)
         if ok_rb:
             plog('  ✓ Source Authentik restarted')
         else:
             plog(f'  ✗ Source restart failed: {(rb_out or "")[:300]}')
-            plog('  → Manual: ssh source "cd ~/authentik && docker compose up -d"')
+            plog('  → Manual: ssh source "cd ~/authentik && docker compose up -d  (or docker-compose up -d)"')
 
         # Revert infra-TAK settings back to source
         try:

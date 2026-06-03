@@ -3,15 +3,16 @@
 # ZeroTier Installer
 #
 # Installs ZeroTier, enables and starts zerotier-one via systemd, prints
-# the node ID, and optionally joins a network.
+# the node ID, and joins a network.
 #
 # Run setup-zerotier-deps.sh first to ensure prerequisites are in place.
+# If NETWORK_ID is not passed as an argument the script will prompt for it.
 #
 # Usage:
 #   sudo bash scripts/setup-zerotier.sh [NETWORK_ID]
 #
 # Arguments:
-#   NETWORK_ID  Optional 16-character hex ZeroTier network ID to join
+#   NETWORK_ID  16-character hex ZeroTier network ID (prompted if omitted)
 #               Example: sudo bash scripts/setup-zerotier.sh a09acf023364e141
 #
 ##############################################################################
@@ -45,7 +46,15 @@ if [ "$(id -u)" -ne 0 ]; then
     exit 1
 fi
 
-# ── Validate optional network ID ─────────────────────────────────────────────
+# ── Prompt for network ID if not provided ────────────────────────────────────
+if [ -z "$NETWORK_ID" ]; then
+    echo -e "  ${CYAN}ZeroTier network ID${NC} (16-char hex from my.zerotier.com)"
+    echo -e "  ${DIM}Leave blank to skip joining a network${NC}"
+    read -r -p "  Network ID: " NETWORK_ID
+    echo ""
+fi
+
+# ── Validate network ID ──────────────────────────────────────────────────────
 if [ -n "$NETWORK_ID" ]; then
     if [[ ! "$NETWORK_ID" =~ ^[0-9a-fA-F]{16}$ ]]; then
         err "NETWORK_ID must be exactly 16 hex characters — got: $NETWORK_ID"

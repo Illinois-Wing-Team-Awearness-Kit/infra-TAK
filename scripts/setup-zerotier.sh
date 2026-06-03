@@ -67,7 +67,7 @@ fi
 hdr "Checking prerequisites..."
 
 MISSING=()
-for cmd in curl gnupg lsb_release; do
+for cmd in curl gpg lsb_release; do
     if ! command -v "$cmd" >/dev/null 2>&1; then
         MISSING+=("$cmd")
     fi

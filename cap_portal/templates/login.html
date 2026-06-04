@@ -1,0 +1,75 @@
+{% extends "base.html" %}
+{% block title %}Login — CAP Command Portal{% endblock %}
+
+{% block content %}
+<div class="auth-container">
+  <div class="auth-card">
+    <div class="auth-header">
+      <div class="auth-shield">
+        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
+          <path d="M12 2L3 6v6c0 5.25 3.75 10.15 9 11.25C17.25 22.15 21 17.25 21 12V6L12 2z" fill="currentColor" opacity="0.2"/>
+          <path d="M12 2L3 6v6c0 5.25 3.75 10.15 9 11.25C17.25 22.15 21 17.25 21 12V6L12 2z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
+          <path d="M9 12l2 2 4-4" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <h1>Command Portal Access</h1>
+      <p>Authenticate with your CAP EServices credentials</p>
+    </div>
+
+    {% if error %}
+    <div class="alert alert-error">
+      <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 3.5a.75.75 0 0 1 .75.75v3a.75.75 0 0 1-1.5 0v-3A.75.75 0 0 1 8 4.5zm0 7a.875.875 0 1 1 0-1.75.875.875 0 0 1 0 1.75z"/></svg>
+      {{ error }}
+    </div>
+    {% endif %}
+
+    <form method="post" action="/login" class="auth-form" autocomplete="on">
+      <div class="field-group">
+        <label for="capid">CAPID</label>
+        <input
+          type="text"
+          id="capid"
+          name="capid"
+          placeholder="000000"
+          autocomplete="username"
+          inputmode="numeric"
+          pattern="[0-9]+"
+          required
+        />
+      </div>
+      <div class="field-group">
+        <label for="password">EServices Password</label>
+        <input
+          type="password"
+          id="password"
+          name="password"
+          autocomplete="current-password"
+          required
+        />
+      </div>
+      <div class="field-group">
+        <label for="totp_code">Authenticator Code <span class="label-hint">(6 digits)</span></label>
+        <input
+          type="text"
+          id="totp_code"
+          name="totp_code"
+          placeholder="000000"
+          inputmode="numeric"
+          maxlength="6"
+          autocomplete="one-time-code"
+          required
+        />
+      </div>
+      <button type="submit" class="btn btn-primary btn-full">
+        <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14"><path d="M8 0a4 4 0 0 1 4 4v1h1.5A1.5 1.5 0 0 1 15 6.5v8A1.5 1.5 0 0 1 13.5 16h-11A1.5 1.5 0 0 1 1 14.5v-8A1.5 1.5 0 0 1 2.5 5H4V4a4 4 0 0 1 4-4zm0 1.5A2.5 2.5 0 0 0 5.5 4v1h5V4A2.5 2.5 0 0 0 8 1.5zM8 9a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z"/></svg>
+        Authenticate via EServices
+      </button>
+    </form>
+
+    <p class="auth-note">
+      Credentials are validated against <strong>capnhq.gov</strong> and are never stored.<br>
+      Access is restricted to authorized Illinois Wing personnel.
+    </p>
+  </div>
+</div>
+{% endblock %}

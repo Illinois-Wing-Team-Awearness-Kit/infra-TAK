@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>{% block title %}CAP Command Portal{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="site-header">
+    <div class="header-inner">
+      <div class="header-brand">
+        <span class="brand-badge">CAP</span>
+        <div class="brand-text">
+          <span class="brand-title">Illinois Wing</span>
+          <span class="brand-subtitle">TAK Command Portal</span>
+        </div>
+      </div>
+      {% block header_actions %}{% endblock %}
+    </div>
+  </header>
+
+  <main class="main-content">
+    {% block content %}{% endblock %}
+  </main>
+
+  <footer class="site-footer">
+    Civil Air Patrol — Illinois Wing &nbsp;|&nbsp; Powered by infra-TAK
+  </footer>
+</body>
+</html>

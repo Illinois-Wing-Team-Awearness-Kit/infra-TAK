@@ -80,7 +80,7 @@ def root(request: Request):
 def login_page(request: Request):
     if _is_admin(request):
         return RedirectResponse("/portal")
-    return templates.TemplateResponse("login.html", {"request": request, "error": None})
+    return templates.TemplateResponse(request, "login.html", {"error": None})
 
 
 @app.post("/login")
@@ -95,9 +95,7 @@ def login_submit(
         client = wmirs_login(capid, password, totp_code.strip())
     except AuthError as e:
         return templates.TemplateResponse(
-            "login.html",
-            {"request": request, "error": str(e)},
-            status_code=401,
+            request, "login.html", {"error": str(e)}, status_code=401
         )
 
     save_session(capid, client)
@@ -119,9 +117,8 @@ def portal_page(request: Request):
     if not _is_admin(request):
         return RedirectResponse("/login", status_code=303)
     return templates.TemplateResponse(
-        "portal.html",
+        request, "portal.html",
         {
-            "request": request,
             "capid": request.session["capid"],
             "tak_portal_configured": tak_portal_api.is_configured(),
         },

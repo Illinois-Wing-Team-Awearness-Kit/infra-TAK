@@ -1,0 +1,257 @@
+{% extends "base.html" %}
+
+{% block title %}CAP Command Portal — Dashboard{% endblock %}
+
+{% block header_actions %}
+<div class="header-actions">
+  <span>CAPID {{ capid }}</span>
+  <form action="/logout" method="post" style="margin:0">
+    <button type="submit" class="btn-logout">Sign Out</button>
+  </form>
+</div>
+{% endblock %}
+
+{% block content %}
+<!-- Portal nav -->
+<nav class="portal-nav">
+  <button class="nav-btn active" data-view="view-dashboard">Dashboard</button>
+  <button class="nav-btn accent" id="open-wizard-btn">+ New Mission Setup</button>
+  <button class="nav-btn" data-view="view-missions">Missions</button>
+  <button class="nav-btn" data-view="view-credentials">Credentials / Email</button>
+</nav>
+
+<!-- ── Dashboard ─────────────────────────────────────────────────── -->
+<div class="view active" id="view-dashboard">
+  <div class="card-grid">
+    <div class="stat-card">
+      <span class="stat-label">Total Missions</span>
+      <span class="stat-value" id="stat-total">0</span>
+      <span class="stat-sub">all time</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Provisioned</span>
+      <span class="stat-value" id="stat-provisioned">0</span>
+      <span class="stat-sub">fully set up</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">GROUND DataSync</span>
+      <span class="stat-value" id="stat-ground">0</span>
+      <span class="stat-sub">missions created</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">AIR DataSync</span>
+      <span class="stat-value" id="stat-air">0</span>
+      <span class="stat-sub">missions created</span>
+    </div>
+    <div class="stat-card">
+      <span class="stat-label">Creds Issued</span>
+      <span class="stat-value" id="stat-creds">0</span>
+      <span class="stat-sub">users created</span>
+    </div>
+  </div>
+
+  <div class="section-header">
+    <h2>Recent Missions</h2>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr><th>Mission #</th><th>TAK Username</th><th>Status</th><th>Date</th></tr>
+      </thead>
+      <tbody id="recent-missions-body">
+        <tr><td colspan="4" style="text-align:center;color:#6b7280;padding:2rem">No missions yet. Run the Mission Wizard to get started.</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── Mission Wizard ─────────────────────────────────────────────── -->
+<div class="view" id="view-wizard">
+  <div class="wizard-wrap">
+    <div class="step-indicator">
+      <div class="step-dot active" id="dot-1"></div>
+      <div class="step-dot" id="dot-2"></div>
+      <div class="step-dot" id="dot-3"></div>
+      <div class="step-dot" id="dot-4"></div>
+      <div class="step-dot" id="dot-5"></div>
+    </div>
+
+    <!-- Step 1: Mission number -->
+    <div class="wizard-step active" id="wiz-step1">
+      <h3>Step 1 — Mission Number</h3>
+      <p>Enter the WMIRS mission number to provision in TAK.</p>
+      <input type="text" class="input-lg" id="wiz-mission-input" placeholder="e.g. IL-2024-001" />
+      <div class="wizard-actions">
+        <button class="btn btn-blue" id="wiz-step1-next">Next →</button>
+      </div>
+    </div>
+
+    <!-- Step 2: Create group -->
+    <div class="wizard-step" id="wiz-step2">
+      <h3>Step 2 — Create TAK Group</h3>
+      <p>Create group <strong id="wiz-step2-mn"></strong> with IN and OUT permissions.</p>
+      <label class="toggle-row"><input type="checkbox" checked disabled /> IN (receive)</label>
+      <label class="toggle-row mt-1"><input type="checkbox" checked disabled /> OUT (transmit)</label>
+      <div id="wiz-step2-status" class="hidden"></div>
+      <div class="wizard-actions">
+        <button class="btn btn-ghost" id="wiz-step2-back">← Back</button>
+        <button class="btn btn-blue" id="wiz-step2-next">Create Group →</button>
+      </div>
+    </div>
+
+    <!-- Step 3: Create user -->
+    <div class="wizard-step" id="wiz-step3">
+      <h3>Step 3 — Create TAK User</h3>
+      <p>Create a TAK user account for this mission. Credentials will be displayed below.</p>
+      <div id="wiz-step3-status" class="hidden"></div>
+      <div class="cred-card hidden" id="wiz-cred-card">
+        <div class="cred-row"><span class="cred-label">Username</span><span id="cred-username"></span></div>
+        <div class="cred-row"><span class="cred-label">Password</span><span id="cred-password"></span></div>
+      </div>
+      <div class="wizard-actions">
+        <button class="btn btn-ghost" id="wiz-step3-back">← Back</button>
+        <button class="btn btn-blue" id="wiz-step3-next">Create User →</button>
+      </div>
+    </div>
+
+    <!-- Step 4: DataSync missions -->
+    <div class="wizard-step" id="wiz-step4">
+      <h3>Step 4 — DataSync Missions</h3>
+      <p>Create mission channels for ground and air tracks.</p>
+      <div class="ds-cards">
+        <div class="ds-card">
+          <h4>GROUND DataSync</h4>
+          <p>Ground team position and situation data.</p>
+          <label class="toggle-row"><input type="checkbox" id="toggle-ground" checked /> Enable</label>
+        </div>
+        <div class="ds-card">
+          <h4>AIR DataSync</h4>
+          <p>Aircraft position and sortie data.</p>
+          <label class="toggle-row"><input type="checkbox" id="toggle-air" checked /> Enable</label>
+        </div>
+      </div>
+      <div id="wiz-step4-status" class="hidden mt-2"></div>
+      <div class="wizard-actions">
+        <button class="btn btn-ghost" id="wiz-step4-back">← Back</button>
+        <button class="btn btn-blue" id="wiz-step4-next">Create Missions →</button>
+      </div>
+    </div>
+
+    <!-- Step 5: Send credentials -->
+    <div class="wizard-step" id="wiz-step5">
+      <h3>Step 5 — Send Credentials</h3>
+      <p>Email the TAK login credentials to mission personnel. Press Skip to finish without sending.</p>
+      <div class="form-group">
+        <label>Recipients</label>
+        <div class="chip-input-wrap" id="chip-wrap">
+          <input type="text" class="chip-input" id="chip-input" placeholder="name@example.com — press Enter" />
+        </div>
+      </div>
+      <div class="form-group">
+        <label>Subject (optional)</label>
+        <input type="text" class="input-sm full-width" id="cred-subject" placeholder="Leave blank for default" />
+      </div>
+      <div class="form-group">
+        <label>Notes (optional)</label>
+        <textarea class="input-sm full-width" id="cred-notes" rows="3" placeholder="Additional instructions for recipients"></textarea>
+      </div>
+      <div id="wiz-step5-status" class="hidden"></div>
+      <div class="wizard-actions">
+        <button class="btn btn-ghost" id="wiz-step5-back">← Back</button>
+        <button class="btn btn-blue" id="wiz-send">Send Credentials</button>
+        <button class="btn btn-ghost" id="wiz-skip">Skip</button>
+      </div>
+    </div>
+
+    <!-- Success screen -->
+    <div class="hidden" id="wiz-success">
+      <div class="success-screen">
+        <div class="success-icon">✅</div>
+        <h3>Mission <span class="success-mission"></span> Provisioned</h3>
+        <p>All selected TAK resources have been created.</p>
+        <ul class="summary-list"></ul>
+        <div class="wizard-actions" style="justify-content:center;margin-top:1.5rem">
+          <button class="btn btn-blue" id="wiz-done-btn">Return to Dashboard</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ── Missions List ───────────────────────────────────────────────── -->
+<div class="view" id="view-missions">
+  <div class="section-header">
+    <h2>Missions</h2>
+    <button class="btn btn-gold" id="open-wizard-btn2" onclick="openWizard()">+ New Mission</button>
+  </div>
+  <div class="table-wrap">
+    <table>
+      <thead>
+        <tr>
+          <th>Mission #</th>
+          <th>TAK Username</th>
+          <th>Group</th>
+          <th>GROUND</th>
+          <th>AIR</th>
+          <th>Status</th>
+          <th>Date</th>
+        </tr>
+      </thead>
+      <tbody id="missions-tbody"></tbody>
+    </table>
+  </div>
+</div>
+
+<!-- ── Credentials / Email ─────────────────────────────────────────── -->
+<div class="view" id="view-credentials">
+  <div class="section-header"><h2>Resend Credentials</h2></div>
+  <div class="wizard-wrap">
+    <div class="form-group">
+      <label>Mission</label>
+      <select class="input-sm full-width" id="cred-mission-select">
+        <option value="">— select mission —</option>
+      </select>
+    </div>
+    <div class="form-group">
+      <label>TAK Username</label>
+      <input type="text" class="input-sm full-width" id="cred-view-username" readonly />
+    </div>
+    <div class="form-group">
+      <label>Password</label>
+      <input type="text" class="input-sm full-width" id="cred-view-password" placeholder="Enter password to resend" />
+    </div>
+    <div class="form-group">
+      <label>Recipients</label>
+      <div class="chip-input-wrap" id="cred-chip-wrap">
+        <input type="text" class="chip-input" id="cred-chip-input" placeholder="name@example.com — press Enter" />
+      </div>
+    </div>
+    <div class="form-group">
+      <label>Subject (optional)</label>
+      <input type="text" class="input-sm full-width" id="cred-view-subject" />
+    </div>
+    <div class="form-group">
+      <label>Notes (optional)</label>
+      <textarea class="input-sm full-width" id="cred-view-notes" rows="3"></textarea>
+    </div>
+    <button class="btn btn-blue" id="cred-send-btn">Send Credentials</button>
+  </div>
+</div>
+
+<!-- Modal backdrop -->
+<div class="modal-backdrop" id="modal-backdrop">
+  <div class="modal">
+    <h3 id="modal-title">Confirm</h3>
+    <p id="modal-body"></p>
+    <div class="modal-actions">
+      <button class="btn btn-ghost" id="modal-cancel">Cancel</button>
+      <button class="btn btn-danger" id="modal-confirm">Confirm</button>
+    </div>
+  </div>
+</div>
+
+<!-- Toast container -->
+<div class="toast-container" id="toast-container"></div>
+
+<script src="/static/portal.js"></script>
+{% endblock %}

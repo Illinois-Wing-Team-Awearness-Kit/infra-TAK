@@ -30,6 +30,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from wmirs_auth.eservices import login as wmirs_login, AuthError
 from wmirs_auth.session_store import save_session
 import tak_api
+import email_sender
+import tak_portal_api
 
 _DIR = Path(__file__).parent
 
@@ -118,7 +120,11 @@ def portal_page(request: Request):
         return RedirectResponse("/login", status_code=303)
     return templates.TemplateResponse(
         "portal.html",
-        {"request": request, "capid": request.session["capid"]},
+        {
+            "request": request,
+            "capid": request.session["capid"],
+            "tak_portal_configured": tak_portal_api.is_configured(),
+        },
     )
 
 
@@ -215,3 +221,50 @@ def api_setup_all(request: Request, body: MissionRequest):
         "message": "Mission provisioning complete" if overall_success else "Provisioning completed with errors",
         "results": results,
     })
+
+
+class SendCredentialsRequest(BaseModel):
+    mission_number: str
+    username: str
+    password: str
+    recipients: list[str]
+    subject: str = ""
+    notes: str = ""
+    enroll_url: str = ""
+    qr_code_base64: str = ""
+
+
+@app.post("/api/send-credentials")
+def api_send_credentials(request: Request, body: SendCredentialsRequest):
+    if (err := _auth_guard(request)):
+        return err
+    results = email_sender.send_batch(
+        recipients=body.recipients,
+        mission_no=body.mission_number,
+        username=body.username,
+        password=body.password,
+        enroll_url=body.enroll_url,
+        qr_code_base64=body.qr_code_base64,
+        subject=body.subject,
+        notes=body.notes,
+    )
+    all_ok = all(r["success"] for r in results)
+    return JSONResponse({"success": all_ok, "results": results})
+
+
+class EnrollmentQrRequest(BaseModel):
+    user_id: str
+    username: str
+
+
+@app.post("/api/enrollment-qr")
+def api_enrollment_qr(request: Request, body: EnrollmentQrRequest):
+    if (err := _auth_guard(request)):
+        return err
+    if not tak_portal_api.is_configured():
+        return JSONResponse({"success": False, "message": "TAK Portal not configured"}, status_code=503)
+    try:
+        data = tak_portal_api.get_enrollment_qr(body.user_id, body.username)
+        return JSONResponse({"success": True, "data": data})
+    except Exception as e:
+        return JSONResponse({"success": False, "message": str(e)}, status_code=500)

@@ -133,7 +133,7 @@ document.getElementById('wiz-step3-next').addEventListener('click', async () => 
           link.href = wiz.enrollUrl;
           link.textContent = wiz.enrollUrl;
           if (wiz.qrCode) {
-            document.getElementById('cred-qr-img').src = 'data:image/png;base64,' + wiz.qrCode;
+            document.getElementById('cred-qr-img').src = wiz.qrCode;
           }
         }
         setStatus('wiz-step3-status', 'success', `✓ User <strong>${wiz.username}</strong> created with enrollment QR`);

@@ -32,15 +32,24 @@ def send_credentials_email(
     html_qr = ""
     img_attachment = None
     if qr_code_base64:
-        html_qr = '<p><img src="cid:qrcode" alt="Enrollment QR" style="max-width:220px"/></p>'
+        html_qr = '<p><img src="cid:qrcode" alt="Enrollment QR" style="max-width:220px;border-radius:8px"/></p>'
         try:
-            img_attachment = base64.b64decode(qr_code_base64)
+            raw = qr_code_base64
+            if raw.startswith("data:"):
+                raw = raw.split(",", 1)[1]
+            img_attachment = base64.b64decode(raw)
         except Exception:
             img_attachment = None
 
     enroll_section = ""
     if enroll_url:
-        enroll_section = f'<p><strong>Enrollment URL:</strong> <a href="{enroll_url}">{enroll_url}</a></p>'
+        enroll_section = (
+            f'<p style="margin-top:16px">'
+            f'<a href="{enroll_url}" style="display:inline-block;background:#003087;color:#fff;'
+            f'font-weight:700;padding:12px 20px;border-radius:6px;text-decoration:none;font-size:.95rem">'
+            f'&#128242; Enroll in TAK</a></p>'
+            f'<p style="font-size:.75rem;color:#6b7280;word-break:break-all;margin-top:4px">{enroll_url}</p>'
+        )
 
     notes_section = f"<p><em>{notes}</em></p>" if notes else ""
 

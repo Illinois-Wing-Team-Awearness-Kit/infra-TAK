@@ -107,6 +107,12 @@
       <div class="cred-card hidden" id="wiz-cred-card">
         <div class="cred-row"><span class="cred-label">Username</span><span id="cred-username"></span></div>
         <div class="cred-row"><span class="cred-label">Password</span><span id="cred-password"></span></div>
+        <div id="cred-enroll-section" class="hidden" style="margin-top:.75rem">
+          <div class="cred-row"><span class="cred-label">Enroll URL</span><a id="cred-enroll-url" href="#" target="_blank" style="font-size:.85rem;word-break:break-all"></a></div>
+          <div id="cred-qr-wrap" style="text-align:center;margin-top:.75rem">
+            <img id="cred-qr-img" src="" alt="Enrollment QR" style="max-width:160px;border-radius:8px;border:1px solid #e4e6ef"/>
+          </div>
+        </div>
       </div>
       <div class="wizard-actions">
         <button class="btn btn-ghost" id="wiz-step3-back">← Back</button>
@@ -253,5 +259,6 @@
 <!-- Toast container -->
 <div class="toast-container" id="toast-container"></div>
 
+<script>const TAK_PORTAL_CONFIGURED = {{ tak_portal_configured | tojson }};</script>
 <script src="/static/portal.js"></script>
 {% endblock %}

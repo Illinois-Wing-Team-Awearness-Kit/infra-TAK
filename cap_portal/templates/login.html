@@ -1,75 +1,147 @@
-{% extends "base.html" %}
-{% block title %}Login — CAP Command Portal{% endblock %}
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>eServices - Log in</title>
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" />
+  <link href="https://fonts.googleapis.com/css?family=Rajdhani" rel="stylesheet" />
+  <link href="https://fonts.googleapis.com/css?family=Ubuntu" rel="stylesheet" />
+  <script src="https://kit.fontawesome.com/55611fd9bc.js" crossorigin="anonymous"></script>
+  <style>
+    :root { --cap_symbolblue: #003087; }
+    body { background: #f4f4f4; font-family: 'Ubuntu', sans-serif; }
+    .eservices_sitename {
+      display: block; text-align: center; font-family: 'Rajdhani', sans-serif;
+      font-size: 2.2rem; font-weight: 700; color: #003087; letter-spacing: .08em;
+      margin-top: .25rem;
+    }
+    .login_area_top { background: #fff; border-radius: 6px 6px 0 0; border: 1px solid #dee2e6; border-bottom: none; }
+    .login_area_bottom { background: #fff; border-radius: 0 0 6px 6px; border: 1px solid #dee2e6; border-top: none; }
+    .login_link { color: #003087; font-size: .85rem; }
+    .login_link:hover { color: #001a5c; }
+    .leaving_gov { font-size: .85rem; }
+    .cap_copyright { background: #003087; color: rgba(255,255,255,.7) !important; }
+    .cap_copyright a { color: rgba(255,255,255,.85); }
+    .alert-danger { font-size: .9rem; }
+    footer { position: fixed; bottom: 0; width: 100%; }
+    .no-spinner::-webkit-outer-spin-button,
+    .no-spinner::-webkit-inner-spin-button { -webkit-appearance: none; margin: 0; }
+    .no-spinner { -moz-appearance: textfield; }
+  </style>
+</head>
+<body class="env-production">
+<div class="container" style="padding-bottom: 60px;">
+  <main role="main">
+    <section class="pt-3">
 
-{% block content %}
-<div class="auth-container">
-  <div class="auth-card">
-    <div class="auth-header">
-      <div class="auth-shield">
-        <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg">
-          <path d="M12 2L3 6v6c0 5.25 3.75 10.15 9 11.25C17.25 22.15 21 17.25 21 12V6L12 2z" fill="currentColor" opacity="0.2"/>
-          <path d="M12 2L3 6v6c0 5.25 3.75 10.15 9 11.25C17.25 22.15 21 17.25 21 12V6L12 2z" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/>
-          <path d="M9 12l2 2 4-4" stroke="white" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/>
-        </svg>
+      <div class="row mt-3 g-0">
+        <div class="col-12 col-md-8 col-lg-6 mx-auto login_area_top pt-2">
+          <center>
+            <img src="https://www.capnhq.gov/Auth/images/cap_horizontal_aux_lg.png" width="75%" alt="Civil Air Patrol" onerror="this.style.display='none';document.getElementById('cap-text-logo').style.display='block'" />
+            <div id="cap-text-logo" style="display:none;font-family:'Rajdhani',sans-serif;font-size:1.8rem;font-weight:700;color:#003087;">CIVIL AIR PATROL</div>
+          </center>
+          <span class="eservices_sitename">eServices</span>
+        </div>
       </div>
-      <h1>Command Portal Access</h1>
-      <p>Authenticate with your CAP EServices credentials</p>
-    </div>
 
-    {% if error %}
-    <div class="alert alert-error">
-      <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14"><path d="M8 1a7 7 0 1 0 0 14A7 7 0 0 0 8 1zm0 3.5a.75.75 0 0 1 .75.75v3a.75.75 0 0 1-1.5 0v-3A.75.75 0 0 1 8 4.5zm0 7a.875.875 0 1 1 0-1.75.875.875 0 0 1 0 1.75z"/></svg>
-      {{ error }}
-    </div>
-    {% endif %}
+      <div class="row g-0">
+        <div class="col-12 col-md-8 col-lg-6 mx-auto login_area_bottom pb-3">
+          <section class="p-2">
 
-    <form method="post" action="/login" class="auth-form" autocomplete="on">
-      <div class="field-group">
-        <label for="capid">CAPID</label>
-        <input
-          type="text"
-          id="capid"
-          name="capid"
-          placeholder="000000"
-          autocomplete="username"
-          inputmode="numeric"
-          pattern="[0-9]+"
-          required
-        />
-      </div>
-      <div class="field-group">
-        <label for="password">EServices Password</label>
-        <input
-          type="password"
-          id="password"
-          name="password"
-          autocomplete="current-password"
-          required
-        />
-      </div>
-      <div class="field-group">
-        <label for="totp_code">Authenticator Code <span class="label-hint">(6 digits)</span></label>
-        <input
-          type="text"
-          id="totp_code"
-          name="totp_code"
-          placeholder="000000"
-          inputmode="numeric"
-          maxlength="6"
-          autocomplete="one-time-code"
-          required
-        />
-      </div>
-      <button type="submit" class="btn btn-primary btn-full">
-        <svg viewBox="0 0 16 16" fill="currentColor" width="14" height="14"><path d="M8 0a4 4 0 0 1 4 4v1h1.5A1.5 1.5 0 0 1 15 6.5v8A1.5 1.5 0 0 1 13.5 16h-11A1.5 1.5 0 0 1 1 14.5v-8A1.5 1.5 0 0 1 2.5 5H4V4a4 4 0 0 1 4-4zm0 1.5A2.5 2.5 0 0 0 5.5 4v1h5V4A2.5 2.5 0 0 0 8 1.5zM8 9a1.5 1.5 0 1 0 0 3 1.5 1.5 0 0 0 0-3z"/></svg>
-        Authenticate via EServices
-      </button>
-    </form>
+            {% if error %}
+            <div class="alert alert-danger mt-2" role="alert">{{ error }}</div>
+            {% endif %}
 
-    <p class="auth-note">
-      Credentials are validated against <strong>capnhq.gov</strong> and are never stored.<br>
-      Access is restricted to authorized Illinois Wing personnel.
-    </p>
-  </div>
+            <form method="post" action="/login">
+
+              <label class="form-label mt-2" for="capid">
+                CAPID <span style="color:red;font-style:italic;">(Please use your CAPID. Usernames are not accepted.)</span>
+              </label>
+              <div class="mb-3">
+                <input class="form-control no-spinner" autocomplete="username" type="number"
+                  aria-required="true" placeholder="Enter CAPID" id="capid" name="capid" required />
+              </div>
+
+              <label class="form-label" for="password">Password</label>
+              <div class="mb-3">
+                <div class="input-group">
+                  <input class="form-control" autocomplete="current-password" aria-required="true"
+                    placeholder="Enter Password" type="password" id="password" name="password" required />
+                  <button class="btn btn-dark" type="button" id="showHidePassword" data-state="hide">
+                    <i class="fa-solid fa-eye" id="stateIcon"></i>
+                  </button>
+                </div>
+              </div>
+
+              <label class="form-label" for="totp_code">Authenticator Code <span style="color:#6c757d;font-size:.85rem;">(6 digits)</span></label>
+              <div class="mb-3">
+                <input class="form-control no-spinner" type="number" inputmode="numeric"
+                  placeholder="000000" maxlength="6" id="totp_code" name="totp_code"
+                  autocomplete="one-time-code" required />
+              </div>
+
+              <div>
+                <button id="login-submit" type="submit" class="w-100 btn btn-lg btn-primary"
+                  style="background-color:var(--cap_symbolblue);">Log in</button>
+              </div>
+
+              <div class="row mb-4 mt-3">
+                <div class="col-6">
+                  <label class="form-label mb-0">FIRST TIME USERS?</label><br />
+                  <a class="login_link" href="https://www.capnhq.gov/Auth/Identity/Account/Register" target="_blank">Click here to register</a>
+                </div>
+                <div class="col-6" style="text-align:right;">
+                  <label class="form-label mb-0">PASSWORD ASSISTANCE?</label><br />
+                  <a class="login_link" href="https://www.capnhq.gov/Auth/Identity/Account/ForgotPassword" target="_blank">Click here for password assistance</a>
+                </div>
+              </div>
+
+              <div class="row">
+                <div class="col-md text-center">
+                  <label class="form-label mb-0">MORE INFORMATION?</label><br />
+                  <a class="login_link leaving_gov" href="http://www.gocivilairpatrol.com/" target="_blank">www.gocivilairpatrol.com</a><br>
+                  <a class="login_link leaving_gov" href="http://www.capmembers.com/" target="_blank">www.capmembers.com</a><br>
+                  <a class="login_link leaving_gov" href="http://www.capvolunteernow.com/" target="_blank">Volunteer Now</a><br>
+                </div>
+              </div>
+
+            </form>
+          </section>
+        </div>
+      </div>
+
+    </section>
+  </main>
 </div>
-{% endblock %}
+
+<footer class="border-top footer text-muted cap_copyright" style="line-height:normal;padding:10px;">
+  <div class="container">
+    <span>
+      <a href="https://www.capnhq.gov/NL/PrivacyLegal.aspx" target="_blank">Privacy and Legal Info</a> |
+      <a href="https://capnhq.crmdesk.com/home.aspx" target="_blank">Help Desk</a>
+    </span><br />
+    &copy; 2026 - Civil Air Patrol
+  </div>
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+<script>
+  document.getElementById('showHidePassword').addEventListener('click', function () {
+    const pw = document.getElementById('password');
+    const icon = document.getElementById('stateIcon');
+    const state = this.getAttribute('data-state');
+    if (state === 'hide') {
+      pw.type = 'text';
+      this.setAttribute('data-state', 'show');
+      icon.classList.replace('fa-eye', 'fa-eye-slash');
+    } else {
+      pw.type = 'password';
+      this.setAttribute('data-state', 'hide');
+      icon.classList.replace('fa-eye-slash', 'fa-eye');
+    }
+  });
+  document.getElementById('capid').focus();
+</script>
+</body>
+</html>

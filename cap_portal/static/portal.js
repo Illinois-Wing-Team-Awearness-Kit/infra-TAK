@@ -109,14 +109,38 @@ document.getElementById('wiz-step3-next').addEventListener('click', async () => 
   setStatus('wiz-step3-status', 'info', 'Creating user…');
   try {
     const resp = await apiPost('/api/user', { mission_number: wiz.missionNumber });
-    wiz.userOk  = true;
+    wiz.userOk   = true;
     wiz.username = resp.data?.username || wiz.missionNumber;
     wiz.password = resp.data?.password || '';
+    wiz.userId   = resp.data?.user_id  || '';
+    wiz.enrollUrl = '';
+    wiz.qrCode    = '';
     setStatus('wiz-step3-status', 'success', `✓ User <strong>${wiz.username}</strong> created`);
     // Show credential card
     document.getElementById('cred-username').textContent = wiz.username;
     document.getElementById('cred-password').textContent = wiz.password;
     document.getElementById('wiz-cred-card').classList.remove('hidden');
+    // Fetch enrollment QR from TAK Portal
+    if (wiz.userId && typeof TAK_PORTAL_CONFIGURED !== 'undefined' && TAK_PORTAL_CONFIGURED) {
+      try {
+        setStatus('wiz-step3-status', 'info', '✓ User created — fetching enrollment QR…');
+        const qrResp = await apiPost('/api/enrollment-qr', { user_id: wiz.userId, username: wiz.username });
+        if (qrResp.data?.enrollUrl) {
+          wiz.enrollUrl = qrResp.data.enrollUrl;
+          wiz.qrCode    = qrResp.data.qrCode || '';
+          document.getElementById('cred-enroll-section').classList.remove('hidden');
+          const link = document.getElementById('cred-enroll-url');
+          link.href = wiz.enrollUrl;
+          link.textContent = wiz.enrollUrl;
+          if (wiz.qrCode) {
+            document.getElementById('cred-qr-img').src = 'data:image/png;base64,' + wiz.qrCode;
+          }
+        }
+        setStatus('wiz-step3-status', 'success', `✓ User <strong>${wiz.username}</strong> created with enrollment QR`);
+      } catch(_) {
+        setStatus('wiz-step3-status', 'success', `✓ User <strong>${wiz.username}</strong> created (QR unavailable)`);
+      }
+    }
     showStep(4);
   } catch(e) {
     setStatus('wiz-step3-status', 'error', `✗ ${e.message}`);
@@ -185,8 +209,8 @@ document.getElementById('wiz-send').addEventListener('click', async () => {
       recipients: wiz.recipients,
       subject,
       notes,
-      enroll_url: '',
-      qr_code_base64: '',
+      enroll_url: wiz.enrollUrl || '',
+      qr_code_base64: wiz.qrCode || '',
     });
     const sent = resp.results?.filter(r => r.success).length || 0;
     setStatus('wiz-step5-status', 'success', `✓ Sent to ${sent} recipient(s)`);

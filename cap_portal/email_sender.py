@@ -44,11 +44,16 @@ def send_credentials_email(
     enroll_section = ""
     if enroll_url:
         enroll_section = (
-            f'<p style="margin-top:16px">'
+            f'<div style="margin-top:16px;padding:14px;background:#f0f4ff;border-radius:8px;border:1px solid #c7d4f0">'
+            f'<p style="margin:0 0 10px 0;font-weight:700;color:#003087">&#128242; TAK Enrollment</p>'
+            f'<p style="margin:0 0 10px 0;font-size:.85rem;color:#374151">'
+            f'Scan the QR code below or tap the button on a mobile device with ATAK/WinTAK installed:</p>'
             f'<a href="{enroll_url}" style="display:inline-block;background:#003087;color:#fff;'
-            f'font-weight:700;padding:12px 20px;border-radius:6px;text-decoration:none;font-size:.95rem">'
-            f'&#128242; Enroll in TAK</a></p>'
-            f'<p style="font-size:.75rem;color:#6b7280;word-break:break-all;margin-top:4px">{enroll_url}</p>'
+            f'font-weight:700;padding:10px 18px;border-radius:6px;text-decoration:none;font-size:.9rem">'
+            f'&#128242; Enroll in TAK</a>'
+            f'<p style="margin:10px 0 0 0;font-size:.72rem;color:#6b7280;word-break:break-all">'
+            f'Or copy this link: {enroll_url}</p>'
+            f'</div>'
         )
 
     notes_section = f"<p><em>{notes}</em></p>" if notes else ""

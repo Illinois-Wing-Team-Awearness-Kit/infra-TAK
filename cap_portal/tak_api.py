@@ -200,7 +200,7 @@ def create_user(mission_number: str, group_uuid: str | None = None) -> dict:
 
     return {
         "username":   username,
-        "user_id":    user_obj.get("pk", ""),
+        "user_id":    str(user_obj.get("pk", "")),
         "password":   password,
         "group":      mission_number,
         "group_uuid": group_uuid,

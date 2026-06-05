@@ -29,7 +29,7 @@ def get_enrollment_qr(user_id: str, username: str) -> dict:
     """
     Returns {"enrollUrl": str, "qrCode": str (base64 PNG), "token": str, "expiresAt": str}
     """
-    url = f"{TAK_PORTAL_URL.rstrip('/')}/api/users/{user_id}/enroll-qr"
-    resp = httpx.post(url, headers=_HEADERS, json={"username": username}, timeout=15)
+    url = f"{TAK_PORTAL_URL.rstrip('/')}/api/users/enroll-qr"
+    resp = httpx.post(url, headers=_HEADERS, json={"userId": str(user_id), "username": username}, timeout=15)
     resp.raise_for_status()
     return resp.json()
